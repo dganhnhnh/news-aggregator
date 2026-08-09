@@ -13,6 +13,15 @@ dependencies = [
     "tavily-python>=0.7.12,<1",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.1,<9",
+]
+
+[project.scripts]
+news-pipeline = "pipelines.news:main"
+news-service = "services.news:main"
+
 
 [build-system]
 requires = ["setuptools>=80"]

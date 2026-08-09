@@ -1,4 +1,4 @@
-"""Periodic Google News RSS crawler service."""
+"""Periodic RSS/Atom crawler service backed by TSV or OPML input."""
 
 from __future__ import annotations
 
@@ -17,15 +17,26 @@ logger = get_logger(__name__)
 def build_parser(settings: Settings) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--feed-path",
         "--tsv-path",
+        dest="feed_path",
         type=Path,
-        default=settings.google_news_tsv_path,
-        help="TSV config path; defaults to GOOGLE_NEWS_TSV_PATH",
+        default=settings.rss_feed_path,
+        help=(
+            "TSV or OPML feed source path; defaults to RSS_FEED_PATH "
+            "(or legacy GOOGLE_NEWS_TSV_PATH)"
+        ),
     )
     parser.add_argument(
         "--interval-seconds",
         type=int,
         default=settings.service_interval_seconds,
+    )
+    parser.add_argument(
+        "--max-feeds",
+        type=int,
+        default=settings.max_feeds,
+        help="Maximum feeds to process per iteration; 0 means all feeds",
     )
     parser.add_argument(
         "--max-articles-per-feed",
@@ -45,7 +56,8 @@ async def run_service(args: argparse.Namespace) -> None:
     while True:
         try:
             results = await run_rss(
-                args.tsv_path,
+                args.feed_path,
+                max_feeds=args.max_feeds,
                 max_articles_per_feed=args.max_articles_per_feed,
                 max_concurrent_crawls=args.max_concurrent_crawls,
             )
@@ -66,10 +78,13 @@ def main() -> None:
     setup_logging(settings.log_level)
     parser = build_parser(settings)
     args = parser.parse_args()
-    if args.tsv_path is None:
-        parser.error("--tsv-path or GOOGLE_NEWS_TSV_PATH is required")
-    if not args.tsv_path.is_file():
-        parser.error(f"Google News TSV file not found: {args.tsv_path}")
+    if args.feed_path is None:
+        parser.error(
+            "--feed-path/--tsv-path or "
+            "RSS_FEED_PATH/GOOGLE_NEWS_TSV_PATH is required"
+        )
+    if not args.feed_path.is_file():
+        parser.error(f"RSS feed source file not found: {args.feed_path}")
     if args.interval_seconds <= 0:
         parser.error("--interval-seconds must be positive")
     try:

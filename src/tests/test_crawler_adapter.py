@@ -18,4 +18,5 @@ def test_build_result_normalizes_crawl4ai_markdown_object() -> None:
     result = _build_crawl_result("https://example.com", inner, success=True)
 
     assert result.markdown == "# Main article"
+    assert type(result.markdown) is str
     assert result.content_length == len("# Main article")

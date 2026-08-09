@@ -50,6 +50,10 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
             or str(markdown_value)
         )
 
+    # crawl4ai 0.8.x may return a StringCompatibleMarkdown wrapper that behaves
+    # like text but still contains a non-JSON-serializable generation object.
+    raw_markdown = str(raw_markdown)
+
     # Fallback: use cleaned_html if markdown is empty
     if not raw_markdown:
         raw_markdown = getattr(inner, "cleaned_html", "") or ""

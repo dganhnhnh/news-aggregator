@@ -1,4 +1,4 @@
-"""Command-line pipeline for search, direct crawling, and Google News RSS."""
+"""Command-line pipeline for search, direct crawling, and RSS/Atom feeds."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from adapters.retrieve_news_data.crawler import CrawlFetcher
-from adapters.retrieve_news_data.google_news_rss_searcher import GoogleNewsRssSearcher
+from adapters.retrieve_news_data.google_news_rss_searcher import RssFeedSearcher
 from adapters.retrieve_news_data.searcher import SearchFetcher, TavilySearcher
 from core.config import Settings
 from core.logger import get_logger, setup_logging
@@ -61,16 +61,20 @@ async def run_crawl(urls: list[str]) -> list[CrawlResult]:
 
 
 async def run_rss(
-    tsv_path: Path,
+    feed_path: Path,
     *,
+    max_feeds: int,
     max_articles_per_feed: int,
     max_concurrent_crawls: int,
 ) -> list[CrawlResult]:
-    searcher = GoogleNewsRssSearcher(
-        tsv_path=tsv_path,
+    searcher = RssFeedSearcher(
+        feed_path=feed_path,
         max_concurrent_crawls=max_concurrent_crawls,
     )
-    return await searcher.fetch_all(max_articles_per_feed=max_articles_per_feed)
+    return await searcher.fetch_all(
+        max_articles_per_feed=max_articles_per_feed,
+        max_feeds=max_feeds,
+    )
 
 
 def build_parser(settings: Settings) -> argparse.ArgumentParser:
@@ -85,12 +89,23 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     crawl = subparsers.add_parser("crawl", help="Crawl one or more URLs")
     crawl.add_argument("urls", nargs="+")
 
-    rss = subparsers.add_parser("rss", help="Fetch and crawl Google News RSS feeds")
+    rss = subparsers.add_parser("rss", help="Fetch and crawl RSS/Atom feeds")
     rss.add_argument(
+        "--feed-path",
         "--tsv-path",
+        dest="feed_path",
         type=Path,
-        default=settings.google_news_tsv_path,
-        help="TSV config path; defaults to GOOGLE_NEWS_TSV_PATH",
+        default=settings.rss_feed_path,
+        help=(
+            "TSV or OPML feed source path; defaults to RSS_FEED_PATH "
+            "(or legacy GOOGLE_NEWS_TSV_PATH)"
+        ),
+    )
+    rss.add_argument(
+        "--max-feeds",
+        type=int,
+        default=settings.max_feeds,
+        help="Maximum feeds to process; 0 means all feeds",
     )
     rss.add_argument(
         "--max-articles-per-feed",
@@ -116,10 +131,14 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> None:
     elif args.command == "crawl":
         results = await run_crawl(args.urls)
     else:
-        if args.tsv_path is None:
-            raise ValueError("rss requires --tsv-path or GOOGLE_NEWS_TSV_PATH")
+        if args.feed_path is None:
+            raise ValueError(
+                "rss requires --feed-path/--tsv-path or "
+                "RSS_FEED_PATH/GOOGLE_NEWS_TSV_PATH"
+            )
         results = await run_rss(
-            args.tsv_path,
+            args.feed_path,
+            max_feeds=args.max_feeds,
             max_articles_per_feed=args.max_articles_per_feed,
             max_concurrent_crawls=args.max_concurrent_crawls,
         )

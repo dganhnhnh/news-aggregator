@@ -16,10 +16,11 @@ pulling in any I/O dependencies.
 """
 import asyncio
 import csv
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import feedparser
 import httpx
@@ -33,6 +34,14 @@ from models.search_and_crawl_models import (
 )
 
 logger = get_logger(__name__)
+
+
+class RssFeedSource(NamedTuple):
+    """Normalized feed configuration shared by TSV and OPML inputs."""
+
+    query_label: str
+    rss_url: str
+
 
 # ─── Shared decode cache + rate-limiter ───────────────────────────────────────
 #
@@ -175,7 +184,7 @@ def _parse_rss_entry(entry: dict) -> dict:
 
     return {
         "title": raw_title,
-        "google_news_url": raw_link,
+        "feed_entry_url": raw_link,
         "source": raw_source,
         "published_date": pub_date,
     }
@@ -213,34 +222,38 @@ async def _fetch_rss(url: str, client: httpx.AsyncClient) -> tuple[list[dict], s
 
 class GoogleNewsRssSearcher(CrawlerProvider):
     """
-    Google News RSS–based implementation of the CrawlerProvider port.
+    RSS-based implementation of the CrawlerProvider port.
 
-    Reads Google News RSS URLs from ``list_queries_ggnews.tsv`` (one URL per
-    query label).  For every entry found in every feed it:
+    Reads RSS URLs from either a four-column TSV file or an OPML subscription
+    export. For every entry found in every feed it:
       1. Decodes the Google News redirect URL → real article URL
       2. Crawls the real article URL using crawl4ai
-      3. Attaches RSS metadata (query label, Google News URL, source name,
-         pubDate) to the resulting CrawlResult.
+      3. Attaches RSS metadata (query label, original feed-entry URL, source
+         name, and publication date) to the resulting CrawlResult.
 
     Parameters
     ----------
-    tsv_path : str | Path, optional
-        Path to the TSV file.  Defaults to ``list_queries_ggnews.tsv`` in the
-        same directory as this module.
+    feed_path : str | Path, optional
+        Path to a ``.tsv`` or ``.opml`` feed source file. Defaults to the
+        legacy ``list_queries_ggnews.tsv`` location.
     http_client : httpx.AsyncClient, optional
         Shared HTTP client to use for RSS fetches.  If not supplied, a default
         client is created and closed after the run.
     """
 
-    name = "google_news_rss"
+    name = "rss_feed"
 
     def __init__(
         self,
-        tsv_path: Optional[str | Path] = None,
+        feed_path: Optional[str | Path] = None,
         http_client: Optional[httpx.AsyncClient] = None,
         max_concurrent_crawls: int = 10,
+        *,
+        tsv_path: Optional[str | Path] = None,
     ) -> None:
-        self._tsv_path = tsv_path or (
+        if feed_path is not None and tsv_path is not None:
+            raise ValueError("Pass only one of feed_path or tsv_path")
+        self._feed_path = feed_path or tsv_path or (
             Path(__file__).parent / "list_queries_ggnews.tsv"
         )
         self._http_client = http_client
@@ -252,13 +265,16 @@ class GoogleNewsRssSearcher(CrawlerProvider):
     async def fetch_all(
         self,
         max_articles_per_feed: int = 20,
+        max_feeds: int = 0,
     ) -> list[CrawlResult]:
         """
         Fetch all configured RSS feeds and crawl every discovered article.
 
         Args:
             max_articles_per_feed: Maximum number of entries to process per
-                RSS feed (most recent first).  Set to 0 to disable.
+                RSS feed (most recent first). Set to 0 for no per-feed limit.
+            max_feeds: Maximum number of configured feeds to process. Set to 0
+                to process every feed.
 
         Returns:
             Flat list of CrawlResult objects, one per successfully crawled
@@ -267,16 +283,20 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             reachable.
         """
         queries = self._load_queries()
+        total_queries = len(queries)
+        if max_feeds > 0:
+            queries = queries[:max_feeds]
         if not queries:
             self._logger.warning(
-                "[GoogleNews RSS] No RSS URLs found in %s", self._tsv_path
+                "[GoogleNews RSS] No RSS URLs found in %s", self._feed_path
             )
             return []
 
         self._logger.info(
-            "[GoogleNews RSS] Loaded %d RSS feeds from %s",
+            "[GoogleNews RSS] Processing %d/%d RSS feeds from %s",
             len(queries),
-            self._tsv_path,
+            total_queries,
+            self._feed_path,
         )
 
         own_client = self._http_client is None
@@ -331,7 +351,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                     query_label,
                     len(entries),
                     total_entries,
-                    _MAX_CONCURRENT_FEEDS,
+                    len(entries),
                 )
 
                 async def _crawl_one(entry: dict) -> Optional[CrawlResult]:
@@ -403,7 +423,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
 
         return await self._do_crawl(
             real_url=real_url,
-            google_news_url=google_url,
+            feed_entry_url=url,
             query_label="",
             feed_title="",
             entry_title="",
@@ -424,8 +444,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         feed_title: str,
     ) -> Optional[CrawlResult]:
         """Decode one RSS entry's Google URL and crawl it."""
-        google_url: str = entry.get("google_news_url", "")
-        real_url = await _decode_google_news_url_async(google_url)
+        feed_entry_url: str = (
+            entry.get("feed_entry_url") or entry.get("google_news_url", "")
+        )
+        real_url = await _decode_google_news_url_async(feed_entry_url)
 
         if not real_url:
             self._logger.warning(
@@ -436,7 +458,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
 
         return await self._do_crawl(
             real_url=real_url,
-            google_news_url=google_url,
+            feed_entry_url=feed_entry_url,
             query_label=query_label,
             feed_title=feed_title,
             entry_title=entry.get("title", ""),
@@ -448,7 +470,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         self,
         *,
         real_url: str,
-        google_news_url: str,
+        feed_entry_url: str,
         query_label: str,
         feed_title: str,
         entry_title: str,
@@ -473,7 +495,11 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             description=crawl_meta.description,
             language=crawl_meta.language,
             author=crawl_meta.author,
-            provider="google_news_rss",
+            provider=(
+                "google_news_rss"
+                if "news.google.com" in feed_entry_url
+                else "rss_feed"
+            ),
         )
 
         # Preserve crawl content while attaching feed-level trace context.
@@ -485,7 +511,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             "query_label": query_label,
             "feed_title": feed_title,
             "source_name": source_name,
-            "google_news_url": google_news_url,
+            "feed_entry_url": feed_entry_url,
+            "google_news_url": (
+                feed_entry_url if "news.google.com" in feed_entry_url else ""
+            ),
             "published_date": published_date,
         })
 
@@ -508,7 +537,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
     @staticmethod
     def _load_queries_from_tsv(
         tsv_path: str | Path,
-    ) -> list[tuple[str, str]]:
+    ) -> list[RssFeedSource]:
         """
         Parse ``list_queries_ggnews.tsv`` and return ``[(query_label, rss_url), ...]``.
 
@@ -518,7 +547,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
 
         Blank lines and comment lines (starting with ``#``) are skipped.
         """
-        queries: list[tuple[str, str]] = []
+        queries: list[RssFeedSource] = []
         with open(tsv_path, newline="", encoding="utf-8") as fh:
             reader = csv.reader(fh, delimiter="\t")
             for row in reader:
@@ -531,22 +560,69 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 url = row[3].strip().strip('"')
                 if not url or not url.startswith("http"):
                     continue
-                queries.append((label, url))
+                queries.append(RssFeedSource(query_label=label, rss_url=url))
         return queries
 
-    def _load_queries(self) -> list[tuple[str, str]]:
-        if not Path(self._tsv_path).is_file():
-            raise FileNotFoundError(
-                f"Google News TSV file not found: {self._tsv_path}. "
-                "Pass --tsv-path or set GOOGLE_NEWS_TSV_PATH."
+    @staticmethod
+    def _load_queries_from_opml(
+        opml_path: str | Path,
+    ) -> list[RssFeedSource]:
+        """Normalize OPML outlines into ``query_label`` and ``rss_url``."""
+        try:
+            root = ET.parse(opml_path).getroot()
+        except ET.ParseError as exc:
+            raise ValueError(f"Invalid OPML file {opml_path}: {exc}") from exc
+
+        queries: list[RssFeedSource] = []
+        for outline in root.iter():
+            if outline.tag.rsplit("}", 1)[-1] != "outline":
+                continue
+            rss_url = (
+                outline.attrib.get("xmlUrl")
+                or outline.attrib.get("xmlurl")
+                or ""
+            ).strip()
+            if not rss_url.startswith(("http://", "https://")):
+                continue
+            query_label = (
+                outline.attrib.get("title")
+                or outline.attrib.get("text")
+                or rss_url
+            ).strip()
+            queries.append(
+                RssFeedSource(query_label=query_label, rss_url=rss_url)
             )
-        return self._load_queries_from_tsv(self._tsv_path)
+        return queries
+
+    def _load_queries(self) -> list[RssFeedSource]:
+        feed_path = Path(self._feed_path)
+        if not feed_path.is_file():
+            raise FileNotFoundError(
+                f"RSS feed source file not found: {feed_path}. "
+                "Pass --feed-path/--tsv-path or set "
+                "RSS_FEED_PATH/GOOGLE_NEWS_TSV_PATH."
+            )
+        suffix = feed_path.suffix.lower()
+        if suffix == ".tsv":
+            return self._load_queries_from_tsv(feed_path)
+        if suffix == ".opml":
+            return self._load_queries_from_opml(feed_path)
+        raise ValueError(
+            f"Unsupported feed source format {suffix or '(no extension)'}: "
+            f"{feed_path}. Expected .tsv or .opml."
+        )
 
 
 # ─── Convenience factory ──────────────────────────────────────────────────────
 
 
+# Preferred generic name; retain GoogleNewsRssSearcher for compatibility.
+RssFeedSearcher = GoogleNewsRssSearcher
+
+
 def create_google_news_searcher(
+    feed_path: Optional[str | Path] = None,
+    *,
     tsv_path: Optional[str | Path] = None,
 ) -> GoogleNewsRssSearcher:
     """
@@ -554,8 +630,7 @@ def create_google_news_searcher(
 
     Parameters
     ----------
-    tsv_path : str | Path, optional
-        Path to the TSV config file.  Defaults to the bundled
-        ``list_queries_ggnews.tsv``.
+    feed_path : str | Path, optional
+        Path to a TSV or OPML feed source file.
     """
-    return GoogleNewsRssSearcher(tsv_path=tsv_path)
+    return GoogleNewsRssSearcher(feed_path=feed_path, tsv_path=tsv_path)
