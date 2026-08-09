@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-news_radar}
+      POSTGRES_USER: ${POSTGRES_USER:-news_radar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-news_radar}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - news_radar_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  news_radar_postgres_data:
+    name: news_radar_postgres_data

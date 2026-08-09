@@ -2,13 +2,27 @@ import asyncio
 from pathlib import Path
 
 import pytest
+import httpx
 
 from adapters.retrieve_news_data.google_news_rss_searcher import (
     GoogleNewsRssSearcher,
     RssFeedSource,
+    _parse_rss_entry,
 )
 from adapters.retrieve_news_data.crawler import Crawl4aiProvider
 from models.search_and_crawl_models import CrawlResult
+
+
+def test_atom_published_date_is_timezone_aware() -> None:
+    entry = _parse_rss_entry(
+        {
+            "title": "Atom article",
+            "link": "https://example.com/article",
+            "published": "2026-08-01T10:30:00Z",
+        }
+    )
+
+    assert entry["published_date"].isoformat() == "2026-08-01T10:30:00+00:00"
 
 
 def test_load_queries_from_tsv(tmp_path: Path) -> None:
@@ -121,10 +135,11 @@ def test_opml_feed_runs_through_rss_crawl_pipeline(
             assert timeout == 20.0
             return FakeResponse()
 
-    async def fake_crawl(self, url: str) -> CrawlResult:
-        return CrawlResult(url=url, markdown="# Article")
+    async def fake_crawl_batch(self, urls, *, max_concurrency=None):
+        assert max_concurrency == 2
+        return [CrawlResult(url=url, markdown="# Article") for url in urls]
 
-    monkeypatch.setattr(Crawl4aiProvider, "crawl", fake_crawl)
+    monkeypatch.setattr(Crawl4aiProvider, "crawl_batch", fake_crawl_batch)
     searcher = GoogleNewsRssSearcher(
         feed_path=path,
         http_client=FakeClient(),
@@ -139,3 +154,130 @@ def test_opml_feed_runs_through_rss_crawl_pipeline(
     assert results[0].context["query_label"] == "Engineering Feed"
     assert results[0].context["feed_entry_url"] == "https://example.com/article"
     assert results[0].context["google_news_url"] == ""
+
+
+def test_feed_fetch_failure_is_returned_as_structured_failure(tmp_path: Path) -> None:
+    path = tmp_path / "feeds.opml"
+    path.write_text(
+        '<opml><body><outline title="Broken Feed" '
+        'xmlUrl="https://example.com/broken.xml" /></body></opml>',
+        encoding="utf-8",
+    )
+
+    class FailingClient:
+        async def get(self, url: str, timeout: float):
+            request = httpx.Request("GET", url)
+            raise httpx.ConnectError("connection failed", request=request)
+
+    batch = asyncio.run(
+        GoogleNewsRssSearcher(
+            feed_path=path,
+            http_client=FailingClient(),
+        ).fetch_batch(max_articles_per_feed=1)
+    )
+
+    assert batch.feeds_processed == 1
+    assert batch.results == []
+    assert len(batch.failures) == 1
+    assert batch.failures[0].failure_kind == "feed"
+    assert batch.failures[0].url == "https://example.com/broken.xml"
+    assert batch.failures[0].source == "Broken Feed"
+
+
+def test_streaming_bounds_feed_and_crawl_workers_and_rotates(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "feeds.opml"
+    path.write_text(
+        "<opml><body>"
+        + "".join(
+            f'<outline title="Feed {index}" '
+            f'xmlUrl="https://feeds.example/{index}.xml" />'
+            for index in range(3)
+        )
+        + "</body></opml>",
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        def __init__(self, feed_index: str) -> None:
+            self.text = (
+                "<rss><channel><title>Feed "
+                + feed_index
+                + "</title>"
+                + "".join(
+                    "<item><title>Article</title>"
+                    f"<link>https://articles.example/{feed_index}/{item}</link>"
+                    "</item>"
+                    for item in range(5)
+                )
+                + "</channel></rss>"
+            )
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class TrackingClient:
+        active = 0
+        peak = 0
+        requested: list[str] = []
+
+        async def get(self, url: str, timeout: float):
+            self.requested.append(url)
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            await asyncio.sleep(0)
+            self.active -= 1
+            return FakeResponse(url.rsplit("/", 1)[-1].split(".", 1)[0])
+
+    class TrackingProvider:
+        calls: list[tuple[list[str], int | None]] = []
+
+        async def crawl_batch(self, urls, *, max_concurrency=None):
+            self.calls.append((list(urls), max_concurrency))
+            return [CrawlResult(url=url, markdown="# Article") for url in urls]
+
+    client = TrackingClient()
+    provider = TrackingProvider()
+    searcher = GoogleNewsRssSearcher(
+        feed_path=path,
+        http_client=client,
+        max_concurrent_feeds=2,
+        max_concurrent_crawls=2,
+        crawl_batch_size=3,
+        crawl_provider=provider,
+    )
+
+    async def run_twice():
+        first = [
+            batch
+            async for batch in searcher.iter_batches(
+                max_feeds=2,
+                max_articles_per_feed=5,
+            )
+        ]
+        second = [
+            batch
+            async for batch in searcher.iter_batches(
+                max_feeds=2,
+                max_articles_per_feed=1,
+            )
+        ]
+        return first, second
+
+    first, second = asyncio.run(run_twice())
+
+    assert client.peak == 2
+    assert all(len(batch.results) <= 3 for batch in first + second)
+    assert all(concurrency == 2 for _, concurrency in provider.calls)
+    assert [len(urls) for urls, _ in provider.calls[:4]] == [3, 2, 3, 2]
+    assert client.requested[:2] == [
+        "https://feeds.example/0.xml",
+        "https://feeds.example/1.xml",
+    ]
+    assert client.requested[2:] == [
+        "https://feeds.example/2.xml",
+        "https://feeds.example/0.xml",
+    ]
+    assert sum(batch.crawl_succeeded for batch in first) == 10
+    assert sum(batch.crawl_succeeded for batch in second) == 2

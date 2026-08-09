@@ -8,7 +8,12 @@ pulling in any I/O dependencies.
 
 from typing import Optional
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+from crawl4ai import (
+    AsyncWebCrawler,
+    BrowserConfig,
+    CrawlerRunConfig,
+    SemaphoreDispatcher,
+)
 
 from core.logger import get_logger
 
@@ -54,12 +59,18 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
     # like text but still contains a non-JSON-serializable generation object.
     raw_markdown = str(raw_markdown)
 
-    # Fallback: use cleaned_html if markdown is empty
-    if not raw_markdown:
-        raw_markdown = getattr(inner, "cleaned_html", "") or ""
+    effective_success = success and bool(raw_markdown.strip())
+    error_message = getattr(inner, "error_message", "") or ""
+    if success and not effective_success:
+        error_message = "Crawler returned empty Markdown content"
 
-    return CrawlResult(
-        url=url,
+    final_url = (
+        getattr(inner, "redirected_url", None)
+        or getattr(inner, "url", None)
+        or url
+    )
+    result = CrawlResult(
+        url=final_url,
         markdown=raw_markdown,
         html=getattr(inner, "cleaned_html", "") or "",
         metadata=CrawlMetadata(
@@ -69,9 +80,11 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
             author=raw_meta.get("author") if isinstance(raw_meta, dict) else None,
             provider="crawl4ai",
         ),
-        success=success,
-        error_message=getattr(inner, "error_message", "") or "",
+        success=effective_success,
+        error_message=error_message,
     )
+    result.context["requested_url"] = url
+    return result
 
 
 # ─── Adapter: crawl4ai ───────────────────────────────────────────────────────
@@ -120,22 +133,30 @@ class Crawl4aiProvider(CrawlerProvider):
         )
 
         result = _build_crawl_result(url=url, inner=inner, success=success)
-        result.error_message = error_msg  # override in case inner had empty string
+        if not result.error_message:
+            result.error_message = error_msg
 
-        if success:
+        if result.success:
             self._logger.info(
                 "[crawl4ai] OK — %s — %d chars",
                 url,
                 result.content_length,
             )
         else:
-            self._logger.warning("[crawl4ai] FAIL — %s: %s", url, error_msg)
+            self._logger.warning(
+                "[crawl4ai] FAIL — %s: %s", url, result.error_message
+            )
 
         return result
 
     # ── crawl_batch ─────────────────────────────────────────────────────────
 
-    async def crawl_batch(self, urls: list[str]) -> list[CrawlResult]:
+    async def crawl_batch(
+        self,
+        urls: list[str],
+        *,
+        max_concurrency: int | None = None,
+    ) -> list[CrawlResult]:
         """
         Crawl multiple URLs concurrently using a shared browser instance.
 
@@ -147,8 +168,17 @@ class Crawl4aiProvider(CrawlerProvider):
 
         self._logger.info("[crawl4ai.batch] crawling %d URLs", len(urls))
 
+        dispatcher = (
+            SemaphoreDispatcher(semaphore_count=max_concurrency)
+            if max_concurrency is not None
+            else None
+        )
         async with AsyncWebCrawler(config=self._browser_config) as crawler:
-            containers = await crawler.arun_many(urls=urls, config=self._run_config)
+            containers = await crawler.arun_many(
+                urls=urls,
+                config=self._run_config,
+                dispatcher=dispatcher,
+            )
 
         results: list[CrawlResult] = []
         for container in containers:
@@ -159,7 +189,8 @@ class Crawl4aiProvider(CrawlerProvider):
                 ("" if success else "unknown crawl4ai error")
             )
             result = _build_crawl_result(url=container_url, inner=inner, success=success)
-            result.error_message = error_msg
+            if not result.error_message:
+                result.error_message = error_msg
             results.append(result)
 
         ok_count = sum(1 for r in results if r.success)

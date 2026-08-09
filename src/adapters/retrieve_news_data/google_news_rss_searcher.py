@@ -15,7 +15,9 @@ in src/models/search_and_crawl_models.py so they can be imported without
 pulling in any I/O dependencies.
 """
 import asyncio
+from collections.abc import AsyncIterator, Iterator
 import csv
+from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 from dataclasses import replace
 from email.utils import parsedate_to_datetime
@@ -32,6 +34,11 @@ from models.search_and_crawl_models import (
     CrawlResult,
     CrawlerProvider,
 )
+from models.storage_models import (
+    CrawlBatch,
+    CrawlFailureOccurrence,
+    FailureTarget,
+)
 
 logger = get_logger(__name__)
 
@@ -41,6 +48,12 @@ class RssFeedSource(NamedTuple):
 
     query_label: str
     rss_url: str
+
+
+class _ArticleJob(NamedTuple):
+    entry: dict
+    query_label: str
+    feed_title: str
 
 
 # ─── Shared decode cache + rate-limiter ───────────────────────────────────────
@@ -178,9 +191,16 @@ def _parse_rss_entry(entry: dict) -> dict:
         if raw_date:
             try:
                 pub_date = parsedate_to_datetime(raw_date)
-                break
             except Exception:
-                pass
+                try:
+                    pub_date = datetime.fromisoformat(
+                        str(raw_date).replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError):
+                    continue
+            if pub_date.tzinfo is None:
+                pub_date = pub_date.replace(tzinfo=timezone.utc)
+            break
 
     return {
         "title": raw_title,
@@ -211,7 +231,7 @@ async def _fetch_rss(url: str, client: httpx.AsyncClient) -> tuple[list[dict], s
     feed_title = (feed.feed.get("title") or "") if feed.feed else ""
 
     if feed.bozo and not feed.entries:
-        logger.warning("[GoogleNews RSS] bozo feed (malformed) at %s: %s", url, feed.bozo_exception)
+        raise ValueError(f"Malformed RSS/Atom feed: {feed.bozo_exception}")
 
     entries = [_parse_rss_entry(e) for e in feed.entries]
     return entries, feed_title
@@ -247,7 +267,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         self,
         feed_path: Optional[str | Path] = None,
         http_client: Optional[httpx.AsyncClient] = None,
-        max_concurrent_crawls: int = 10,
+        max_concurrent_crawls: int = 2,
+        max_concurrent_feeds: int = 2,
+        crawl_batch_size: int = 10,
+        crawl_provider: CrawlerProvider | None = None,
         *,
         tsv_path: Optional[str | Path] = None,
     ) -> None:
@@ -258,6 +281,11 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         )
         self._http_client = http_client
         self._max_concurrent_crawls = max_concurrent_crawls
+        self._max_concurrent_feeds = max_concurrent_feeds
+        self._crawl_batch_size = crawl_batch_size
+        self._crawl_provider = crawl_provider
+        self._feed_offset = 0
+        self._last_feed_offset = 0
         self._logger = get_logger(__name__)
 
     # ── public API ─────────────────────────────────────────────────────────────
@@ -267,36 +295,58 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         max_articles_per_feed: int = 20,
         max_feeds: int = 0,
     ) -> list[CrawlResult]:
-        """
-        Fetch all configured RSS feeds and crawl every discovered article.
+        """Compatibility wrapper returning only crawler results."""
+        batch = await self.fetch_batch(
+            max_articles_per_feed=max_articles_per_feed,
+            max_feeds=max_feeds,
+        )
+        return batch.results
 
-        Args:
-            max_articles_per_feed: Maximum number of entries to process per
-                RSS feed (most recent first). Set to 0 for no per-feed limit.
-            max_feeds: Maximum number of configured feeds to process. Set to 0
-                to process every feed.
+    async def fetch_batch(
+        self,
+        max_articles_per_feed: int = 20,
+        max_feeds: int = 0,
+        sources: list[RssFeedSource] | None = None,
+        feed_offset: int | None = None,
+    ) -> CrawlBatch:
+        """Compatibility wrapper that combines the bounded streamed batches."""
+        combined = CrawlBatch()
+        async for batch in self.iter_batches(
+            max_articles_per_feed=max_articles_per_feed,
+            max_feeds=max_feeds,
+            sources=sources,
+            feed_offset=feed_offset,
+        ):
+            self._merge_batch(combined, batch)
+        return combined
 
-        Returns:
-            Flat list of CrawlResult objects, one per successfully crawled
-            article.  Failed individual articles are logged and skipped; a
-            fully-empty result list is returned only when no feeds were
-            reachable.
-        """
-        queries = self._load_queries()
-        total_queries = len(queries)
-        if max_feeds > 0:
-            queries = queries[:max_feeds]
+    async def iter_batches(
+        self,
+        max_articles_per_feed: int = 20,
+        max_feeds: int = 0,
+        sources: list[RssFeedSource] | None = None,
+        feed_offset: int | None = None,
+    ) -> AsyncIterator[CrawlBatch]:
+        """Yield bounded crawl batches so callers can persist incrementally."""
+        configured = sources if sources is not None else self._load_queries()
+        queries = self._select_sources(
+            configured,
+            max_feeds=max_feeds,
+            feed_offset=feed_offset,
+            advance_offset=sources is None,
+        )
         if not queries:
             self._logger.warning(
                 "[GoogleNews RSS] No RSS URLs found in %s", self._feed_path
             )
-            return []
+            return
 
         self._logger.info(
-            "[GoogleNews RSS] Processing %d/%d RSS feeds from %s",
+            "[GoogleNews RSS] Processing %d/%d RSS feeds from %s at offset %d",
             len(queries),
-            total_queries,
+            len(configured),
             self._feed_path,
+            self._last_feed_offset,
         )
 
         own_client = self._http_client is None
@@ -308,98 +358,256 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 )
             }
         )
-
-        # Two-tier concurrency:
-        #   - 5 feeds in parallel   (MAX_CONCURRENT_FEEDS)
-        #   - up to max_concurrent_crawls article crawls per feed
-        #     shared across ALL active feeds (single semaphore)
-        _MAX_CONCURRENT_FEEDS = 5
-
-        feed_sem = asyncio.Semaphore(_MAX_CONCURRENT_FEEDS)
-        crawl_sem = asyncio.Semaphore(self._max_concurrent_crawls)
-
-        async def _fetch_and_crawl_feed(
-            query_label: str,
-            rss_url: str,
-        ) -> list[CrawlResult]:
-            async with feed_sem:
-                try:
-                    entries, feed_title = await _fetch_rss(rss_url, client)
-                except Exception as exc:
-                    self._logger.warning(
-                        "[GoogleNews RSS] Skipping feed %s (%s): %s",
-                        query_label,
-                        rss_url,
-                        exc,
-                    )
-                    return []
-
-                if not entries:
-                    self._logger.debug(
-                        "[GoogleNews RSS] No entries in feed %s", query_label
-                    )
-                    return []
-
-                total_entries = len(entries)
-
-                # Cap entries per feed
-                if max_articles_per_feed > 0:
-                    entries = entries[:max_articles_per_feed]
-
-                self._logger.info(
-                    "[GoogleNews RSS] %s — %d entries (%d total), crawling %d…",
-                    query_label,
-                    len(entries),
-                    total_entries,
-                    len(entries),
-                )
-
-                async def _crawl_one(entry: dict) -> Optional[CrawlResult]:
-                    async with crawl_sem:
-                        return await self._crawl_single_entry(
-                            entry=entry,
-                            query_label=query_label,
-                            feed_title=feed_title,
-                        )
-
-                crawl_results = await asyncio.gather(
-                    *[_crawl_one(e) for e in entries],
+        try:
+            for feed_group in self._chunks(queries, self._max_concurrent_feeds):
+                fetched = await asyncio.gather(
+                    *[_fetch_rss(source.rss_url, client) for source in feed_group],
                     return_exceptions=True,
                 )
-                return [
-                    r
-                    for r in crawl_results
-                    if r is not None and not isinstance(r, Exception)
-                ]
+                discovery = CrawlBatch()
+                feed_entries: list[tuple[RssFeedSource, str, list[dict], int]] = []
+                for source, outcome in zip(feed_group, fetched, strict=True):
+                    discovery.feeds_processed += 1
+                    if isinstance(outcome, Exception):
+                        discovery.failures.append(
+                            CrawlFailureOccurrence(
+                                failure_kind="feed",
+                                url=source.rss_url,
+                                source=source.query_label or None,
+                                error_type=type(outcome).__name__,
+                                error_message=str(outcome),
+                            )
+                        )
+                        continue
 
-        try:
-            feed_results = await asyncio.gather(
-                *[
-                    _fetch_and_crawl_feed(label, url)
-                    for label, url in queries
-                ],
-                return_exceptions=True,
-            )
-            results: list[CrawlResult] = []
-            for feed_result in feed_results:
-                if isinstance(feed_result, Exception):
-                    self._logger.warning(
-                        "[GoogleNews RSS] Unexpected error in feed task: %s",
-                        feed_result,
+                    entries, feed_title = outcome
+                    discovery.resolved_failures.append(
+                        FailureTarget(failure_kind="feed", url=source.rss_url)
                     )
-                elif isinstance(feed_result, list):
-                    results.extend(feed_result)
+                    discovery.articles_discovered += len(entries)
+                    selected_count = (
+                        min(max_articles_per_feed, len(entries))
+                        if max_articles_per_feed > 0
+                        else len(entries)
+                    )
+                    self._logger.info(
+                        "[GoogleNews RSS] %s — %d entries (%d total), crawling %d…",
+                        source.query_label,
+                        selected_count,
+                        len(entries),
+                        selected_count,
+                    )
+                    feed_entries.append(
+                        (source, feed_title, entries, selected_count)
+                    )
 
+                yield discovery
+                for source, feed_title, entries, selected_count in feed_entries:
+                    for start in range(
+                        0, selected_count, self._crawl_batch_size
+                    ):
+                        jobs = [
+                            _ArticleJob(entry, source.query_label, feed_title)
+                            for entry in entries[
+                                start : min(
+                                    start + self._crawl_batch_size,
+                                    selected_count,
+                                )
+                            ]
+                        ]
+                        yield await self._crawl_job_batch(jobs)
         finally:
             if own_client:
                 await client.aclose()
 
-        self._logger.info(
-            "[GoogleNews RSS] Done — %d articles crawled across %d feeds",
-            len(results),
-            len(queries),
+    @property
+    def next_feed_offset(self) -> int:
+        return self._feed_offset
+
+    def _select_sources(
+        self,
+        sources: list[RssFeedSource],
+        *,
+        max_feeds: int,
+        feed_offset: int | None,
+        advance_offset: bool,
+    ) -> list[RssFeedSource]:
+        if not sources:
+            self._last_feed_offset = 0
+            return []
+        start = (self._feed_offset if feed_offset is None else feed_offset) % len(
+            sources
         )
-        return results
+        self._last_feed_offset = start
+        count = len(sources) if max_feeds == 0 else min(max_feeds, len(sources))
+        selected = [sources[(start + index) % len(sources)] for index in range(count)]
+        if advance_offset:
+            self._feed_offset = (start + count) % len(sources)
+        return selected
+
+    @staticmethod
+    def _chunks(items: list, size: int) -> Iterator[list]:
+        for start in range(0, len(items), size):
+            yield items[start : start + size]
+
+    @staticmethod
+    def _merge_batch(destination: CrawlBatch, source: CrawlBatch) -> None:
+        destination.results.extend(source.results)
+        destination.failures.extend(source.failures)
+        destination.resolved_failures.extend(source.resolved_failures)
+        destination.feeds_processed += source.feeds_processed
+        destination.articles_discovered += source.articles_discovered
+
+    def _provider(self) -> CrawlerProvider:
+        if self._crawl_provider is None:
+            from adapters.retrieve_news_data.crawler import Crawl4aiProvider
+
+            self._crawl_provider = Crawl4aiProvider()
+        return self._crawl_provider
+
+    async def _crawl_job_batch(
+        self,
+        jobs: list[_ArticleJob],
+        *,
+        max_concurrency: int | None = None,
+    ) -> CrawlBatch:
+        decoded_urls = await asyncio.gather(
+            *[
+                _decode_google_news_url_async(
+                    job.entry.get("feed_entry_url")
+                    or job.entry.get("google_news_url", "")
+                )
+                for job in jobs
+            ]
+        )
+        outcomes: list[CrawlResult | None] = [None] * len(jobs)
+        crawl_indexes: list[int] = []
+        crawl_urls: list[str] = []
+        for index, (job, real_url) in enumerate(
+            zip(jobs, decoded_urls, strict=True)
+        ):
+            feed_entry_url = job.entry.get("feed_entry_url", "")
+            if not real_url:
+                outcomes[index] = CrawlResult(
+                    url=feed_entry_url,
+                    markdown="",
+                    success=False,
+                    error_message="Empty URL after decoding",
+                )
+            elif "news.google.com" in feed_entry_url and real_url == feed_entry_url:
+                outcomes[index] = CrawlResult(
+                    url=feed_entry_url,
+                    markdown="",
+                    success=False,
+                    error_message="Unable to decode Google News redirect URL",
+                )
+            else:
+                crawl_indexes.append(index)
+                crawl_urls.append(real_url)
+
+        if crawl_urls:
+            try:
+                crawled = await self._provider().crawl_batch(
+                    crawl_urls,
+                    max_concurrency=(
+                        max_concurrency or self._max_concurrent_crawls
+                    ),
+                )
+                if len(crawled) != len(crawl_urls):
+                    raise RuntimeError(
+                        "Crawler returned a different number of batch results"
+                    )
+            except Exception as exc:
+                crawled = [
+                    CrawlResult(
+                        url=url,
+                        markdown="",
+                        success=False,
+                        error_message=str(exc),
+                    )
+                    for url in crawl_urls
+                ]
+            for index, result in zip(crawl_indexes, crawled, strict=True):
+                outcomes[index] = result
+
+        batch = CrawlBatch()
+        for job, real_url, result in zip(
+            jobs, decoded_urls, outcomes, strict=True
+        ):
+            assert result is not None
+            enriched = self._enrich_result(result, job, real_url)
+            self._add_article_outcome(batch, job, enriched)
+        return batch
+
+    def _enrich_result(
+        self,
+        result: CrawlResult,
+        job: _ArticleJob,
+        real_url: str,
+    ) -> CrawlResult:
+        feed_entry_url = job.entry.get("feed_entry_url", "")
+        crawl_meta = result.metadata or CrawlMetadata()
+        enriched = replace(
+            result,
+            metadata=CrawlMetadata(
+                title=crawl_meta.title or job.entry.get("title", ""),
+                description=crawl_meta.description,
+                language=crawl_meta.language,
+                author=crawl_meta.author,
+                provider=(
+                    "google_news_rss"
+                    if "news.google.com" in feed_entry_url
+                    else "rss_feed"
+                ),
+            ),
+        )
+        enriched.context.update(
+            {
+                "query_label": job.query_label,
+                "feed_title": job.feed_title,
+                "source_name": job.entry.get("source", ""),
+                "feed_entry_url": feed_entry_url,
+                "google_news_url": (
+                    feed_entry_url if "news.google.com" in feed_entry_url else ""
+                ),
+                "published_date": job.entry.get("published_date"),
+                "requested_url": real_url or feed_entry_url,
+            }
+        )
+        return enriched
+
+    @staticmethod
+    def _add_article_outcome(
+        batch: CrawlBatch,
+        job: _ArticleJob,
+        result: CrawlResult,
+    ) -> None:
+        feed_entry_url = job.entry.get("feed_entry_url", "")
+        source = job.feed_title or job.query_label or None
+        batch.results.append(result)
+        if result.success:
+            resolved_urls = {
+                result.url,
+                feed_entry_url,
+                result.context.get("requested_url", ""),
+            }
+            batch.resolved_failures.extend(
+                FailureTarget(failure_kind="article", url=url)
+                for url in resolved_urls
+                if url
+            )
+            return
+        batch.failures.append(
+            CrawlFailureOccurrence(
+                failure_kind="article",
+                url=result.url or feed_entry_url,
+                source=source,
+                title=job.entry.get("title") or None,
+                published_at=job.entry.get("published_date"),
+                error_type="CrawlError",
+                error_message=result.error_message or "Unknown crawl failure",
+            )
+        )
 
     # ── CrawlerProvider contract ───────────────────────────────────────────────
 
@@ -420,6 +628,13 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 success=False,
                 error_message="Empty URL after decoding",
             )
+        if google_url and real_url == google_url:
+            return CrawlResult(
+                url=url,
+                markdown="",
+                success=False,
+                error_message="Unable to decode Google News redirect URL",
+            )
 
         return await self._do_crawl(
             real_url=real_url,
@@ -431,9 +646,34 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             published_date=None,
         )
 
-    async def crawl_batch(self, urls: list[str]) -> list[CrawlResult]:
-        """Crawl a batch of Google News redirect URLs."""
-        return [await self.crawl(u) for u in urls]
+    async def crawl_batch(
+        self,
+        urls: list[str],
+        *,
+        max_concurrency: int | None = None,
+    ) -> list[CrawlResult]:
+        """Crawl URLs in bounded chunks, sharing one browser per chunk."""
+        results: list[CrawlResult] = []
+        jobs = [
+            _ArticleJob(
+                {
+                    "feed_entry_url": url,
+                    "title": "",
+                    "source": "",
+                    "published_date": None,
+                },
+                "",
+                "",
+            )
+            for url in urls
+        ]
+        for chunk in self._chunks(jobs, self._crawl_batch_size):
+            batch = await self._crawl_job_batch(
+                chunk,
+                max_concurrency=max_concurrency,
+            )
+            results.extend(batch.results)
+        return results
 
     # ── internal ──────────────────────────────────────────────────────────────
 
@@ -455,6 +695,13 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 entry.get("title", "(no title)"),
             )
             return None
+        if "news.google.com" in feed_entry_url and real_url == feed_entry_url:
+            return CrawlResult(
+                url=feed_entry_url,
+                markdown="",
+                success=False,
+                error_message="Unable to decode Google News redirect URL",
+            )
 
         return await self._do_crawl(
             real_url=real_url,
@@ -482,41 +729,21 @@ class GoogleNewsRssSearcher(CrawlerProvider):
 
         If the crawl fails the returned CrawlResult has ``success=False``.
         """
-        # Import here to keep the module-level namespace clean
-        from adapters.retrieve_news_data.crawler import Crawl4aiProvider
-
-        provider = Crawl4aiProvider()
-        result = await provider.crawl(real_url)
-
-        # Attach Google News–specific metadata on top of crawl4ai metadata
-        crawl_meta: CrawlMetadata = result.metadata or CrawlMetadata()
-        enriched_meta = CrawlMetadata(
-            title=crawl_meta.title or entry_title,
-            description=crawl_meta.description,
-            language=crawl_meta.language,
-            author=crawl_meta.author,
-            provider=(
-                "google_news_rss"
-                if "news.google.com" in feed_entry_url
-                else "rss_feed"
-            ),
-        )
-
-        # Preserve crawl content while attaching feed-level trace context.
-        enriched_result = replace(
+        result = await self._provider().crawl(real_url)
+        enriched_result = self._enrich_result(
             result,
-            metadata=enriched_meta,
-        )
-        enriched_result.context.update({
-            "query_label": query_label,
-            "feed_title": feed_title,
-            "source_name": source_name,
-            "feed_entry_url": feed_entry_url,
-            "google_news_url": (
-                feed_entry_url if "news.google.com" in feed_entry_url else ""
+            _ArticleJob(
+                {
+                    "feed_entry_url": feed_entry_url,
+                    "title": entry_title,
+                    "source": source_name,
+                    "published_date": published_date,
+                },
+                query_label,
+                feed_title,
             ),
-            "published_date": published_date,
-        })
+            real_url,
+        )
 
         if result.success:
             self._logger.debug(

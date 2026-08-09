@@ -1,0 +1,209 @@
+import asyncio
+from datetime import datetime, timezone
+import os
+
+import pytest
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from adapters.storage.postgres import PostgresRawStorage
+from adapters.storage.schema import crawl_failures, ingest_runs, raw_articles
+from models.storage_models import (
+    CrawlFailureOccurrence,
+    FailureTarget,
+    IngestRunStats,
+    RawArticle,
+)
+
+
+DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+pytestmark = pytest.mark.integration
+
+
+def test_postgres_upsert_and_failure_state() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_postgres_upsert_and_failure_state())
+
+
+async def _test_postgres_upsert_and_failure_state() -> None:
+    url = "https://integration.example/article"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    now = datetime.now(timezone.utc)
+    run_ids: list[int] = []
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        async with engine.begin() as connection:
+            await connection.execute(delete(raw_articles).where(raw_articles.c.url == url))
+            await connection.execute(delete(crawl_failures).where(crawl_failures.c.url == url))
+
+        original = RawArticle(
+            url=url,
+            title="Original",
+            source="Example",
+            content="one",
+            content_hash=b"1" * 32,
+            published_at=now,
+            crawled_at=now,
+        )
+        inserted = await storage.apply_batch([original], [], [], received=1, rejected=0)
+        async with engine.connect() as connection:
+            inserted_row = (
+                await connection.execute(
+                    select(raw_articles).where(raw_articles.c.url == url)
+                )
+            ).one()
+        unchanged = await storage.apply_batch([original], [], [], received=1, rejected=0)
+        async with engine.connect() as connection:
+            unchanged_row = (
+                await connection.execute(
+                    select(raw_articles).where(raw_articles.c.url == url)
+                )
+            ).one()
+        changed = RawArticle(
+            url=url,
+            title=None,
+            source=None,
+            content="two",
+            content_hash=b"2" * 32,
+            published_at=None,
+            crawled_at=now,
+        )
+        updated = await storage.apply_batch([changed], [], [], received=1, rejected=0)
+
+        assert inserted.written == 1
+        assert unchanged.unchanged == 1
+        assert updated.written == 1
+        assert unchanged_row.updated_at == inserted_row.updated_at
+
+        metadata_change = RawArticle(
+            url=url,
+            title="Renamed",
+            source=None,
+            content="two",
+            content_hash=b"2" * 32,
+            published_at=None,
+            crawled_at=now,
+        )
+        metadata_updated = await storage.apply_batch(
+            [metadata_change], [], [], received=1, rejected=0
+        )
+        assert metadata_updated.written == 1
+
+        failure = CrawlFailureOccurrence(
+            failure_kind="article",
+            url=url,
+            source="Example",
+            error_type="TimeoutError",
+            error_message="timeout",
+        )
+        await storage.apply_batch([], [failure], [], received=0, rejected=0)
+        failure_without_context = CrawlFailureOccurrence(
+            failure_kind="article",
+            url=url,
+            error_type="TimeoutError",
+            error_message="timeout again",
+        )
+        await storage.apply_batch(
+            [], [failure_without_context], [], received=0, rejected=0
+        )
+
+        async with engine.connect() as connection:
+            article = (
+                await connection.execute(
+                    select(raw_articles).where(raw_articles.c.url == url)
+                )
+            ).one()
+            failed = (
+                await connection.execute(
+                    select(crawl_failures).where(crawl_failures.c.url == url)
+                )
+            ).one()
+        assert article.title == "Renamed"
+        assert article.source == "Example"
+        assert article.content == "two"
+        assert failed.attempt_count == 2
+        assert failed.source == "Example"
+        assert (
+            failed.next_retry_at - failed.last_failed_at
+        ).total_seconds() == pytest.approx(600, abs=1)
+
+        await storage.apply_batch(
+            [],
+            [],
+            [FailureTarget(failure_kind="article", url=url)],
+            received=0,
+            rejected=0,
+        )
+        succeeded_id = await storage.start_run("pipeline_crawl")
+        run_ids.append(succeeded_id)
+        async with engine.connect() as connection:
+            running_status = await connection.scalar(
+                select(ingest_runs.c.status).where(
+                    ingest_runs.c.id == succeeded_id
+                )
+            )
+        assert running_status == "running"
+
+        checkpoint_stats = IngestRunStats(
+            feeds_processed=2,
+            articles_written=1,
+        )
+        await storage.update_run(succeeded_id, checkpoint_stats)
+        async with engine.connect() as connection:
+            checkpointed = (
+                await connection.execute(
+                    select(ingest_runs).where(
+                        ingest_runs.c.id == succeeded_id
+                    )
+                )
+            ).one()
+        assert checkpointed.status == "running"
+        assert checkpointed.feeds_processed == 2
+        assert checkpointed.articles_written == 1
+
+        await storage.finish_run(succeeded_id, "succeeded", checkpoint_stats)
+        partial_id = await storage.start_run("pipeline_rss")
+        run_ids.append(partial_id)
+        await storage.finish_run(partial_id, "partial", IngestRunStats())
+        failed_id = await storage.start_run("service")
+        run_ids.append(failed_id)
+        await storage.finish_run(
+            failed_id,
+            "failed",
+            IngestRunStats(),
+            "fatal error",
+        )
+        async with engine.connect() as connection:
+            resolved = await connection.scalar(
+                select(crawl_failures.c.url).where(crawl_failures.c.url == url)
+            )
+            runs = await connection.execute(
+                select(ingest_runs.c.id, ingest_runs.c.status).where(
+                    ingest_runs.c.id.in_(run_ids)
+                )
+            )
+        assert resolved is None
+        assert dict(runs.all()) == {
+            succeeded_id: "succeeded",
+            partial_id: "partial",
+            failed_id: "failed",
+        }
+    finally:
+        if ready:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    delete(raw_articles).where(raw_articles.c.url == url)
+                )
+                await connection.execute(
+                    delete(crawl_failures).where(crawl_failures.c.url == url)
+                )
+                if run_ids:
+                    await connection.execute(
+                        delete(ingest_runs).where(ingest_runs.c.id.in_(run_ids))
+                    )
+        await engine.dispose()
+        await storage.close()

@@ -188,12 +188,18 @@ class CrawlerProvider(ABC):
         ...
 
     @abstractmethod
-    async def crawl_batch(self, urls: list[str]) -> list[CrawlResult]:
+    async def crawl_batch(
+        self,
+        urls: list[str],
+        *,
+        max_concurrency: int | None = None,
+    ) -> list[CrawlResult]:
         """
         Fetch and extract content from multiple URLs.
 
         Args:
             urls: List of fully-qualified URLs.
+            max_concurrency: Optional upper bound for active page crawls.
 
         Returns:
             List of CrawlResult objects (one per URL, in the same order).
