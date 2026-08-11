@@ -8,3 +8,7 @@ build/
 dist/
 *.egg-info/
 logs/
+
+node_modules/
+.next/
+frontend/out/

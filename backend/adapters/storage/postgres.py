@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from adapters.storage.schema import crawl_failures, ingest_runs, raw_articles
 from models.storage_models import (
+    ArticleListItem,
     CrawlFailureOccurrence,
     FailureTarget,
     IngestRunStats,
@@ -237,6 +238,63 @@ class PostgresRawStorage:
             unchanged=unchanged,
             rejected=rejected,
         )
+
+    async def list_articles(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        source: str | None = None,
+        query: str | None = None,
+    ) -> tuple[list[ArticleListItem], int]:
+        list_columns = (
+            raw_articles.c.id,
+            raw_articles.c.url,
+            raw_articles.c.title,
+            raw_articles.c.source,
+            raw_articles.c.published_at,
+            raw_articles.c.crawled_at,
+        )
+        filters = []
+        if source:
+            filters.append(raw_articles.c.source == source)
+        if query:
+            filters.append(raw_articles.c.title.ilike(f"%{query}%"))
+
+        async with self._engine.connect() as connection:
+            count_stmt = select(func.count()).select_from(raw_articles)
+            for condition in filters:
+                count_stmt = count_stmt.where(condition)
+            total = (await connection.execute(count_stmt)).scalar_one()
+
+            list_stmt = select(*list_columns)
+            for condition in filters:
+                list_stmt = list_stmt.where(condition)
+            list_stmt = (
+                list_stmt.order_by(raw_articles.c.crawled_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            result = await connection.execute(list_stmt)
+            items = [ArticleListItem(**dict(row._mapping)) for row in result]
+            return items, int(total)
+
+    async def get_article(self, article_id: int) -> RawArticle | None:
+        columns = (
+            raw_articles.c.url,
+            raw_articles.c.title,
+            raw_articles.c.source,
+            raw_articles.c.content,
+            raw_articles.c.content_hash,
+            raw_articles.c.published_at,
+            raw_articles.c.crawled_at,
+        )
+        async with self._engine.connect() as connection:
+            result = await connection.execute(
+                select(*columns).where(raw_articles.c.id == article_id)
+            )
+            row = result.first()
+            return RawArticle(**dict(row._mapping)) if row is not None else None
 
     async def due_failures(self, limit: int) -> list[StoredCrawlFailure]:
         now = datetime.now(timezone.utc)

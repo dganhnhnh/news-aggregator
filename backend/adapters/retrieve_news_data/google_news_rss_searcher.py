@@ -11,7 +11,7 @@ Pipeline per article:
   4. Crawl real URL  (crawl4ai)
 
 Domain models (CrawlResult, CrawlerProvider, CrawlError, CrawlMetadata) live
-in src/models/search_and_crawl_models.py so they can be imported without
+in backend/models/search_and_crawl_models.py so they can be imported without
 pulling in any I/O dependencies.
 """
 import asyncio

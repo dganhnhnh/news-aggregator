@@ -5,23 +5,36 @@
 News Radar searches and crawls web articles directly or through RSS/Atom feeds
 from TSV/OPML. Persisted jobs keep only the latest normalized Markdown article
 in PostgreSQL and record current failures plus per-run operational summaries.
+A read-only FastAPI app exposes that data; `frontend/` is a placeholder for a
+future Next.js UI.
 
 ## Structure and design
 
-- `src/pipelines/news.py`: one-shot `news-pipeline` commands. `crawl` and `rss`
-  persist only with `--persist`; Tavily `search` never persists.
-- `src/services/news.py`: periodic `news-service`; always requires PostgreSQL,
-  retries due failures before fresh feed ingestion, and emits JSONL only with
-  `--emit-jsonl`.
-- `src/adapters/retrieve_news_data/`: Tavily, crawl4ai, and RSS/OPML adapters.
-- `src/services/raw_storage.py` and `ingestion.py`: normalization, hashing,
-  batch deduplication, persistence orchestration, and retry handling.
-- `src/adapters/storage/`: async SQLAlchemy/asyncpg repository and schema.
+- `backend/`: single Python package (setuptools `where = ["backend"]`); all
+  internal imports stay flat (`from core...`, `from adapters...`), matching
+  `alembic.ini`'s `prepend_sys_path = backend`.
+  - `pipelines/news.py`: one-shot `news-pipeline` commands. `crawl` and `rss`
+    persist only with `--persist`; Tavily `search` never persists.
+  - `services/news.py`: periodic `news-service`; always requires PostgreSQL,
+    retries due failures before fresh feed ingestion, and emits JSONL only
+    with `--emit-jsonl`.
+  - `adapters/retrieve_news_data/`: Tavily, crawl4ai, and RSS/OPML adapters.
+  - `services/raw_storage.py` and `ingestion.py`: normalization, hashing,
+    batch deduplication, persistence orchestration, and retry handling.
+  - `adapters/storage/`: async SQLAlchemy/asyncpg repository and schema.
+  - `api/`: `news-api` FastAPI app (`main.py`, `deps.py`, `routers/`); reuses
+    `PostgresRawStorage` for read-only endpoints, never writes.
+  - `migrations/`: Alembic environment and revisions.
+  - `tests/`: unit and PostgreSQL integration tests.
+- `frontend/`: empty placeholder for a future Next.js app; see
+  `frontend/README.md` for the scaffold command.
+- `deployments/`: `docker-compose.yml` (PostgreSQL only) and `Dockerfile.api`.
 - PostgreSQL has three tables: `raw_articles` (latest version only),
   `crawl_failures` (current durable retry queue), and `ingest_runs` (monitoring).
   Raw HTML and historical article versions are intentionally not stored.
-- PostgreSQL 16 runs through `compose.yaml` with named volume
-  `news_radar_postgres_data`; host-side CLI jobs run Alembic explicitly.
+- PostgreSQL 16 runs through `deployments/docker-compose.yml` with named volume
+  `news_radar_postgres_data`; host-side CLI jobs run Alembic explicitly. Always
+  pass `--env-file .env` since the compose file no longer sits next to it.
 
 ## Development notes
 
@@ -40,12 +53,15 @@ in PostgreSQL and record current failures plus per-run operational summaries.
   chunk, and preserve completed chunks if a later chunk is interrupted.
 - Keep limited-feed runs rotating through the source list; use
   `RSS_FEED_OFFSET`/`--feed-offset` when a deterministic starting point matters.
+- The API is read-only: it must never write to `raw_articles`,
+  `crawl_failures`, or `ingest_runs`. Add new read methods to
+  `PostgresRawStorage` rather than querying tables directly from routers.
 - Add focused unit tests and PostgreSQL integration tests for storage changes.
   Run `uv run --extra dev pytest`; integration tests use `TEST_DATABASE_URL`.
 
 ### Alembic migrations
 
-- Treat `src/adapters/storage/schema.py` as the schema source of truth.
+- Treat `backend/adapters/storage/schema.py` as the schema source of truth.
 - Create revisions only with
   `uv run alembic revision --autogenerate -m "<short description>"` against a
   database already at head. Never hand-write the file or pass `--rev-id`; keep

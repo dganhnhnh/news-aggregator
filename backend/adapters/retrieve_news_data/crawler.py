@@ -2,7 +2,7 @@
 Crawl provider adapter — crawl4ai implementation + coordinator.
 
 Domain models (CrawlResult, CrawlerProvider ABC, CrawlError) live in
-src/models/search_and_crawl_models.py so they can be imported without
+backend/models/search_and_crawl_models.py so they can be imported without
 pulling in any I/O dependencies.
 """
 

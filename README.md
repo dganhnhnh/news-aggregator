@@ -2,7 +2,8 @@
 
 Repo này crawl nội dung web trực tiếp hoặc từ RSS/Atom, lưu bản mới nhất của
 mỗi article vào PostgreSQL, đồng thời duy trì hàng đợi retry và thống kê từng
-lần ingest.
+lần ingest. Backend (Python/FastAPI) nằm trong `backend/`, frontend (Next.js)
+nằm trong `frontend/`.
 
 ## Cài đặt
 
@@ -16,16 +17,18 @@ uv run crawl4ai-setup
 
 ## Khởi động PostgreSQL
 
-PostgreSQL 16 chạy trong Compose, còn các CLI job chạy trên host:
+PostgreSQL 16 chạy trong Compose (`deployments/docker-compose.yml`), còn các
+CLI job chạy trên host:
 
 ```bash
-docker compose up -d db
+docker compose -f deployments/docker-compose.yml --env-file .env up -d db
 uv run alembic upgrade head
 ```
 
 Compose dùng named volume `news_radar_postgres_data`, vì vậy dữ liệu vẫn còn
 khi container được restart hoặc tạo lại. Nếu port `5432` trên host đã bận, đổi
-cả `POSTGRES_PORT` và port trong `DATABASE_URL`, ví dụ `55432`.
+cả `POSTGRES_PORT` và port trong `DATABASE_URL`, ví dụ `55432`. `--env-file .env`
+là bắt buộc vì file compose không còn nằm cạnh `.env` ở root.
 
 Alembic không tự chạy khi service khởi động. Nếu DB chưa kết nối được hoặc
 schema chưa migrate, job có persistence sẽ dừng trước khi crawl và in hướng
@@ -33,8 +36,8 @@ dẫn chạy migration.
 
 ### Thay đổi schema và tạo migration
 
-`src/adapters/storage/schema.py` là source of truth. Sau khi thay đổi schema,
-luôn tạo revision bằng autogenerate trên DB đang ở migration head:
+`backend/adapters/storage/schema.py` là source of truth. Sau khi thay đổi
+schema, luôn tạo revision bằng autogenerate trên DB đang ở migration head:
 
 ```bash
 uv run alembic upgrade head
@@ -137,9 +140,34 @@ Schema chỉ có ba bảng:
 Không lưu raw HTML hay phiên bản cũ. Có thể kiểm tra nhanh trạng thái bằng:
 
 ```bash
-docker compose exec db psql -U news_radar -d news_radar -c "SELECT status, count(*) FROM ingest_runs GROUP BY status;"
-docker compose exec db psql -U news_radar -d news_radar -c "SELECT failure_kind, count(*) FROM crawl_failures GROUP BY failure_kind;"
+docker compose -f deployments/docker-compose.yml --env-file .env exec db psql -U news_radar -d news_radar -c "SELECT status, count(*) FROM ingest_runs GROUP BY status;"
+docker compose -f deployments/docker-compose.yml --env-file .env exec db psql -U news_radar -d news_radar -c "SELECT failure_kind, count(*) FROM crawl_failures GROUP BY failure_kind;"
 ```
+
+## Chạy API
+
+`backend/api/` là một FastAPI app read-only trên cùng schema (`raw_articles`),
+dùng chung `PostgresRawStorage`
+([backend/adapters/storage/postgres.py](backend/adapters/storage/postgres.py))
+với pipeline/service. Yêu cầu PostgreSQL đã migrate:
+
+```bash
+uv run news-api
+```
+
+Mặc định lắng nghe `API_HOST`/`API_PORT` (`0.0.0.0:8000`); `CORS_ALLOW_ORIGINS`
+trong `.env` là danh sách origin (phân tách bởi dấu phẩy) được phép gọi API,
+mặc định `http://localhost:3000` cho frontend dev. Endpoint hiện có:
+
+- `GET /health`, `GET /health/db`
+- `GET /api/articles?limit=&offset=&source=&q=`
+- `GET /api/articles/{id}`
+
+## Frontend
+
+`frontend/` hiện là chỗ trống, chưa scaffold. Xem
+[frontend/README.md](frontend/README.md) để khởi tạo bằng `pnpm create next-app`
+khi cần.
 
 ## Kiểm thử
 

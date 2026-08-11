@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from adapters.storage.postgres import PostgresRawStorage
 from adapters.storage.schema import crawl_failures, ingest_runs, raw_articles
 from models.storage_models import (
+    ArticleListItem,
     CrawlFailureOccurrence,
     FailureTarget,
     IngestRunStats,
@@ -130,6 +131,32 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         assert (
             failed.next_retry_at - failed.last_failed_at
         ).total_seconds() == pytest.approx(600, abs=1)
+
+        fetched = await storage.get_article(article.id)
+        assert fetched is not None
+        assert fetched.url == url
+        assert fetched.content == "two"
+        assert await storage.get_article(-1) is None
+
+        listed, total = await storage.list_articles(
+            limit=50, offset=0, query="Renamed", source="Example"
+        )
+        assert total == 1
+        assert listed == [
+            ArticleListItem(
+                id=article.id,
+                url=url,
+                title="Renamed",
+                source="Example",
+                published_at=now,
+                crawled_at=now,
+            )
+        ]
+        no_match, no_match_total = await storage.list_articles(
+            limit=50, offset=0, query="no-such-title-xyz"
+        )
+        assert no_match == []
+        assert no_match_total == 0
 
         await storage.apply_batch(
             [],

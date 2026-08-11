@@ -49,6 +49,16 @@ class RawArticle:
     crawled_at: datetime
 
 
+@dataclass(frozen=True)
+class ArticleListItem:
+    id: int
+    url: str
+    title: str | None
+    source: str | None
+    published_at: datetime | None
+    crawled_at: datetime
+
+
 @dataclass
 class CrawlBatch:
     results: list[CrawlResult] = field(default_factory=list)

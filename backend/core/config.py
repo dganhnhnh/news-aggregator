@@ -36,12 +36,20 @@ class Settings:
     feed_offset: int
     max_retries_per_run: int
     service_interval_seconds: int
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    cors_allow_origins: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "Settings":
         feed_path = (
             os.getenv("RSS_FEED_PATH", "").strip()
             or os.getenv("GOOGLE_NEWS_TSV_PATH", "").strip()
+        )
+        cors_origins = tuple(
+            origin.strip()
+            for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+            if origin.strip()
         )
         return cls(
             tavily_api_key=os.getenv("TAVILY_API_KEY") or None,
@@ -56,6 +64,9 @@ class Settings:
             feed_offset=_env_int("RSS_FEED_OFFSET", 0),
             max_retries_per_run=_env_int("MAX_RETRIES_PER_RUN", 50),
             service_interval_seconds=_env_int("SERVICE_INTERVAL_SECONDS", 1800),
+            api_host=os.getenv("API_HOST", "0.0.0.0"),
+            api_port=_env_int("API_PORT", 8000),
+            cors_allow_origins=cors_origins,
         )
 
     @property

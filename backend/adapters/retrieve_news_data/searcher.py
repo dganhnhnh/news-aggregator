@@ -2,7 +2,7 @@
 Search provider adapter — Tavily implementation + coordinator.
 
 Domain models (SearchResult, Searcher ABC, SearchError) live in
-src/models/search_and_crawl_models.py so they can be imported without
+backend/models/search_and_crawl_models.py so they can be imported without
 pulling in any I/O dependencies.
 """
 import os
