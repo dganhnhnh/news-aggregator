@@ -5,11 +5,14 @@ from logging.config import fileConfig
 import os
 
 from alembic import context
+from dotenv import load_dotenv
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from adapters.storage.schema import metadata
 
+
+load_dotenv()
 
 config = context.config
 if config.config_file_name is not None:
@@ -22,6 +25,14 @@ if database_url:
 target_metadata = metadata
 
 
+def render_item(type_, obj, autogen_context):
+    """Render third-party pgvector types in generated revisions."""
+    if type_ == "type" and obj.__class__.__module__.startswith("pgvector"):
+        autogen_context.imports.add("import pgvector.sqlalchemy")
+        return f"pgvector.sqlalchemy.Vector({obj.dim})"
+    return False
+
+
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
     if not url:
@@ -31,13 +42,18 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        render_item=render_item,
     )
     with context.begin_transaction():
         context.run_migrations()
 
 
 def do_run_migrations(connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        render_item=render_item,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
