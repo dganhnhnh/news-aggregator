@@ -222,9 +222,11 @@ class PostgresRawStorage:
             for article in articles:
                 stmt = pg_insert(raw_articles).values(
                     url=article.url,
+                    url_original=article.url_original,
                     source_id=source_ids[article_slugs[article.url]],
                     title=article.title,
                     source=article.source,
+                    lang=article.lang,
                     content=article.content,
                     content_hash=article.content_hash,
                     published_at=article.published_at,
@@ -233,6 +235,7 @@ class PostgresRawStorage:
                 incoming = stmt.excluded
                 merged_title = func.coalesce(incoming.title, raw_articles.c.title)
                 merged_source = func.coalesce(incoming.source, raw_articles.c.source)
+                merged_lang = func.coalesce(incoming.lang, raw_articles.c.lang)
                 merged_published = func.coalesce(
                     incoming.published_at,
                     raw_articles.c.published_at,
@@ -240,9 +243,11 @@ class PostgresRawStorage:
                 statement = stmt.on_conflict_do_update(
                     index_elements=[raw_articles.c.url],
                     set_={
+                        "url_original": incoming.url_original,
                         "title": merged_title,
                         "source": merged_source,
                         "source_id": incoming.source_id,
+                        "lang": merged_lang,
                         "content": incoming.content,
                         "content_hash": incoming.content_hash,
                         "published_at": merged_published,
@@ -254,7 +259,9 @@ class PostgresRawStorage:
                         raw_articles.c.title.is_distinct_from(merged_title),
                         raw_articles.c.source.is_distinct_from(merged_source),
                         raw_articles.c.source_id.is_distinct_from(incoming.source_id),
+                        raw_articles.c.lang.is_distinct_from(merged_lang),
                         raw_articles.c.published_at.is_distinct_from(merged_published),
+                        raw_articles.c.url_original.is_distinct_from(incoming.url_original),
                     ),
                 ).returning(raw_articles.c.id)
                 result = await connection.execute(statement)
@@ -314,8 +321,10 @@ class PostgresRawStorage:
     async def get_article(self, article_id: int) -> RawArticle | None:
         columns = (
             raw_articles.c.url,
+            raw_articles.c.url_original,
             raw_articles.c.title,
             raw_articles.c.source,
+            raw_articles.c.lang,
             raw_articles.c.content,
             raw_articles.c.content_hash,
             raw_articles.c.published_at,

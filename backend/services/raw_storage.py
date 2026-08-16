@@ -4,14 +4,34 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from models.search_and_crawl_models import CrawlResult
 from models.storage_models import RawArticle
 
 
-_TRACKING_PARAMETERS = {"fbclid", "gclid"}
+_TRACKING_PARAMETERS = {
+    "fbclid",
+    "gclid",
+    "mc_cid",
+    "mc_eid",
+    "igshid",
+    "ref",
+    "ref_src",
+    "_hsenc",
+}
 _SOURCE_HOST_PREFIXES = ("www.", "m.", "amp.")
+# Only m./amp. are collapsed at the URL level; www. is left alone since it is
+# not reliably an alias of the bare host the way AMP/mobile mirrors are.
+_AMBIGUOUS_HOST_PREFIXES = ("m.", "amp.")
+_AMP_SUFFIX_RE = re.compile(r"(?:/amp/?|\.amp)$", re.IGNORECASE)
+
+
+def _strip_trailing_slash(path: str) -> str:
+    if path == "/" or not path.endswith("/"):
+        return path
+    return path.rstrip("/") or "/"
 
 
 def normalize_url(url: str) -> str:
@@ -21,6 +41,11 @@ def normalize_url(url: str) -> str:
     hostname = (parts.hostname or "").lower()
     if not scheme or not hostname:
         raise ValueError(f"Invalid article URL: {url!r}")
+
+    for prefix in _AMBIGUOUS_HOST_PREFIXES:
+        if hostname.startswith(prefix):
+            hostname = hostname[len(prefix):]
+            break
 
     port = parts.port
     if port is not None and not (
@@ -33,13 +58,16 @@ def normalize_url(url: str) -> str:
             credentials += f":{parts.password}"
         hostname = f"{credentials}@{hostname}"
 
-    query_items = [
+    path = _AMP_SUFFIX_RE.sub("", parts.path or "/") or "/"
+    path = _strip_trailing_slash(path)
+
+    query_items = sorted(
         (key, value)
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
         if key.lower() not in _TRACKING_PARAMETERS
         and not key.lower().startswith("utm_")
-    ]
-    return urlunsplit((scheme, hostname, parts.path or "/", urlencode(query_items), ""))
+    )
+    return urlunsplit((scheme, hostname, path, urlencode(query_items), ""))
 
 
 def source_slug(normalized_url: str) -> str:
@@ -92,11 +120,14 @@ def crawl_result_to_article(result: CrawlResult) -> RawArticle:
     content = normalize_content(result.markdown)
     if not content:
         raise ValueError("Cannot persist an empty crawl result")
-    url = normalize_url(result.url)
+    url_original = result.url.strip()
+    url = normalize_url(url_original)
     return RawArticle(
         url=url,
+        url_original=url_original,
         title=_optional_text(result.metadata.title),
         source=article_source(result, url),
+        lang=_optional_text(result.metadata.language),
         content=content,
         content_hash=content_hash(content),
         published_at=_published_at(result),

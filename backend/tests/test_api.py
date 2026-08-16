@@ -17,8 +17,10 @@ class FakeStorage:
         self._articles = {
             1: RawArticle(
                 url="https://example.com/a",
+                url_original="https://example.com/a",
                 title="Article A",
                 source="Example",
+                lang="en",
                 content="full markdown body",
                 content_hash=b"1" * 32,
                 published_at=now,

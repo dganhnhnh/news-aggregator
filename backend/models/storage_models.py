@@ -41,8 +41,10 @@ class StoredCrawlFailure(CrawlFailureOccurrence):
 @dataclass(frozen=True)
 class RawArticle:
     url: str
+    url_original: str
     title: str | None
     source: str | None
+    lang: str | None
     content: str
     content_hash: bytes
     published_at: datetime | None

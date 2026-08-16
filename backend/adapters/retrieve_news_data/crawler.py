@@ -76,7 +76,7 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
         metadata=CrawlMetadata(
             title=raw_meta.get("title") if isinstance(raw_meta, dict) else None,
             description=raw_meta.get("description") if isinstance(raw_meta, dict) else None,
-            language=None,
+            language=raw_meta.get("language") if isinstance(raw_meta, dict) else None,
             author=raw_meta.get("author") if isinstance(raw_meta, dict) else None,
             provider="crawl4ai",
         ),

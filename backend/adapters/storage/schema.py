@@ -4,6 +4,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
+    Computed,
     DateTime,
     ForeignKey,
     Identity,
@@ -17,6 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import TSVECTOR
 
 
 metadata = MetaData()
@@ -49,6 +51,7 @@ raw_articles = Table(
         ForeignKey("sources.id", name="fk_raw_articles_source_id_sources"),
     ),
     Column("url", Text, nullable=False),
+    Column("url_original", Text),
     Column("title", Text),
     Column("source", Text),
     Column("content", Text, nullable=False),
@@ -56,8 +59,27 @@ raw_articles = Table(
     Column("published_at", DateTime(timezone=True)),
     Column("crawled_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("lang", Text),
+    Column(
+        "event_at",
+        DateTime(timezone=True),
+        Computed("coalesce(published_at, crawled_at)", persisted=True),
+        nullable=False,
+    ),
+    Column(
+        "search_tsv",
+        TSVECTOR,
+        Computed(
+            "to_tsvector('english', coalesce(title, '') || ' ' || left(content, 200000))",
+            persisted=True,
+        ),
+    ),
     UniqueConstraint("url", name="uq_raw_articles_url"),
 )
+Index("ix_raw_articles_event_at_brin", raw_articles.c.event_at, postgresql_using="brin")
+Index("ix_raw_articles_search_tsv", raw_articles.c.search_tsv, postgresql_using="gin")
+Index("ix_raw_articles_source_event", raw_articles.c.source_id, raw_articles.c.event_at)
+Index("ix_raw_articles_url_original", raw_articles.c.url_original)
 
 crawl_failures = Table(
     "crawl_failures",

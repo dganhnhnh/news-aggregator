@@ -50,8 +50,10 @@ async def _test_postgres_upsert_and_failure_state() -> None:
 
         original = RawArticle(
             url=url,
+            url_original=url + "?utm_source=rss",
             title="Original",
             source="Example",
+            lang="en",
             content="one",
             content_hash=b"1" * 32,
             published_at=now,
@@ -60,8 +62,10 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         inserted = await storage.apply_batch([original], [], [], received=1, rejected=0)
         sibling = RawArticle(
             url=sibling_url,
+            url_original=sibling_url,
             title="Second article",
             source="A different feed label",
+            lang="en",
             content="second",
             content_hash=b"3" * 32,
             published_at=now,
@@ -99,8 +103,10 @@ async def _test_postgres_upsert_and_failure_state() -> None:
             ).one()
         changed = RawArticle(
             url=url,
+            url_original=url,
             title=None,
             source=None,
+            lang=None,
             content="two",
             content_hash=b"2" * 32,
             published_at=None,
@@ -115,8 +121,10 @@ async def _test_postgres_upsert_and_failure_state() -> None:
 
         metadata_change = RawArticle(
             url=url,
+            url_original=url,
             title="Renamed",
             source=None,
+            lang=None,
             content="two",
             content_hash=b"2" * 32,
             published_at=None,
@@ -159,6 +167,8 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         assert article.title == "Renamed"
         assert article.source == "Example"
         assert article.content == "two"
+        assert article.lang == "en"
+        assert article.url_original == url
         assert failed.attempt_count == 2
         assert failed.source == "Example"
         assert (

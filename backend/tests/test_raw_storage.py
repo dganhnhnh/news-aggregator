@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from adapters.storage.postgres import retry_delay
 from models.search_and_crawl_models import CrawlMetadata, CrawlResult
 from services.raw_storage import (
@@ -12,10 +14,118 @@ from services.raw_storage import (
 )
 
 
-def test_normalize_url_is_conservative_and_removes_tracking() -> None:
-    assert normalize_url(
-        "HTTPS://Example.COM:443/news?id=7&utm_source=rss&fbclid=x#section"
-    ) == "https://example.com/news?id=7"
+NORMALIZE_URL_CASES = [
+    # (label, input, expected)
+    (
+        "scheme/host lowercased, default https port dropped, utm+fbclid stripped",
+        "HTTPS://Example.COM:443/news?id=7&utm_source=rss&fbclid=x#section",
+        "https://example.com/news?id=7",
+    ),
+    (
+        "query params sorted regardless of original order",
+        "https://example.com/a?b=2&a=1",
+        "https://example.com/a?a=1&b=2",
+    ),
+    (
+        "trailing slash stripped on a non-root path",
+        "https://example.com/path/",
+        "https://example.com/path",
+    ),
+    (
+        "root path keeps its single slash",
+        "https://example.com",
+        "https://example.com/",
+    ),
+    (
+        "mc_cid and mc_eid stripped",
+        "https://example.com/p?mc_cid=abc&mc_eid=def&x=1",
+        "https://example.com/p?x=1",
+    ),
+    (
+        "igshid stripped",
+        "https://example.com/p?igshid=xyz",
+        "https://example.com/p",
+    ),
+    (
+        "ref and ref_src stripped",
+        "https://example.com/p?ref=fb&ref_src=twitter",
+        "https://example.com/p",
+    ),
+    (
+        "_hsenc stripped",
+        "https://example.com/p?_hsenc=abc",
+        "https://example.com/p",
+    ),
+    (
+        "/amp path suffix stripped",
+        "https://example.com/article/amp",
+        "https://example.com/article",
+    ),
+    (
+        "/amp/ path suffix stripped",
+        "https://example.com/article/amp/",
+        "https://example.com/article",
+    ),
+    (
+        ".amp path suffix stripped",
+        "https://example.com/article.amp",
+        "https://example.com/article",
+    ),
+    (
+        "bare /amp path collapses to root",
+        "https://example.com/amp",
+        "https://example.com/",
+    ),
+    (
+        "m. host prefix collapsed",
+        "https://m.example.com/article",
+        "https://example.com/article",
+    ),
+    (
+        "amp. host prefix collapsed",
+        "https://amp.example.com/article",
+        "https://example.com/article",
+    ),
+    (
+        "www. host prefix is NOT collapsed (only m./amp. are)",
+        "https://www.example.com/article",
+        "https://www.example.com/article",
+    ),
+    (
+        "non-tracking query params are NOT merged away",
+        "https://example.com/list?page=2",
+        "https://example.com/list?page=2",
+    ),
+    (
+        "blank-value query params are NOT merged away",
+        "https://example.com/a?id=",
+        "https://example.com/a?id=",
+    ),
+    (
+        "non-default port is preserved",
+        "https://example.com:8443/a",
+        "https://example.com:8443/a",
+    ),
+    (
+        "userinfo is preserved",
+        "https://user:pass@example.com/a",
+        "https://user:pass@example.com/a",
+    ),
+    (
+        "path merely containing 'amp' is not mistaken for the AMP suffix",
+        "https://example.com/example-amp",
+        "https://example.com/example-amp",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,url,expected",
+    NORMALIZE_URL_CASES,
+    ids=[case[0] for case in NORMALIZE_URL_CASES],
+)
+def test_normalize_url(label: str, url: str, expected: str) -> None:
+    assert normalize_url(url) == expected
 
 
 def test_source_slug_normalizes_only_non_publisher_host_variants() -> None:
@@ -40,7 +150,7 @@ def test_crawl_result_mapping_uses_feed_source_and_published_date() -> None:
     result = CrawlResult(
         url="https://example.com/article?utm_medium=rss",
         markdown="# Article",
-        metadata=CrawlMetadata(title="Article"),
+        metadata=CrawlMetadata(title="Article", language="en"),
         context={
             "feed_title": "Example Engineering",
             "query_label": "Fallback",
@@ -51,9 +161,19 @@ def test_crawl_result_mapping_uses_feed_source_and_published_date() -> None:
     article = crawl_result_to_article(result)
 
     assert article.url == "https://example.com/article"
+    assert article.url_original == "https://example.com/article?utm_medium=rss"
     assert article.source == "Example Engineering"
+    assert article.lang == "en"
     assert article.published_at == published_at
     assert article.content == "# Article"
+
+
+def test_crawl_result_mapping_lang_is_none_when_undetected() -> None:
+    result = CrawlResult(url="https://example.com/article", markdown="# Article")
+
+    article = crawl_result_to_article(result)
+
+    assert article.lang is None
 
 
 def test_prepare_articles_keeps_newest_result_per_url() -> None:
