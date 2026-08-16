@@ -7,7 +7,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from adapters.storage.postgres import PostgresRawStorage
-from adapters.storage.schema import crawl_failures, ingest_runs, raw_articles
+from adapters.storage.schema import crawl_failures, ingest_runs, raw_articles, sources
 from models.storage_models import (
     ArticleListItem,
     CrawlFailureOccurrence,
@@ -29,6 +29,8 @@ def test_postgres_upsert_and_failure_state() -> None:
 
 async def _test_postgres_upsert_and_failure_state() -> None:
     url = "https://integration.example/article"
+    sibling_url = "https://www.integration.example/second"
+    source_slug = "integration.example"
     storage = PostgresRawStorage(DATABASE_URL)
     engine = create_async_engine(DATABASE_URL)
     now = datetime.now(timezone.utc)
@@ -38,8 +40,13 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         await storage.check_ready()
         ready = True
         async with engine.begin() as connection:
-            await connection.execute(delete(raw_articles).where(raw_articles.c.url == url))
+            await connection.execute(
+                delete(raw_articles).where(
+                    raw_articles.c.url.in_([url, sibling_url])
+                )
+            )
             await connection.execute(delete(crawl_failures).where(crawl_failures.c.url == url))
+            await connection.execute(delete(sources).where(sources.c.slug == source_slug))
 
         original = RawArticle(
             url=url,
@@ -51,12 +58,38 @@ async def _test_postgres_upsert_and_failure_state() -> None:
             crawled_at=now,
         )
         inserted = await storage.apply_batch([original], [], [], received=1, rejected=0)
+        sibling = RawArticle(
+            url=sibling_url,
+            title="Second article",
+            source="A different feed label",
+            content="second",
+            content_hash=b"3" * 32,
+            published_at=now,
+            crawled_at=now,
+        )
+        await storage.apply_batch([sibling], [], [], received=1, rejected=0)
         async with engine.connect() as connection:
             inserted_row = (
                 await connection.execute(
                     select(raw_articles).where(raw_articles.c.url == url)
                 )
             ).one()
+            source_rows = (
+                await connection.execute(
+                    select(sources).where(sources.c.slug == source_slug)
+                )
+            ).all()
+            article_source_ids = (
+                await connection.execute(
+                    select(raw_articles.c.source_id).where(
+                        raw_articles.c.url.in_([url, sibling_url])
+                    )
+                )
+            ).scalars().all()
+        assert len(source_rows) == 1
+        assert source_rows[0].name == source_slug
+        assert len(set(article_source_ids)) == 1
+        assert article_source_ids[0] is not None
         unchanged = await storage.apply_batch([original], [], [], received=1, rejected=0)
         async with engine.connect() as connection:
             unchanged_row = (
@@ -223,7 +256,9 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         if ready:
             async with engine.begin() as connection:
                 await connection.execute(
-                    delete(raw_articles).where(raw_articles.c.url == url)
+                    delete(raw_articles).where(
+                        raw_articles.c.url.in_([url, sibling_url])
+                    )
                 )
                 await connection.execute(
                     delete(crawl_failures).where(crawl_failures.c.url == url)
@@ -232,5 +267,8 @@ async def _test_postgres_upsert_and_failure_state() -> None:
                     await connection.execute(
                         delete(ingest_runs).where(ingest_runs.c.id.in_(run_ids))
                     )
+                await connection.execute(
+                    delete(sources).where(sources.c.slug == source_slug)
+                )
         await engine.dispose()
         await storage.close()

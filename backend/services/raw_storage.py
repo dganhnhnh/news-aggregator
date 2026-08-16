@@ -11,6 +11,7 @@ from models.storage_models import RawArticle
 
 
 _TRACKING_PARAMETERS = {"fbclid", "gclid"}
+_SOURCE_HOST_PREFIXES = ("www.", "m.", "amp.")
 
 
 def normalize_url(url: str) -> str:
@@ -39,6 +40,17 @@ def normalize_url(url: str) -> str:
         and not key.lower().startswith("utm_")
     ]
     return urlunsplit((scheme, hostname, parts.path or "/", urlencode(query_items), ""))
+
+
+def source_slug(normalized_url: str) -> str:
+    """Return the stable publisher hostname used to identify an article source."""
+    hostname = (urlsplit(normalized_url).hostname or "").lower()
+    if not hostname:
+        raise ValueError(f"Invalid article URL: {normalized_url!r}")
+    for prefix in _SOURCE_HOST_PREFIXES:
+        if hostname.startswith(prefix):
+            return hostname.removeprefix(prefix)
+    return hostname
 
 
 def normalize_content(content: str) -> str:

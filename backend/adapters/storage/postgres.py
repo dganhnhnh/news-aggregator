@@ -6,9 +6,9 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import delete, func, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-from adapters.storage.schema import crawl_failures, ingest_runs, raw_articles
+from adapters.storage.schema import crawl_failures, ingest_runs, raw_articles, sources
 from models.storage_models import (
     ArticleListItem,
     CrawlFailureOccurrence,
@@ -18,6 +18,7 @@ from models.storage_models import (
     StoredCrawlFailure,
     StorageWriteSummary,
 )
+from services.raw_storage import source_slug
 
 
 class StorageError(RuntimeError):
@@ -49,7 +50,8 @@ class PostgresRawStorage:
                     text(
                         "SELECT to_regclass('public.raw_articles'), "
                         "to_regclass('public.crawl_failures'), "
-                        "to_regclass('public.ingest_runs')"
+                        "to_regclass('public.ingest_runs'), "
+                        "to_regclass('public.sources')"
                     )
                 )
                 if any(value is None for value in tables.one()):
@@ -112,6 +114,25 @@ class PostgresRawStorage:
             "articles_unchanged": stats.articles_unchanged,
         }
 
+    @staticmethod
+    async def _ensure_sources(
+        connection: AsyncConnection,
+        slugs: set[str],
+    ) -> dict[str, int]:
+        """Create missing sources once per batch and return their stable IDs."""
+        if not slugs:
+            return {}
+        values = [{"slug": slug, "name": slug} for slug in sorted(slugs)]
+        await connection.execute(
+            pg_insert(sources)
+            .values(values)
+            .on_conflict_do_nothing(index_elements=[sources.c.slug])
+        )
+        result = await connection.execute(
+            select(sources.c.slug, sources.c.id).where(sources.c.slug.in_(slugs))
+        )
+        return {row.slug: int(row.id) for row in result}
+
     async def apply_batch(
         self,
         articles: list[RawArticle],
@@ -123,6 +144,14 @@ class PostgresRawStorage:
     ) -> StorageWriteSummary:
         written = 0
         async with self._engine.begin() as connection:
+            article_slugs = {
+                article.url: source_slug(article.url) for article in articles
+            }
+            source_ids = await self._ensure_sources(
+                connection,
+                set(article_slugs.values()),
+            )
+
             failure_by_key = {
                 (failure.failure_kind, failure.url): failure for failure in failures
             }
@@ -193,6 +222,7 @@ class PostgresRawStorage:
             for article in articles:
                 stmt = pg_insert(raw_articles).values(
                     url=article.url,
+                    source_id=source_ids[article_slugs[article.url]],
                     title=article.title,
                     source=article.source,
                     content=article.content,
@@ -212,6 +242,7 @@ class PostgresRawStorage:
                     set_={
                         "title": merged_title,
                         "source": merged_source,
+                        "source_id": incoming.source_id,
                         "content": incoming.content,
                         "content_hash": incoming.content_hash,
                         "published_at": merged_published,
@@ -222,6 +253,7 @@ class PostgresRawStorage:
                         raw_articles.c.content_hash.is_distinct_from(incoming.content_hash),
                         raw_articles.c.title.is_distinct_from(merged_title),
                         raw_articles.c.source.is_distinct_from(merged_source),
+                        raw_articles.c.source_id.is_distinct_from(incoming.source_id),
                         raw_articles.c.published_at.is_distinct_from(merged_published),
                     ),
                 ).returning(raw_articles.c.id)

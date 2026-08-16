@@ -2,8 +2,10 @@
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     DateTime,
+    ForeignKey,
     Identity,
     Index,
     Integer,
@@ -19,10 +21,33 @@ from sqlalchemy import (
 
 metadata = MetaData()
 
+sources = Table(
+    "sources",
+    metadata,
+    Column("id", BigInteger, Identity(), primary_key=True),
+    Column("slug", Text, nullable=False),
+    Column("name", Text, nullable=False),
+    Column("homepage", Text),
+    Column("default_domain", Text),
+    Column("active", Boolean, nullable=False, server_default="true"),
+    Column(
+        "first_seen_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    UniqueConstraint("slug", name="uq_sources_slug"),
+)
+
 raw_articles = Table(
     "raw_articles",
     metadata,
     Column("id", BigInteger, Identity(), primary_key=True),
+    Column(
+        "source_id",
+        BigInteger,
+        ForeignKey("sources.id", name="fk_raw_articles_source_id_sources"),
+    ),
     Column("url", Text, nullable=False),
     Column("title", Text),
     Column("source", Text),

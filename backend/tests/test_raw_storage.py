@@ -8,6 +8,7 @@ from services.raw_storage import (
     normalize_content,
     normalize_url,
     prepare_articles,
+    source_slug,
 )
 
 
@@ -15,6 +16,14 @@ def test_normalize_url_is_conservative_and_removes_tracking() -> None:
     assert normalize_url(
         "HTTPS://Example.COM:443/news?id=7&utm_source=rss&fbclid=x#section"
     ) == "https://example.com/news?id=7"
+
+
+def test_source_slug_normalizes_only_non_publisher_host_variants() -> None:
+    assert source_slug("https://www.example.com/article") == "example.com"
+    assert source_slug("https://m.example.com/article") == "example.com"
+    assert source_slug("https://amp.example.com/article") == "example.com"
+    assert source_slug("https://example.com:8443/article") == "example.com"
+    assert source_slug("https://news.example.com/article") == "news.example.com"
 
 
 def test_normalize_content_and_hash_are_stable() -> None:
