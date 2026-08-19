@@ -17,6 +17,7 @@ from workers import cli as worker_cli
 logger = get_logger(__name__)
 
 _INTERVAL_FLAG = "--interval-seconds"
+_FEED_OFFSET_FLAG = "--feed-offset"
 
 
 def translate_argv(argv: list[str], default_interval: int) -> list[str]:
@@ -24,6 +25,8 @@ def translate_argv(argv: list[str], default_interval: int) -> list[str]:
 
     Beyond renaming `--interval-seconds`, this restores the old default: bare
     `news-service` looped forever, whereas bare `news-worker crawl` runs once.
+    `--feed-offset` is swallowed with a warning: feed_state.next_poll_at now
+    owns feed rotation, and the new parser doesn't accept the flag at all.
     """
     once = "--once" in argv
     translated: list[str] = ["crawl"]
@@ -34,6 +37,13 @@ def translate_argv(argv: list[str], default_interval: int) -> list[str]:
             skip_next = False
             continue
         name, separator, value = argument.partition("=")
+        if name == _FEED_OFFSET_FLAG:
+            logger.warning(
+                "--feed-offset no longer has any effect; feed rotation is "
+                "read from feed_state"
+            )
+            skip_next = not separator and index + 1 < len(argv)
+            continue
         if name != _INTERVAL_FLAG:
             translated.append(argument)
             continue

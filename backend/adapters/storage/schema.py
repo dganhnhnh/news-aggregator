@@ -128,3 +128,37 @@ Index(
     worker_runs.c.heartbeat_at,
     postgresql_where=text("status = 'running'"),
 )
+
+feed_state = Table(
+    "feed_state",
+    metadata,
+    Column("feed_url", Text, primary_key=True),
+    Column("source_label", Text),
+    Column("etag", Text),
+    Column("last_modified", Text),
+    Column("last_polled_at", DateTime(timezone=True)),
+    Column("last_success_at", DateTime(timezone=True)),
+    Column("last_entry_published_at", DateTime(timezone=True)),
+    Column("consecutive_failures", Integer, nullable=False, server_default="0"),
+    Column(
+        "next_poll_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    Column("disabled_at", DateTime(timezone=True)),
+    Column("disabled_reason", Text),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+)
+# Feeds with disabled_at set never appear in the "what's due" query, so they
+# don't need to be in the index.
+Index(
+    "ix_feed_state_next_poll",
+    feed_state.c.next_poll_at,
+    postgresql_where=text("disabled_at IS NULL"),
+)

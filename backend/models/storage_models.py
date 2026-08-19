@@ -53,6 +53,30 @@ class RawArticle:
 
 
 @dataclass(frozen=True)
+class FeedSeed:
+    """What storage needs to seed a feed; no RSS-adapter dependency."""
+
+    feed_url: str
+    source_label: str
+
+
+@dataclass(frozen=True)
+class FeedPollTarget:
+    """What storage hands back to a worker about to poll a feed."""
+
+    feed_url: str
+    source_label: str | None
+    etag: str | None
+    last_modified: str | None
+
+
+@dataclass(frozen=True)
+class FeedFailureOutcome:
+    consecutive_failures: int
+    disabled: bool
+
+
+@dataclass(frozen=True)
 class ArticleListItem:
     id: int
     url: str
@@ -89,6 +113,12 @@ class IngestRunStats:
     retries_succeeded: int = 0
     articles_written: int = 0
     articles_unchanged: int = 0
+    feeds_not_modified: int = 0
+    feeds_failed: int = 0
+    feeds_disabled: int = 0
+    entries_skipped_out_of_window: int = 0
+    entries_skipped_undated: int = 0
+    entries_skipped_known: int = 0
 
     def add_batch(self, batch: CrawlBatch, *, retry: bool = False) -> None:
         self.feeds_processed += batch.feeds_processed

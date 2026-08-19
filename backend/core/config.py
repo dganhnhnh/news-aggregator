@@ -36,6 +36,8 @@ class Settings:
     feed_offset: int
     max_retries_per_run: int
     service_interval_seconds: int
+    feed_poll_interval_seconds: int = 1800
+    feed_disable_after_failures: int = 10
     # A run checkpoints (and so heartbeats) after every chunk, so this measures
     # silence between chunks rather than total run length.
     worker_heartbeat_timeout_seconds: int = 900
@@ -67,6 +69,8 @@ class Settings:
             feed_offset=_env_int("RSS_FEED_OFFSET", 0),
             max_retries_per_run=_env_int("MAX_RETRIES_PER_RUN", 50),
             service_interval_seconds=_env_int("SERVICE_INTERVAL_SECONDS", 1800),
+            feed_poll_interval_seconds=_env_int("FEED_POLL_INTERVAL_SECONDS", 1800),
+            feed_disable_after_failures=_env_int("FEED_DISABLE_AFTER_FAILURES", 10),
             worker_heartbeat_timeout_seconds=_env_int(
                 "WORKER_HEARTBEAT_TIMEOUT_SECONDS", 900
             ),

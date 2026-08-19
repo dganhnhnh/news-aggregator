@@ -72,9 +72,23 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         type=Path,
         default=settings.rss_feed_path,
         help=(
-            "TSV or OPML feed source path; defaults to RSS_FEED_PATH "
+            "TSV or OPML feed source path to seed feed_state from; optional "
+            "once feeds are seeded. Defaults to RSS_FEED_PATH "
             "(or legacy GOOGLE_NEWS_TSV_PATH)"
         ),
+    )
+    crawl.add_argument(
+        "--feeds",
+        metavar="URL[,URL...]",
+        help=(
+            "Poll only these feed URLs, ignoring both the schedule and "
+            "disabled_at; for inspecting a specific feed"
+        ),
+    )
+    crawl.add_argument(
+        "--ignore-schedule",
+        action="store_true",
+        help="Poll every non-disabled feed regardless of next_poll_at",
     )
     crawl.add_argument(
         "--max-feeds",
@@ -104,10 +118,17 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Maximum crawled articles retained before each DB checkpoint",
     )
     crawl.add_argument(
-        "--feed-offset",
+        "--poll-interval",
         type=int,
-        default=settings.feed_offset,
-        help="Starting feed index; looping runs rotate from the next group",
+        metavar="SECONDS",
+        default=settings.feed_poll_interval_seconds,
+        help="How long before a successfully polled feed is due again",
+    )
+    crawl.add_argument(
+        "--disable-after-failures",
+        type=int,
+        default=settings.feed_disable_after_failures,
+        help="Consecutive feed failures before a feed is auto-disabled",
     )
     crawl.add_argument(
         "--max-retries-per-run",
@@ -129,11 +150,7 @@ def resolve_window(
 
 
 def _validate_crawl(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    if args.feed_path is None:
-        parser.error(
-            "--feed-path/--tsv-path or RSS_FEED_PATH/GOOGLE_NEWS_TSV_PATH is required"
-        )
-    if not args.feed_path.is_file():
+    if args.feed_path is not None and not args.feed_path.is_file():
         parser.error(f"RSS feed source file not found: {args.feed_path}")
     if args.max_feeds < 0:
         parser.error("--max-feeds must not be negative")
@@ -145,10 +162,17 @@ def _validate_crawl(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         parser.error("--max-concurrent-crawls must be positive")
     if args.crawl_batch_size <= 0:
         parser.error("--crawl-batch-size must be positive")
-    if args.feed_offset < 0:
-        parser.error("--feed-offset must not be negative")
+    if args.poll_interval <= 0:
+        parser.error("--poll-interval must be positive")
+    if args.disable_after_failures <= 0:
+        parser.error("--disable-after-failures must be positive")
     if args.max_retries_per_run < 0:
         parser.error("--max-retries-per-run must not be negative")
+    args.feeds = (
+        [feed.strip() for feed in args.feeds.split(",") if feed.strip()]
+        if args.feeds
+        else []
+    )
 
 
 def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:

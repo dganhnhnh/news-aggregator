@@ -11,6 +11,7 @@ from adapters.retrieve_news_data.google_news_rss_searcher import (
 )
 from adapters.retrieve_news_data.crawler import Crawl4aiProvider
 from models.search_and_crawl_models import CrawlResult
+from models.storage_models import FeedPollTarget
 
 
 def test_atom_published_date_is_timezone_aware() -> None:
@@ -124,13 +125,15 @@ def test_opml_feed_runs_through_rss_crawl_pipeline(
         text = """<rss version="2.0"><channel><title>Example feed</title>
         <item><title>Article</title><link>https://example.com/article</link>
         <author>Example author</author></item></channel></rss>"""
+        headers: dict[str, str] = {}
+        status_code = 200
 
         @staticmethod
         def raise_for_status() -> None:
             return None
 
     class FakeClient:
-        async def get(self, url: str, timeout: float):
+        async def get(self, url: str, timeout: float, headers=None):
             assert url == "https://example.com/feed.xml"
             assert timeout == 20.0
             return FakeResponse()
@@ -165,7 +168,7 @@ def test_feed_fetch_failure_is_returned_as_structured_failure(tmp_path: Path) ->
     )
 
     class FailingClient:
-        async def get(self, url: str, timeout: float):
+        async def get(self, url: str, timeout: float, headers=None):
             request = httpx.Request("GET", url)
             raise httpx.ConnectError("connection failed", request=request)
 
@@ -184,6 +187,124 @@ def test_feed_fetch_failure_is_returned_as_structured_failure(tmp_path: Path) ->
     assert batch.failures[0].source == "Broken Feed"
 
 
+def test_poll_feeds_sends_conditional_get_headers() -> None:
+    seen_headers: dict = {}
+
+    class FakeResponse:
+        status_code = 304
+        headers: dict[str, str] = {}
+
+        @property
+        def text(self) -> str:
+            raise AssertionError("a 304 response must never be parsed")
+
+        def raise_for_status(self) -> None:
+            raise AssertionError("a 304 must be handled before raise_for_status")
+
+    class FakeClient:
+        async def get(self, url: str, timeout: float, headers=None):
+            seen_headers.update(headers or {})
+            return FakeResponse()
+
+    target = FeedPollTarget(
+        feed_url="https://example.com/feed.xml",
+        source_label="Feed",
+        etag='"abc123"',
+        last_modified="Wed, 19 Aug 2026 00:00:00 GMT",
+    )
+    searcher = GoogleNewsRssSearcher(http_client=FakeClient())
+
+    polls = asyncio.run(
+        _collect(searcher.poll_feeds([target]))
+    )
+
+    assert seen_headers == {
+        "If-None-Match": '"abc123"',
+        "If-Modified-Since": "Wed, 19 Aug 2026 00:00:00 GMT",
+    }
+    assert len(polls) == 1
+    assert polls[0].status == "not_modified"
+    assert polls[0].etag == '"abc123"'
+    assert polls[0].last_modified == "Wed, 19 Aug 2026 00:00:00 GMT"
+
+
+def test_poll_feeds_reads_new_etag_and_last_modified_on_a_fresh_fetch() -> None:
+    class FakeResponse:
+        status_code = 200
+        text = (
+            "<rss><channel><title>Feed</title>"
+            "<item><title>Article</title>"
+            "<link>https://example.com/article</link></item>"
+            "</channel></rss>"
+        )
+        headers = {"ETag": '"new-etag"', "Last-Modified": "Thu, 20 Aug 2026 00:00:00 GMT"}
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        async def get(self, url: str, timeout: float, headers=None):
+            return FakeResponse()
+
+    target = FeedPollTarget(
+        feed_url="https://example.com/feed.xml",
+        source_label="Feed",
+        etag=None,
+        last_modified=None,
+    )
+    searcher = GoogleNewsRssSearcher(http_client=FakeClient())
+
+    polls = asyncio.run(_collect(searcher.poll_feeds([target])))
+
+    assert len(polls) == 1
+    assert polls[0].status == "fetched"
+    assert polls[0].etag == '"new-etag"'
+    assert polls[0].last_modified == "Thu, 20 Aug 2026 00:00:00 GMT"
+    assert [entry.entry_url for entry in polls[0].entries] == [
+        "https://example.com/article"
+    ]
+
+
+def test_poll_feeds_follows_redirects_transparently() -> None:
+    # The fake client stands in for httpx already having followed the
+    # redirect (follow_redirects=True on the default client is what makes
+    # that true for a real feed); the final 200 must not be treated as a
+    # failure.
+    class FakeResponse:
+        status_code = 200
+        text = "<rss><channel><title>Feed</title></channel></rss>"
+        headers: dict[str, str] = {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class RedirectingClient:
+        async def get(self, url: str, timeout: float, headers=None):
+            return FakeResponse()
+
+    target = FeedPollTarget(
+        feed_url="https://example.com/feed.xml",
+        source_label="Feed",
+        etag=None,
+        last_modified=None,
+    )
+    searcher = GoogleNewsRssSearcher(http_client=RedirectingClient())
+
+    polls = asyncio.run(_collect(searcher.poll_feeds([target])))
+
+    assert len(polls) == 1
+    assert polls[0].status == "fetched"
+
+
+def test_default_client_follows_redirects() -> None:
+    client = GoogleNewsRssSearcher._build_default_client()
+    assert client.follow_redirects is True
+
+
+async def _collect(aiter):
+    return [item async for item in aiter]
+
+
 def test_streaming_bounds_feed_and_crawl_workers_and_rotates(
     tmp_path: Path,
 ) -> None:
@@ -200,6 +321,9 @@ def test_streaming_bounds_feed_and_crawl_workers_and_rotates(
     )
 
     class FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
         def __init__(self, feed_index: str) -> None:
             self.text = (
                 "<rss><channel><title>Feed "
@@ -222,7 +346,7 @@ def test_streaming_bounds_feed_and_crawl_workers_and_rotates(
         peak = 0
         requested: list[str] = []
 
-        async def get(self, url: str, timeout: float):
+        async def get(self, url: str, timeout: float, headers=None):
             self.requested.append(url)
             self.active += 1
             self.peak = max(self.peak, self.active)

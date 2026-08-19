@@ -5,10 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import replace
 
-from adapters.retrieve_news_data.google_news_rss_searcher import (
-    RssFeedSearcher,
-    RssFeedSource,
-)
+from adapters.retrieve_news_data.google_news_rss_searcher import RssFeedSearcher
 from adapters.storage.postgres import PostgresRawStorage
 from models.search_and_crawl_models import CrawlMetadata, CrawlResult
 from models.storage_models import (
@@ -86,7 +83,6 @@ async def retry_due_failures(
     searcher: RssFeedSearcher,
     *,
     limit: int,
-    max_articles_per_feed: int,
     max_concurrent_crawls: int,
     crawl_batch_size: int = 10,
 ) -> tuple[CrawlBatch, int, int]:
@@ -98,7 +94,6 @@ async def retry_due_failures(
         storage,
         searcher,
         limit=limit,
-        max_articles_per_feed=max_articles_per_feed,
         max_concurrent_crawls=max_concurrent_crawls,
         crawl_batch_size=crawl_batch_size,
     ):
@@ -113,39 +108,20 @@ async def iter_retry_batches(
     searcher: RssFeedSearcher,
     *,
     limit: int,
-    max_articles_per_feed: int,
     max_concurrent_crawls: int,
     crawl_batch_size: int,
 ) -> AsyncIterator[tuple[CrawlBatch, int, int]]:
-    """Yield retry work in bounded batches with per-batch target counters."""
+    """Yield retry work in bounded batches with per-batch target counters.
+
+    Only article failures are retried here: feed_state is the sole retry
+    schedule for feeds (see CrawlWorker), so a feed-kind row in
+    crawl_failures is a log entry, not a queue to drain.
+    """
     due = await storage.due_failures(limit)
     if not due:
         return
 
-    feed_failures = [item for item in due if item.failure_kind == "feed"]
     article_failures = [item for item in due if item.failure_kind == "article"]
-    feed_due_keys = {
-        (item.failure_kind, item.url) for item in feed_failures
-    }
-
-    if feed_failures:
-        async for feed_batch in searcher.iter_batches(
-            max_articles_per_feed=max_articles_per_feed,
-            max_feeds=0,
-            sources=[
-                RssFeedSource(
-                    query_label=item.source or item.url,
-                    rss_url=item.url,
-                )
-                for item in feed_failures
-            ],
-        ):
-            resolved = {
-                (item.failure_kind, item.url)
-                for item in feed_batch.resolved_failures
-                if (item.failure_kind, item.url) in feed_due_keys
-            }
-            yield feed_batch, feed_batch.feeds_processed, len(resolved)
 
     if article_failures:
         for start in range(0, len(article_failures), crawl_batch_size):

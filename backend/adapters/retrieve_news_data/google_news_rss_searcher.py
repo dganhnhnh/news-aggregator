@@ -15,7 +15,7 @@ in backend/models/search_and_crawl_models.py so they can be imported without
 pulling in any I/O dependencies.
 """
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 import csv
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
@@ -29,6 +29,7 @@ import httpx
 from googlenewsdecoder import new_decoderv1
 
 from core.logger import get_logger
+from models.discovery_models import DiscoveredEntry, FeedPoll
 from models.search_and_crawl_models import (
     CrawlMetadata,
     CrawlResult,
@@ -38,6 +39,7 @@ from models.storage_models import (
     CrawlBatch,
     CrawlFailureOccurrence,
     FailureTarget,
+    FeedPollTarget,
 )
 
 logger = get_logger(__name__)
@@ -213,15 +215,38 @@ def _parse_rss_entry(entry: dict) -> dict:
 # ─── RSS fetch ─────────────────────────────────────────────────────────────────
 
 
-async def _fetch_rss(url: str, client: httpx.AsyncClient) -> tuple[list[dict], str]:
-    """
-    Fetch and parse a single RSS feed.
+class FeedFetch(NamedTuple):
+    entries: list[dict]
+    feed_title: str
+    etag: str | None
+    last_modified: str | None
+    not_modified: bool
 
-    Returns (entries, feed_title).
-    entries is a list of dicts from _parse_rss_entry.
+
+async def _fetch_rss(
+    url: str,
+    client: httpx.AsyncClient,
+    *,
+    etag: str | None = None,
+    last_modified: str | None = None,
+) -> FeedFetch:
     """
+    Fetch and parse a single RSS feed, using conditional GET when possible.
+
+    A 304 must be checked before ``raise_for_status()`` runs: without
+    following redirects, httpx treats any unhandled 3xx as an error for that
+    call, so checking status after would misclassify every unchanged feed as
+    a failure and eventually get it auto-disabled.
+    """
+    headers = {}
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
     try:
-        response = await client.get(url, timeout=20.0)
+        response = await client.get(url, timeout=20.0, headers=headers or None)
+        if response.status_code == 304:
+            return FeedFetch([], "", etag, last_modified, True)
         response.raise_for_status()
     except httpx.HTTPError as exc:
         logger.warning("[GoogleNews RSS] failed to fetch %s: %s", url, exc)
@@ -234,7 +259,13 @@ async def _fetch_rss(url: str, client: httpx.AsyncClient) -> tuple[list[dict], s
         raise ValueError(f"Malformed RSS/Atom feed: {feed.bozo_exception}")
 
     entries = [_parse_rss_entry(e) for e in feed.entries]
-    return entries, feed_title
+    return FeedFetch(
+        entries,
+        feed_title,
+        response.headers.get("ETag"),
+        response.headers.get("Last-Modified"),
+        False,
+    )
 
 
 # ─── Google News RSS Searcher ─────────────────────────────────────────────────
@@ -320,6 +351,110 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             self._merge_batch(combined, batch)
         return combined
 
+    async def poll_feeds(
+        self, targets: Sequence[FeedPollTarget]
+    ) -> AsyncIterator[FeedPoll]:
+        """Poll each target feed, honoring conditional GET; yield one FeedPoll per feed.
+
+        Fetches in groups of ``max_concurrent_feeds`` like the old
+        ``iter_batches`` did, but yields per-feed instead of merging a group
+        into one discovery batch, so a caller can react to each feed's
+        304/failure/fetched outcome independently.
+        """
+        own_client = self._http_client is None
+        client = self._http_client or self._build_default_client()
+        try:
+            for feed_group in self._chunks(list(targets), self._max_concurrent_feeds):
+                fetched = await asyncio.gather(
+                    *[
+                        _fetch_rss(
+                            target.feed_url,
+                            client,
+                            etag=target.etag,
+                            last_modified=target.last_modified,
+                        )
+                        for target in feed_group
+                    ],
+                    return_exceptions=True,
+                )
+                for target, outcome in zip(feed_group, fetched, strict=True):
+                    if isinstance(outcome, Exception):
+                        yield FeedPoll(
+                            target=target,
+                            status="failed",
+                            error=CrawlFailureOccurrence(
+                                failure_kind="feed",
+                                url=target.feed_url,
+                                source=target.source_label,
+                                error_type=type(outcome).__name__,
+                                error_message=str(outcome),
+                            ),
+                        )
+                        continue
+
+                    fetch = outcome
+                    if fetch.not_modified:
+                        yield FeedPoll(
+                            target=target,
+                            status="not_modified",
+                            etag=fetch.etag,
+                            last_modified=fetch.last_modified,
+                        )
+                        continue
+
+                    entries = [
+                        DiscoveredEntry(
+                            feed_url=target.feed_url,
+                            query_label=target.source_label or "",
+                            feed_title=fetch.feed_title,
+                            entry_url=entry["feed_entry_url"],
+                            title=entry["title"],
+                            source=entry["source"],
+                            published_at=entry["published_date"],
+                        )
+                        for entry in fetch.entries
+                    ]
+                    yield FeedPoll(
+                        target=target,
+                        status="fetched",
+                        entries=entries,
+                        feed_title=fetch.feed_title,
+                        etag=fetch.etag,
+                        last_modified=fetch.last_modified,
+                    )
+        finally:
+            if own_client:
+                await client.aclose()
+
+    async def crawl_entries(self, entries: Sequence[DiscoveredEntry]) -> CrawlBatch:
+        """Crawl an already-filtered, already-bounded chunk of entries."""
+        jobs = [
+            _ArticleJob(
+                {
+                    "feed_entry_url": entry.entry_url,
+                    "title": entry.title,
+                    "source": entry.source,
+                    "published_date": entry.published_at,
+                },
+                entry.query_label,
+                entry.feed_title,
+            )
+            for entry in entries
+        ]
+        return await self._crawl_job_batch(jobs)
+
+    @staticmethod
+    def _build_default_client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            follow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; GoogleNewsBot/1.0; "
+                    "+https://news.google.com)"
+                )
+            },
+        )
+
     async def iter_batches(
         self,
         max_articles_per_feed: int = 20,
@@ -327,7 +462,11 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         sources: list[RssFeedSource] | None = None,
         feed_offset: int | None = None,
     ) -> AsyncIterator[CrawlBatch]:
-        """Yield bounded crawl batches so callers can persist incrementally."""
+        """Yield bounded crawl batches so callers can persist incrementally.
+
+        Built on poll_feeds/crawl_entries so `news-pipeline rss` and
+        CrawlWorker (via RssDiscovery) share one fetch/crawl implementation.
+        """
         configured = sources if sources is not None else self._load_queries()
         queries = self._select_sources(
             configured,
@@ -349,76 +488,46 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             self._last_feed_offset,
         )
 
-        own_client = self._http_client is None
-        client = self._http_client or httpx.AsyncClient(
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (compatible; GoogleNewsBot/1.0; "
-                    "+https://news.google.com)"
-                )
-            }
-        )
-        try:
-            for feed_group in self._chunks(queries, self._max_concurrent_feeds):
-                fetched = await asyncio.gather(
-                    *[_fetch_rss(source.rss_url, client) for source in feed_group],
-                    return_exceptions=True,
-                )
-                discovery = CrawlBatch()
-                feed_entries: list[tuple[RssFeedSource, str, list[dict], int]] = []
-                for source, outcome in zip(feed_group, fetched, strict=True):
-                    discovery.feeds_processed += 1
-                    if isinstance(outcome, Exception):
-                        discovery.failures.append(
-                            CrawlFailureOccurrence(
-                                failure_kind="feed",
-                                url=source.rss_url,
-                                source=source.query_label or None,
-                                error_type=type(outcome).__name__,
-                                error_message=str(outcome),
-                            )
-                        )
-                        continue
-
-                    entries, feed_title = outcome
-                    discovery.resolved_failures.append(
-                        FailureTarget(failure_kind="feed", url=source.rss_url)
-                    )
-                    discovery.articles_discovered += len(entries)
-                    selected_count = (
-                        min(max_articles_per_feed, len(entries))
-                        if max_articles_per_feed > 0
-                        else len(entries)
-                    )
-                    self._logger.info(
-                        "[GoogleNews RSS] %s — %d entries (%d total), crawling %d…",
-                        source.query_label,
-                        selected_count,
-                        len(entries),
-                        selected_count,
-                    )
-                    feed_entries.append(
-                        (source, feed_title, entries, selected_count)
-                    )
-
+        targets = [
+            FeedPollTarget(
+                feed_url=source.rss_url,
+                source_label=source.query_label,
+                etag=None,
+                last_modified=None,
+            )
+            for source in queries
+        ]
+        async for poll in self.poll_feeds(targets):
+            discovery = CrawlBatch(feeds_processed=1)
+            if poll.status == "failed":
+                assert poll.error is not None
+                discovery.failures.append(poll.error)
                 yield discovery
-                for source, feed_title, entries, selected_count in feed_entries:
-                    for start in range(
-                        0, selected_count, self._crawl_batch_size
-                    ):
-                        jobs = [
-                            _ArticleJob(entry, source.query_label, feed_title)
-                            for entry in entries[
-                                start : min(
-                                    start + self._crawl_batch_size,
-                                    selected_count,
-                                )
-                            ]
-                        ]
-                        yield await self._crawl_job_batch(jobs)
-        finally:
-            if own_client:
-                await client.aclose()
+                continue
+
+            discovery.resolved_failures.append(
+                FailureTarget(failure_kind="feed", url=poll.target.feed_url)
+            )
+            if poll.status == "not_modified":
+                yield discovery
+                continue
+
+            discovery.articles_discovered = len(poll.entries)
+            selected = (
+                poll.entries[:max_articles_per_feed]
+                if max_articles_per_feed > 0
+                else poll.entries
+            )
+            self._logger.info(
+                "[GoogleNews RSS] %s — %d entries (%d total), crawling %d…",
+                poll.target.source_label,
+                len(selected),
+                len(poll.entries),
+                len(selected),
+            )
+            yield discovery
+            for chunk in self._chunks(selected, self._crawl_batch_size):
+                yield await self.crawl_entries(chunk)
 
     @property
     def next_feed_offset(self) -> int:

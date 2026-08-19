@@ -39,7 +39,6 @@ def test_article_retry_preserves_context_and_resolves_original_failure() -> None
             FakeStorage(),
             FakeSearcher(),
             limit=50,
-            max_articles_per_feed=20,
             max_concurrent_crawls=1,
         )
     )
@@ -81,7 +80,6 @@ def test_article_retries_are_chunked() -> None:
             FakeStorage(),
             searcher,
             limit=50,
-            max_articles_per_feed=20,
             max_concurrent_crawls=2,
             crawl_batch_size=2,
         )

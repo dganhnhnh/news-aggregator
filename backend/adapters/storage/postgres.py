@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, or_, select, text, tuple_, update
+from sqlalchemy import delete, func, or_, select, text, tuple_, union, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-from adapters.storage.schema import crawl_failures, raw_articles, sources, worker_runs
+from adapters.storage.schema import (
+    crawl_failures,
+    feed_state,
+    raw_articles,
+    sources,
+    worker_runs,
+)
 from models.storage_models import (
     ArticleListItem,
     CrawlFailureOccurrence,
     FailureTarget,
+    FeedFailureOutcome,
+    FeedPollTarget,
+    FeedSeed,
     RawArticle,
     RunStatus,
     StoredCrawlFailure,
@@ -56,7 +65,8 @@ class PostgresRawStorage:
                         "SELECT to_regclass('public.raw_articles'), "
                         "to_regclass('public.crawl_failures'), "
                         "to_regclass('public.worker_runs'), "
-                        "to_regclass('public.sources')"
+                        "to_regclass('public.sources'), "
+                        "to_regclass('public.feed_state')"
                     )
                 )
                 if any(value is None for value in tables.one()):
@@ -426,3 +436,153 @@ class PostgresRawStorage:
                 .limit(limit)
             )
             return [StoredCrawlFailure(**dict(row._mapping)) for row in result]
+
+    async def seed_feeds(self, seeds: Sequence[FeedSeed]) -> int:
+        """Insert feeds unknown to `feed_state`; never touch existing rows.
+
+        DO NOTHING rather than DO UPDATE: an operator's manual `disabled_at`
+        must outlive the feed disappearing from an OPML file, and a feed
+        reappearing later must not silently resurrect it.
+        """
+        if not seeds:
+            return 0
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                pg_insert(feed_state)
+                .values(
+                    [
+                        {"feed_url": seed.feed_url, "source_label": seed.source_label}
+                        for seed in seeds
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=[feed_state.c.feed_url])
+                .returning(feed_state.c.feed_url)
+            )
+            return len(result.fetchall())
+
+    async def due_feeds(
+        self,
+        *,
+        limit: int,
+        feed_urls: Sequence[str] | None = None,
+        ignore_schedule: bool = False,
+        now: datetime | None = None,
+    ) -> list[FeedPollTarget]:
+        now = now or datetime.now(timezone.utc)
+        stmt = select(
+            feed_state.c.feed_url,
+            feed_state.c.source_label,
+            feed_state.c.etag,
+            feed_state.c.last_modified,
+        )
+        if feed_urls:
+            stmt = stmt.where(feed_state.c.feed_url.in_(list(feed_urls)))
+        else:
+            stmt = stmt.where(feed_state.c.disabled_at.is_(None))
+            if not ignore_schedule:
+                stmt = stmt.where(feed_state.c.next_poll_at <= now)
+        stmt = stmt.order_by(feed_state.c.next_poll_at)
+        if limit:
+            stmt = stmt.limit(limit)
+        async with self._engine.connect() as connection:
+            result = await connection.execute(stmt)
+            return [FeedPollTarget(**dict(row._mapping)) for row in result]
+
+    async def record_feed_poll(
+        self,
+        feed_url: str,
+        *,
+        next_poll_at: datetime,
+        not_modified: bool = False,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        last_entry_published_at: datetime | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        values: dict[str, Any] = {
+            "last_polled_at": now,
+            "last_success_at": now,
+            "consecutive_failures": 0,
+            "next_poll_at": next_poll_at,
+            "updated_at": now,
+        }
+        if not not_modified:
+            # A 304 carries no new headers/entries, so leave the existing
+            # etag/last_modified/last_entry_published_at untouched.
+            values["etag"] = etag
+            values["last_modified"] = last_modified
+            values["last_entry_published_at"] = last_entry_published_at
+        async with self._engine.begin() as connection:
+            await connection.execute(
+                update(feed_state)
+                .where(feed_state.c.feed_url == feed_url)
+                .values(**values)
+            )
+
+    async def record_feed_failure(
+        self,
+        feed_url: str,
+        *,
+        error_message: str,
+        disable_after: int,
+    ) -> FeedFailureOutcome:
+        now = datetime.now(timezone.utc)
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    select(feed_state.c.consecutive_failures)
+                    .where(feed_state.c.feed_url == feed_url)
+                    .with_for_update()
+                )
+            ).one()
+            consecutive_failures = int(row.consecutive_failures) + 1
+            disabled = consecutive_failures >= disable_after
+            values: dict[str, Any] = {
+                "last_polled_at": now,
+                "consecutive_failures": consecutive_failures,
+                "next_poll_at": now + retry_delay(consecutive_failures),
+                "updated_at": now,
+            }
+            if disabled:
+                values["disabled_at"] = now
+                values["disabled_reason"] = error_message[:2000]
+            await connection.execute(
+                update(feed_state)
+                .where(feed_state.c.feed_url == feed_url)
+                .values(**values)
+            )
+        return FeedFailureOutcome(
+            consecutive_failures=consecutive_failures, disabled=disabled
+        )
+
+    async def known_urls(
+        self,
+        candidates: Sequence[str],
+        *,
+        now: datetime | None = None,
+    ) -> set[str]:
+        """Return the subset of `candidates` already stored or in backoff.
+
+        Checks both `raw_articles` columns because a feed's entry URL often
+        differs from the final URL after redirects, and includes
+        `crawl_failures` still in backoff so the exponential delay in
+        `retry_delay()` is actually honored instead of being defeated by a
+        fresh discovery pass rediscovering the same broken URL every poll.
+        """
+        if not candidates:
+            return set()
+        now = now or datetime.now(timezone.utc)
+        urls = list(candidates)
+        stmt = union(
+            select(raw_articles.c.url).where(raw_articles.c.url.in_(urls)),
+            select(raw_articles.c.url_original).where(
+                raw_articles.c.url_original.in_(urls)
+            ),
+            select(crawl_failures.c.url).where(
+                crawl_failures.c.url.in_(urls),
+                crawl_failures.c.next_retry_at > now,
+            ),
+        )
+        async with self._engine.connect() as connection:
+            result = await connection.execute(stmt)
+            return {row[0] for row in result if row[0] is not None}
