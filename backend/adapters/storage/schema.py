@@ -17,8 +17,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 
 
 metadata = MetaData()
@@ -99,21 +100,31 @@ crawl_failures = Table(
 )
 Index("ix_crawl_failures_next_retry_at", crawl_failures.c.next_retry_at)
 
-ingest_runs = Table(
-    "ingest_runs",
+worker_runs = Table(
+    "worker_runs",
     metadata,
     Column("id", BigInteger, Identity(), primary_key=True),
-    Column("job_type", Text, nullable=False),
+    Column("worker", Text, nullable=False),
+    Column("trigger", Text, nullable=False),
     Column("status", Text, nullable=False),
     Column("started_at", DateTime(timezone=True), nullable=False),
     Column("finished_at", DateTime(timezone=True)),
-    Column("feeds_processed", Integer, nullable=False, server_default="0"),
-    Column("articles_discovered", Integer, nullable=False, server_default="0"),
-    Column("crawl_succeeded", Integer, nullable=False, server_default="0"),
-    Column("crawl_failed", Integer, nullable=False, server_default="0"),
-    Column("retries_attempted", Integer, nullable=False, server_default="0"),
-    Column("retries_succeeded", Integer, nullable=False, server_default="0"),
-    Column("articles_written", Integer, nullable=False, server_default="0"),
-    Column("articles_unchanged", Integer, nullable=False, server_default="0"),
+    Column("heartbeat_at", DateTime(timezone=True), nullable=False),
+    Column("window_start", DateTime(timezone=True)),
+    Column("window_end", DateTime(timezone=True)),
+    Column("params", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
+    Column("stats", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     Column("error_message", Text),
+)
+Index(
+    "ix_worker_runs_worker_started",
+    worker_runs.c.worker,
+    worker_runs.c.started_at.desc(),
+)
+# Partial index: the reaper only ever scans rows still marked running, and that
+# set stays tiny while the table grows without bound.
+Index(
+    "ix_worker_runs_running",
+    worker_runs.c.heartbeat_at,
+    postgresql_where=text("status = 'running'"),
 )

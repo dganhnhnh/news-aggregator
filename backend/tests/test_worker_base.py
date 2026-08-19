@@ -1,0 +1,255 @@
+import argparse
+import asyncio
+import os
+import signal
+import sys
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import pytest
+
+from models.storage_models import IngestRunStats
+from workers.base import (
+    EXIT_FAILED,
+    EXIT_OK,
+    RunContext,
+    RunOutcome,
+    Worker,
+    shutdown_signals,
+    stale_after_for,
+)
+from workers.window import RunWindow
+
+
+NOW = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+STALE_AFTER = timedelta(seconds=900)
+
+
+def _window(explicit: bool = False, days: int = 3) -> RunWindow:
+    return RunWindow(start=NOW - timedelta(days=days), end=NOW, explicit=explicit)
+
+
+def _args(**overrides: Any) -> argparse.Namespace:
+    defaults: dict[str, Any] = {
+        "worker": "crawl",
+        "once": True,
+        "interval": None,
+        "strict": False,
+        "trigger": None,
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class FakeStorage:
+    """Records the order of the bookkeeping calls a run makes."""
+
+    def __init__(self, *, lock_acquired: bool = True) -> None:
+        self.calls: list[Any] = []
+        self._lock_acquired = lock_acquired
+        self._next_run_id = 1
+
+    async def reap_abandoned(self, worker: str, stale_after: timedelta) -> int:
+        self.calls.append(("reap", worker, stale_after))
+        return 0
+
+    @asynccontextmanager
+    async def worker_lock(self, name: str):
+        self.calls.append(("lock", name, self._lock_acquired))
+        yield self._lock_acquired
+
+    async def start_run(self, **kwargs: Any) -> int:
+        run_id = self._next_run_id
+        self._next_run_id += 1
+        self.calls.append(("start", run_id, kwargs["worker"], kwargs["trigger"]))
+        return run_id
+
+    async def update_run(self, run_id: int, stats: Any) -> None:
+        self.calls.append(("checkpoint", run_id, stats.articles_written))
+
+    async def finish_run(
+        self,
+        run_id: int,
+        status: str,
+        stats: Any,
+        error_message: str | None = None,
+    ) -> None:
+        self.calls.append(("finish", run_id, status, error_message))
+
+
+class ScriptedWorker(Worker):
+    name = "crawl"
+
+    def __init__(self, outcome: RunOutcome | BaseException) -> None:
+        self.outcome = outcome
+        self.executed = 0
+
+    async def execute(self, ctx: RunContext) -> RunOutcome:
+        self.executed += 1
+        # CancelledError is a BaseException, so this cannot narrow to Exception.
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def _run(worker: Worker, storage: FakeStorage, args: argparse.Namespace) -> int:
+    return asyncio.run(
+        worker.run(storage, args, _window(), stale_after=STALE_AFTER)
+    )
+
+
+def test_lock_held_elsewhere_skips_the_run_without_bookkeeping() -> None:
+    storage = FakeStorage(lock_acquired=False)
+    worker = ScriptedWorker(RunOutcome("succeeded", IngestRunStats()))
+
+    exit_code = _run(worker, storage, _args())
+
+    assert exit_code == EXIT_OK
+    assert worker.executed == 0
+    assert [call[0] for call in storage.calls] == ["reap", "lock"]
+
+
+def test_stale_runs_are_reaped_before_the_lock_is_taken() -> None:
+    # A run worth reaping belongs to a dead process that no longer holds the
+    # lock, so reaping has to happen first or it would never happen at all.
+    storage = FakeStorage()
+    worker = ScriptedWorker(RunOutcome("succeeded", IngestRunStats()))
+
+    _run(worker, storage, _args())
+
+    assert [call[0] for call in storage.calls] == [
+        "reap",
+        "lock",
+        "start",
+        "finish",
+    ]
+    assert storage.calls[0] == ("reap", "crawl", STALE_AFTER)
+
+
+def test_failing_execute_closes_the_run_and_exits_one() -> None:
+    storage = FakeStorage()
+    worker = ScriptedWorker(RuntimeError("feed host is down"))
+
+    exit_code = _run(worker, storage, _args())
+
+    assert exit_code == EXIT_FAILED
+    assert ("finish", 1, "failed", "feed host is down") in storage.calls
+
+
+def test_partial_exits_zero_unless_strict() -> None:
+    lenient = FakeStorage()
+    strict = FakeStorage()
+    outcome = RunOutcome("partial", IngestRunStats(), "3 feeds failed")
+
+    assert _run(ScriptedWorker(outcome), lenient, _args()) == EXIT_OK
+    assert _run(ScriptedWorker(outcome), strict, _args(strict=True)) == EXIT_FAILED
+    assert ("finish", 1, "partial", "3 feeds failed") in strict.calls
+
+
+def test_explicit_window_is_recorded_as_a_backfill() -> None:
+    storage = FakeStorage()
+    worker = ScriptedWorker(RunOutcome("succeeded", IngestRunStats()))
+
+    asyncio.run(
+        worker.run(
+            storage,
+            _args(),
+            _window(explicit=True),
+            stale_after=STALE_AFTER,
+        )
+    )
+
+    assert ("start", 1, "crawl", "backfill") in storage.calls
+
+
+def test_trigger_can_be_overridden_on_the_command_line() -> None:
+    storage = FakeStorage()
+    worker = ScriptedWorker(RunOutcome("succeeded", IngestRunStats()))
+
+    _run(worker, storage, _args(trigger="manual"))
+
+    assert ("start", 1, "crawl", "manual") in storage.calls
+
+
+def test_shutdown_between_chunks_keeps_the_first_checkpoint() -> None:
+    storage = FakeStorage()
+
+    class ChunkedWorker(Worker):
+        name = "crawl"
+
+        async def execute(self, ctx: RunContext) -> RunOutcome:
+            stats = IngestRunStats()
+            for chunk in range(3):
+                stats.articles_written += 1
+                await ctx.checkpoint(stats)
+                if chunk == 0:
+                    # Stands in for a SIGTERM arriving mid-run.
+                    ctx.shutdown.set()
+                if ctx.shutdown.is_set():
+                    return RunOutcome("partial", stats, "Stopped on a shutdown signal")
+            return RunOutcome("succeeded", stats)
+
+    exit_code = _run(ChunkedWorker(), storage, _args())
+
+    assert exit_code == EXIT_OK
+    assert ("checkpoint", 1, 1) in storage.calls
+    assert ("checkpoint", 1, 2) not in storage.calls
+    assert ("finish", 1, "partial", "Stopped on a shutdown signal") in storage.calls
+
+
+def test_interval_loops_until_shutdown_is_requested() -> None:
+    storage = FakeStorage()
+
+    class LoopingWorker(Worker):
+        name = "crawl"
+        runs = 0
+
+        async def execute(self, ctx: RunContext) -> RunOutcome:
+            self.runs += 1
+            if self.runs == 2:
+                ctx.shutdown.set()
+            return RunOutcome("succeeded", IngestRunStats())
+
+    exit_code = _run(LoopingWorker(), storage, _args(once=False, interval=1))
+
+    assert exit_code == EXIT_OK
+    assert [call for call in storage.calls if call[0] == "start"] == [
+        ("start", 1, "crawl", "scheduled"),
+        ("start", 2, "crawl", "scheduled"),
+    ]
+
+
+def test_cancellation_closes_the_run_as_partial() -> None:
+    storage = FakeStorage()
+    worker = ScriptedWorker(asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        _run(worker, storage, _args())
+
+    assert storage.calls[-1] == (
+        "finish",
+        1,
+        "partial",
+        "Cancelled before the run completed",
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX signal handling only"
+)
+def test_sigterm_sets_the_shutdown_event_without_killing_the_process() -> None:
+    async def scenario() -> bool:
+        event = asyncio.Event()
+        with shutdown_signals(event):
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.wait_for(event.wait(), timeout=5)
+        return event.is_set()
+
+    assert asyncio.run(scenario()) is True
+
+
+def test_stale_after_never_dips_below_the_configured_floor() -> None:
+    assert stale_after_for(_args(), 900) == timedelta(seconds=900)
+    assert stale_after_for(_args(interval=60), 900) == timedelta(seconds=900)
+    assert stale_after_for(_args(interval=1800), 900) == timedelta(seconds=5400)

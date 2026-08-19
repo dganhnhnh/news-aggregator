@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from sqlalchemy import delete, func, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-from adapters.storage.schema import crawl_failures, ingest_runs, raw_articles, sources
+from adapters.storage.schema import crawl_failures, raw_articles, sources, worker_runs
 from models.storage_models import (
     ArticleListItem,
     CrawlFailureOccurrence,
     FailureTarget,
-    IngestRunStats,
     RawArticle,
+    RunStatus,
     StoredCrawlFailure,
     StorageWriteSummary,
+    WorkerTrigger,
 )
 from services.raw_storage import source_slug
 
@@ -50,7 +55,7 @@ class PostgresRawStorage:
                     text(
                         "SELECT to_regclass('public.raw_articles'), "
                         "to_regclass('public.crawl_failures'), "
-                        "to_regclass('public.ingest_runs'), "
+                        "to_regclass('public.worker_runs'), "
                         "to_regclass('public.sources')"
                     )
                 )
@@ -63,56 +68,130 @@ class PostgresRawStorage:
         except Exception as exc:
             raise StorageError(f"Database is unavailable: {exc}") from exc
 
-    async def start_run(self, job_type: str) -> int:
+    @asynccontextmanager
+    async def worker_lock(self, name: str) -> AsyncIterator[bool]:
+        """Hold a session-level advisory lock for the duration of a worker run.
+
+        Yields whether the lock was acquired; a caller that gets ``False`` must
+        exit instead of waiting, because overlapping cron schedules would
+        otherwise pile up waiters. The lock lives on a dedicated AUTOCOMMIT
+        connection: advisory locks do not need a transaction, and holding one
+        open for a run that may last an hour would block autovacuum.
+        """
+        key = {"key": f"worker:{name}"}
+        engine = self._engine.execution_options(isolation_level="AUTOCOMMIT")
+        acquired = False
+        async with engine.connect() as connection:
+            try:
+                acquired = bool(
+                    await connection.scalar(
+                        text("SELECT pg_try_advisory_lock(hashtext(:key)::bigint)"),
+                        key,
+                    )
+                )
+                yield acquired
+            finally:
+                if acquired:
+                    await connection.execute(
+                        text("SELECT pg_advisory_unlock(hashtext(:key)::bigint)"),
+                        key,
+                    )
+
+    async def reap_abandoned(self, worker: str, stale_after: timedelta) -> int:
+        """Close out runs whose process died without finishing them.
+
+        Only relabels rows; a live run keeps its heartbeat fresh and is never
+        touched. Returns how many runs were reaped so the caller can log it.
+        """
+        cutoff = datetime.now(timezone.utc) - stale_after
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                update(worker_runs)
+                .where(
+                    worker_runs.c.worker == worker,
+                    worker_runs.c.status == "running",
+                    worker_runs.c.heartbeat_at < cutoff,
+                )
+                .values(
+                    status="abandoned",
+                    finished_at=datetime.now(timezone.utc),
+                    error_message="Heartbeat stopped; reaped by a later run",
+                )
+            )
+            return int(result.rowcount or 0)
+
+    async def start_run(
+        self,
+        *,
+        worker: str,
+        trigger: WorkerTrigger,
+        window_start: datetime | None = None,
+        window_end: datetime | None = None,
+        params: Mapping[str, Any] | None = None,
+    ) -> int:
         now = datetime.now(timezone.utc)
         async with self._engine.begin() as connection:
             result = await connection.execute(
-                ingest_runs.insert()
-                .values(job_type=job_type, status="running", started_at=now)
-                .returning(ingest_runs.c.id)
+                worker_runs.insert()
+                .values(
+                    worker=worker,
+                    trigger=trigger,
+                    status="running",
+                    started_at=now,
+                    heartbeat_at=now,
+                    window_start=window_start,
+                    window_end=window_end,
+                    params=dict(params or {}),
+                )
+                .returning(worker_runs.c.id)
             )
             return int(result.scalar_one())
 
     async def finish_run(
         self,
         run_id: int,
-        status: str,
-        stats: IngestRunStats,
+        status: RunStatus,
+        stats: Any,
         error_message: str | None = None,
     ) -> None:
         async with self._engine.begin() as connection:
             await connection.execute(
-                update(ingest_runs)
-                .where(ingest_runs.c.id == run_id)
+                update(worker_runs)
+                .where(worker_runs.c.id == run_id)
                 .values(
                     status=status,
                     finished_at=datetime.now(timezone.utc),
-                    **self._stats_values(stats),
+                    heartbeat_at=datetime.now(timezone.utc),
+                    stats=self._stats_payload(stats),
                     error_message=(error_message or "")[:2000] or None,
                 )
             )
 
-    async def update_run(self, run_id: int, stats: IngestRunStats) -> None:
-        """Checkpoint counters while the run is still in progress."""
+    async def update_run(self, run_id: int, stats: Any) -> None:
+        """Checkpoint stats and refresh the heartbeat in one write.
+
+        Both express the same event -- "a chunk just finished" -- so keeping
+        them in a single statement makes it impossible to record progress
+        without also proving the run is alive.
+        """
         async with self._engine.begin() as connection:
             await connection.execute(
-                update(ingest_runs)
-                .where(ingest_runs.c.id == run_id)
-                .values(**self._stats_values(stats))
+                update(worker_runs)
+                .where(worker_runs.c.id == run_id)
+                .values(
+                    stats=self._stats_payload(stats),
+                    heartbeat_at=datetime.now(timezone.utc),
+                )
             )
 
     @staticmethod
-    def _stats_values(stats: IngestRunStats) -> dict[str, int]:
-        return {
-            "feeds_processed": stats.feeds_processed,
-            "articles_discovered": stats.articles_discovered,
-            "crawl_succeeded": stats.crawl_succeeded,
-            "crawl_failed": stats.crawl_failed,
-            "retries_attempted": stats.retries_attempted,
-            "retries_succeeded": stats.retries_succeeded,
-            "articles_written": stats.articles_written,
-            "articles_unchanged": stats.articles_unchanged,
-        }
+    def _stats_payload(stats: Any) -> dict[str, Any]:
+        """Accept any counter dataclass so each worker can define its own."""
+        if stats is None:
+            return {}
+        if is_dataclass(stats) and not isinstance(stats, type):
+            return asdict(stats)
+        return dict(stats)
 
     @staticmethod
     async def _ensure_sources(

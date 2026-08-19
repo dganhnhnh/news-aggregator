@@ -27,6 +27,7 @@ dev = [
 
 [project.scripts]
 news-pipeline = "pipelines.news:main"
+news-worker = "workers.cli:main"
 news-service = "services.news:main"
 news-api = "api.main:run"
 

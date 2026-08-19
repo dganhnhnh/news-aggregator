@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 
 import pytest
@@ -7,7 +7,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from adapters.storage.postgres import PostgresRawStorage
-from adapters.storage.schema import crawl_failures, ingest_runs, raw_articles, sources
+from adapters.storage.schema import crawl_failures, raw_articles, sources, worker_runs
 from models.storage_models import (
     ArticleListItem,
     CrawlFailureOccurrence,
@@ -208,15 +208,25 @@ async def _test_postgres_upsert_and_failure_state() -> None:
             received=0,
             rejected=0,
         )
-        succeeded_id = await storage.start_run("pipeline_crawl")
+        window_start = now - timedelta(days=3)
+        succeeded_id = await storage.start_run(
+            worker="crawl",
+            trigger="manual",
+            window_start=window_start,
+            window_end=now,
+            params={"entrypoint": "test"},
+        )
         run_ids.append(succeeded_id)
         async with engine.connect() as connection:
-            running_status = await connection.scalar(
-                select(ingest_runs.c.status).where(
-                    ingest_runs.c.id == succeeded_id
+            started = (
+                await connection.execute(
+                    select(worker_runs).where(worker_runs.c.id == succeeded_id)
                 )
-            )
-        assert running_status == "running"
+            ).one()
+        assert started.status == "running"
+        assert started.params == {"entrypoint": "test"}
+        assert started.window_start == window_start
+        assert started.heartbeat_at == started.started_at
 
         checkpoint_stats = IngestRunStats(
             feeds_processed=2,
@@ -226,20 +236,22 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         async with engine.connect() as connection:
             checkpointed = (
                 await connection.execute(
-                    select(ingest_runs).where(
-                        ingest_runs.c.id == succeeded_id
+                    select(worker_runs).where(
+                        worker_runs.c.id == succeeded_id
                     )
                 )
             ).one()
         assert checkpointed.status == "running"
-        assert checkpointed.feeds_processed == 2
-        assert checkpointed.articles_written == 1
+        assert checkpointed.stats["feeds_processed"] == 2
+        assert checkpointed.stats["articles_written"] == 1
+        # A checkpoint is also the run's proof of life.
+        assert checkpointed.heartbeat_at > started.heartbeat_at
 
         await storage.finish_run(succeeded_id, "succeeded", checkpoint_stats)
-        partial_id = await storage.start_run("pipeline_rss")
+        partial_id = await storage.start_run(worker="crawl", trigger="manual")
         run_ids.append(partial_id)
         await storage.finish_run(partial_id, "partial", IngestRunStats())
-        failed_id = await storage.start_run("service")
+        failed_id = await storage.start_run(worker="crawl", trigger="scheduled")
         run_ids.append(failed_id)
         await storage.finish_run(
             failed_id,
@@ -252,8 +264,8 @@ async def _test_postgres_upsert_and_failure_state() -> None:
                 select(crawl_failures.c.url).where(crawl_failures.c.url == url)
             )
             runs = await connection.execute(
-                select(ingest_runs.c.id, ingest_runs.c.status).where(
-                    ingest_runs.c.id.in_(run_ids)
+                select(worker_runs.c.id, worker_runs.c.status).where(
+                    worker_runs.c.id.in_(run_ids)
                 )
             )
         assert resolved is None
@@ -275,7 +287,7 @@ async def _test_postgres_upsert_and_failure_state() -> None:
                 )
                 if run_ids:
                     await connection.execute(
-                        delete(ingest_runs).where(ingest_runs.c.id.in_(run_ids))
+                        delete(worker_runs).where(worker_runs.c.id.in_(run_ids))
                     )
                 await connection.execute(
                     delete(sources).where(sources.c.slug == source_slug)

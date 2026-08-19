@@ -36,6 +36,9 @@ class Settings:
     feed_offset: int
     max_retries_per_run: int
     service_interval_seconds: int
+    # A run checkpoints (and so heartbeats) after every chunk, so this measures
+    # silence between chunks rather than total run length.
+    worker_heartbeat_timeout_seconds: int = 900
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     cors_allow_origins: tuple[str, ...] = ()
@@ -64,6 +67,9 @@ class Settings:
             feed_offset=_env_int("RSS_FEED_OFFSET", 0),
             max_retries_per_run=_env_int("MAX_RETRIES_PER_RUN", 50),
             service_interval_seconds=_env_int("SERVICE_INTERVAL_SECONDS", 1800),
+            worker_heartbeat_timeout_seconds=_env_int(
+                "WORKER_HEARTBEAT_TIMEOUT_SECONDS", 900
+            ),
             api_host=os.getenv("API_HOST", "0.0.0.0"),
             api_port=_env_int("API_PORT", 8000),
             cors_allow_origins=cors_origins,

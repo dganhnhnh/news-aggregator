@@ -61,7 +61,7 @@ uv run news-pipeline rss --feed-path ./data/engineering_blogs.opml --max-feeds 5
 uv run news-pipeline rss --tsv-path ./queries.tsv --max-articles-per-feed 5
 ```
 
-`crawl` và `rss` hỗ trợ lưu article/failure và tạo một `ingest_runs` bằng cờ
+`crawl` và `rss` hỗ trợ lưu article/failure và tạo một `worker_runs` bằng cờ
 `--persist`; kết quả article vẫn được emit ra stdout:
 
 ```bash
@@ -71,46 +71,71 @@ uv run news-pipeline rss --feed-path ./data/engineering_blogs.opml --max-feeds 5
 
 `search` của Tavily không hỗ trợ `--persist`.
 
-## Chạy background service
+## Chạy worker
 
-`news-service` luôn yêu cầu PostgreSQL. Mỗi iteration xử lý tối đa
-`MAX_RETRIES_PER_RUN` failure đến hạn trước, rồi mới ingest feed hiện tại:
+`news-worker` là entry point cho mọi worker; hiện có subcommand `crawl`. Worker
+luôn yêu cầu PostgreSQL. Mỗi run xử lý tối đa `MAX_RETRIES_PER_RUN` failure đến
+hạn trước, rồi mới ingest feed hiện tại. Mặc định chạy một lần rồi thoát:
 
 ```bash
-uv run news-service --feed-path ./data/engineering_blogs.opml --interval-seconds 1800
-uv run news-service --feed-path ./data/engineering_blogs.opml --max-feeds 5 --once
+uv run news-worker crawl --feed-path ./data/engineering_blogs.opml --max-feeds 5
+uv run news-worker crawl --feed-path ./data/engineering_blogs.opml --interval 1800
 ```
+
+Mỗi run ghi cửa sổ thời gian đã yêu cầu vào `worker_runs`; mặc định là `--last
+3d`, hoặc chỉ định tường minh bằng `--since` / `--until` (ISO date hoặc
+datetime, naive được đọc là UTC):
+
+```bash
+uv run news-worker crawl --last 12h
+uv run news-worker crawl --since 2026-08-01 --until 2026-08-10
+```
+
+Cửa sổ dài hơn 7 ngày sẽ log WARNING vì RSS feed không giữ lại entry cũ đến
+vậy. Ở giai đoạn hiện tại cửa sổ mới chỉ được ghi nhận, chưa dùng để lọc entry.
 
 Crawler dùng giới hạn tài nguyên cố định, không tăng số browser workers theo
 tổng số article. Mặc định fetch tối đa 2 feed, crawl tối đa 2 page đồng thời và
 commit sau mỗi 10 kết quả. Có thể điều chỉnh rõ ràng:
 
 ```bash
-uv run news-service \
+uv run news-worker crawl \
   --feed-path ./data/engineering_blogs.opml \
-  --once \
   --max-concurrent-feeds 2 \
   --max-concurrent-crawls 2 \
   --crawl-batch-size 10
 ```
 
 Mỗi chunk được upsert và checkpoint ngay; dừng sau đó không làm mất các chunk
-đã commit. Khi `--max-feeds` nhỏ hơn tổng nguồn, service định kỳ tự chuyển sang
-nhóm tiếp theo trong cùng process. Dùng `--feed-offset` để chọn vị trí bắt đầu
-cho một lần `--once` hoặc sau khi restart service.
+đã commit. Khi `--max-feeds` nhỏ hơn tổng nguồn, run có `--interval` tự chuyển
+sang nhóm tiếp theo trong cùng process. Dùng `--feed-offset` để chọn vị trí bắt
+đầu cho một run đơn lẻ hoặc sau khi restart.
 
-Mặc định service chỉ log summary. Thêm `--emit-jsonl` nếu cần emit đầy đủ các
+Mặc định worker chỉ log summary. Thêm `--emit-jsonl` nếu cần emit đầy đủ các
 article đã crawl:
 
 ```bash
-uv run news-service --feed-path ./data/engineering_blogs.opml --once --emit-jsonl
+uv run news-worker crawl --feed-path ./data/engineering_blogs.opml --emit-jsonl
 ```
 
 Failure được retry theo exponential backoff từ 5 phút đến tối đa 24 giờ. Một
 failure thành công sẽ bị xóa; failure lặp lại chỉ tăng `attempt_count` trên cùng
-row. Chạy `--once` trả exit code khác 0 nếu iteration gặp lỗi fatal. Service
-định kỳ ghi nhận iteration failed rồi thử lại ở chu kỳ sau. Hiện chỉ nên chạy
-một instance `news-service`; claiming cho multi-worker chưa được triển khai.
+row.
+
+### Vận hành
+
+- **Không chạy chồng:** mỗi worker giữ một advisory lock của PostgreSQL trong
+  suốt run. Instance thứ hai log rồi thoát ngay với exit code 0 thay vì xếp
+  hàng chờ, nên đặt cron dày hơn thời lượng run vẫn an toàn.
+- **Exit code:** `0` khi run `succeeded`/`partial` hoặc khi không lấy được
+  lock; `1` khi run `failed`. Thêm `--strict` nếu muốn `partial` cũng trả `1`.
+- **Tắt êm:** SIGTERM/SIGINT dừng ở ranh giới chunk kế tiếp, đóng sổ run ở
+  trạng thái `partial` thay vì để kẹt `running`.
+- **Run treo:** run nào ngừng heartbeat quá `max(3 × --interval,
+  WORKER_HEARTBEAT_TIMEOUT_SECONDS)` sẽ bị run sau đánh dấu `abandoned`.
+
+`news-service` vẫn chạy được nhưng đã deprecated: nó chỉ in cảnh báo, đổi
+`--interval-seconds` thành `--interval` rồi gọi lại `news-worker crawl`.
 
 ## Nguồn TSV và OPML
 
@@ -128,19 +153,21 @@ của `--feed-path`. Có thể đặt nguồn mặc định bằng `RSS_FEED_PAT
 
 ## Raw storage và monitoring
 
-Schema chỉ có ba bảng:
+Schema có bốn bảng:
 
 - `raw_articles`: nội dung Markdown mới nhất, URL chuẩn hóa và SHA-256
   `content_hash`; upsert chỉ update khi content hoặc metadata thay đổi.
+- `sources`: nguồn đã chuẩn hóa mà `raw_articles` tham chiếu tới.
 - `crawl_failures`: lỗi hiện tại và durable retry queue, không lưu lịch sử từng
   attempt.
-- `ingest_runs`: summary `running/succeeded/partial/failed` của mỗi invocation
-  có persistence.
+- `worker_runs`: sổ vận hành chung cho mọi worker — trạng thái
+  `running/succeeded/partial/failed/abandoned`, `heartbeat_at`, cửa sổ thời
+  gian, cùng `params` và `stats` dạng JSONB.
 
 Không lưu raw HTML hay phiên bản cũ. Có thể kiểm tra nhanh trạng thái bằng:
 
 ```bash
-docker compose -f deployments/docker-compose.yml --env-file .env exec db psql -U news_radar -d news_radar -c "SELECT status, count(*) FROM ingest_runs GROUP BY status;"
+docker compose -f deployments/docker-compose.yml --env-file .env exec db psql -U news_radar -d news_radar -c "SELECT worker, status, count(*) FROM worker_runs GROUP BY worker, status;"
 docker compose -f deployments/docker-compose.yml --env-file .env exec db psql -U news_radar -d news_radar -c "SELECT failure_kind, count(*) FROM crawl_failures GROUP BY failure_kind;"
 ```
 

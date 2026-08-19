@@ -8,6 +8,7 @@ from models.search_and_crawl_models import CrawlMetadata, CrawlResult
 from models.storage_models import CrawlBatch, StorageWriteSummary
 from pipelines import news as pipeline_cli
 from services import news as service_cli
+from workers import cli as worker_cli
 
 
 def _settings(database_url: str | None = None) -> Settings:
@@ -27,7 +28,7 @@ def _settings(database_url: str | None = None) -> Settings:
     )
 
 
-def test_persistence_and_service_output_flags_are_exposed() -> None:
+def test_persistence_and_worker_output_flags_are_exposed() -> None:
     pipeline_parser = pipeline_cli.build_parser(_settings())
     crawl_args = pipeline_parser.parse_args(
         ["crawl", "https://example.com", "--persist"]
@@ -35,20 +36,43 @@ def test_persistence_and_service_output_flags_are_exposed() -> None:
     rss_args = pipeline_parser.parse_args(
         ["rss", "--feed-path", "feeds.opml", "--persist"]
     )
-    service_args = service_cli.build_parser(_settings()).parse_args(
-        ["--feed-path", "feeds.opml", "--once", "--emit-jsonl"]
+    worker_args = worker_cli.build_parser(_settings()).parse_args(
+        ["crawl", "--feed-path", "feeds.opml", "--once", "--emit-jsonl"]
     )
 
     assert crawl_args.persist is True
     assert rss_args.persist is True
-    assert service_args.emit_jsonl is True
-    assert service_args.max_concurrent_feeds == 2
-    assert service_args.max_concurrent_crawls == 2
-    assert service_args.crawl_batch_size == 10
+    assert worker_args.emit_jsonl is True
+    assert worker_args.max_concurrent_feeds == 2
+    assert worker_args.max_concurrent_crawls == 2
+    assert worker_args.crawl_batch_size == 10
     with pytest.raises(SystemExit):
         pipeline_parser.parse_args(
             ["search", "query", "--persist"]
         )
+
+
+def test_news_service_alias_translates_legacy_flags() -> None:
+    # Bare news-service used to loop; the alias must keep doing so even though
+    # bare `news-worker crawl` runs once.
+    assert service_cli.translate_argv([], 1800) == [
+        "crawl",
+        "--interval",
+        "1800",
+    ]
+    assert service_cli.translate_argv(
+        ["--feed-path", "feeds.opml", "--interval-seconds", "60"], 1800
+    ) == ["crawl", "--feed-path", "feeds.opml", "--interval", "60"]
+    assert service_cli.translate_argv(["--interval-seconds=60"], 1800) == [
+        "crawl",
+        "--interval",
+        "60",
+    ]
+    # --once won over --interval-seconds under the old parser; the new parser
+    # rejects the pair, so the interval is dropped rather than passed through.
+    assert service_cli.translate_argv(
+        ["--once", "--interval-seconds", "60"], 1800
+    ) == ["crawl", "--once"]
 
 
 def test_persist_fails_before_crawl_without_database_url(
@@ -121,8 +145,8 @@ def test_persisted_crawl_creates_and_finishes_run(
         async def check_ready(self) -> None:
             calls.append("ready")
 
-        async def start_run(self, job_type: str) -> int:
-            calls.append(("start", job_type))
+        async def start_run(self, *, worker, trigger, **kwargs) -> int:
+            calls.append(("start", worker, trigger, kwargs["params"]["command"]))
             return 7
 
         async def apply_batch(self, *args, **kwargs) -> StorageWriteSummary:
@@ -162,7 +186,7 @@ def test_persisted_crawl_creates_and_finishes_run(
         )
     )
 
-    assert ("start", "pipeline_crawl") in calls
+    assert ("start", "crawl", "manual", "crawl") in calls
     assert ("finish", 7, "succeeded", 1) in calls
     assert calls[-1] == "close"
     assert '"url": "https://example.com"' in capsys.readouterr().out
@@ -180,7 +204,7 @@ def test_rss_persists_each_chunk_before_later_interruption(
         async def check_ready(self) -> None:
             pass
 
-        async def start_run(self, job_type: str) -> int:
+        async def start_run(self, **kwargs) -> int:
             return 9
 
         async def apply_batch(self, *args, **kwargs) -> StorageWriteSummary:

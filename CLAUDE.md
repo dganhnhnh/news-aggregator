@@ -15,9 +15,14 @@ future Next.js UI.
   `alembic.ini`'s `prepend_sys_path = backend`.
   - `pipelines/news.py`: one-shot `news-pipeline` commands. `crawl` and `rss`
     persist only with `--persist`; Tavily `search` never persists.
-  - `services/news.py`: periodic `news-service`; always requires PostgreSQL,
-    retries due failures before fresh feed ingestion, and emits JSONL only
-    with `--emit-jsonl`.
+  - `workers/`: `news-worker`, the entry point for every worker. `base.py`
+    owns the operational frame (advisory lock, `worker_runs` bookkeeping,
+    heartbeats, shutdown signals, exit codes); a worker subclass implements
+    only `execute()`. `window.py` parses `--last`/`--since`/`--until` into a
+    shared `RunWindow`; `crawl.py` is the RSS/crawl worker.
+  - `services/news.py`: deprecated `news-service` alias that warns, renames
+    `--interval-seconds` to `--interval`, and delegates to `news-worker crawl`.
+    Keep it thin; there must stay exactly one orchestration code path.
   - `adapters/retrieve_news_data/`: Tavily, crawl4ai, and RSS/OPML adapters.
   - `services/raw_storage.py` and `ingestion.py`: normalization, hashing,
     batch deduplication, persistence orchestration, and retry handling.
@@ -29,9 +34,11 @@ future Next.js UI.
 - `frontend/`: empty placeholder for a future Next.js app; see
   `frontend/README.md` for the scaffold command.
 - `deployments/`: `docker-compose.yml` (PostgreSQL only) and `Dockerfile.api`.
-- PostgreSQL has three tables: `raw_articles` (latest version only),
-  `crawl_failures` (current durable retry queue), and `ingest_runs` (monitoring).
-  Raw HTML and historical article versions are intentionally not stored.
+- PostgreSQL has four tables: `raw_articles` (latest version only), `sources`,
+  `crawl_failures` (current durable retry queue), and `worker_runs` (one
+  operational log for every worker, with JSONB `params`/`stats` so a new worker
+  needs no migration). Raw HTML and historical article versions are
+  intentionally not stored.
 - PostgreSQL 16 runs through `deployments/docker-compose.yml` with named volume
   `news_radar_postgres_data`; host-side CLI jobs run Alembic explicitly. Always
   pass `--env-file .env` since the compose file no longer sits next to it.
@@ -43,8 +50,14 @@ future Next.js UI.
 - Article identity is the normalized final URL. Upserts must preserve `id`,
   avoid updates when content/metadata are unchanged, and never erase existing
   metadata with empty incoming values.
-- Retry assumes one `news-service` instance; multi-worker claiming is out of
-  scope until explicitly implemented.
+- One run of a given worker at a time, enforced by `PostgresRawStorage.
+  worker_lock`; a run that cannot take the lock exits 0 without doing work.
+  Retry therefore assumes a single active crawl run; per-row claiming for
+  parallel workers is out of scope until explicitly implemented.
+- Worker plumbing belongs in `workers/base.py`, not in a worker subclass:
+  check `ctx.shutdown` at chunk boundaries, report progress with
+  `ctx.checkpoint()` (which doubles as the heartbeat), and return a
+  `RunOutcome` instead of calling `finish_run` directly.
 - Keep RSS resource usage bounded: fetch only `MAX_CONCURRENT_FEEDS` at once,
   crawl at most `MAX_CONCURRENT_CRAWLS` pages concurrently, and retain at most
   `CRAWL_BATCH_SIZE` crawl results before persistence. Do not create tasks for
@@ -54,7 +67,7 @@ future Next.js UI.
 - Keep limited-feed runs rotating through the source list; use
   `RSS_FEED_OFFSET`/`--feed-offset` when a deterministic starting point matters.
 - The API is read-only: it must never write to `raw_articles`,
-  `crawl_failures`, or `ingest_runs`. Add new read methods to
+  `crawl_failures`, or `worker_runs`. Add new read methods to
   `PostgresRawStorage` rather than querying tables directly from routers.
 - Add focused unit tests and PostgreSQL integration tests for storage changes.
   Run `uv run --extra dev pytest`; integration tests use `TEST_DATABASE_URL`.

@@ -201,11 +201,7 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> None:
         emit_results(results)
         return
 
-    job_type: str
-    if args.command == "crawl":
-        job_type = "pipeline_crawl"
-    else:
-        job_type = "pipeline_rss"
+    if args.command != "crawl":
         if args.feed_path is None:
             raise ValueError(
                 "rss requires --feed-path/--tsv-path or "
@@ -221,7 +217,14 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> None:
                 raise StorageError("DATABASE_URL is required when --persist is used")
             storage = PostgresRawStorage(settings.database_url)
             await storage.check_ready()
-            run_id = await storage.start_run(job_type)
+            # news-pipeline is a hand-run debugging entry point, so it books a
+            # manual crawl run; the exact subcommand stays in params rather
+            # than widening the worker vocabulary.
+            run_id = await storage.start_run(
+                worker="crawl",
+                trigger="manual",
+                params={"entrypoint": "news-pipeline", "command": args.command},
+            )
 
         if args.command == "crawl":
             batch = await run_crawl_batch(args.urls)

@@ -10,7 +10,8 @@ from models.search_and_crawl_models import CrawlResult
 
 
 FailureKind = Literal["feed", "article"]
-RunStatus = Literal["running", "succeeded", "partial", "failed"]
+RunStatus = Literal["running", "succeeded", "partial", "failed", "abandoned"]
+WorkerTrigger = Literal["scheduled", "manual", "backfill"]
 
 
 @dataclass(frozen=True)
