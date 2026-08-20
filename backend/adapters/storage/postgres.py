@@ -8,7 +8,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, or_, select, text, tuple_, union, update
+from sqlalchemy import delete, func, or_, select, text, true, tuple_, union, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -20,7 +20,8 @@ from adapters.storage.schema import (
     worker_runs,
 )
 from models.storage_models import (
-    ArticleListItem,
+    ArticleDetailItem,
+    ArticleFeedItem,
     CrawlFailureOccurrence,
     FailureTarget,
     FeedFailureOutcome,
@@ -28,11 +29,12 @@ from models.storage_models import (
     FeedSeed,
     RawArticle,
     RunStatus,
+    SourceItem,
     StoredCrawlFailure,
     StorageWriteSummary,
     WorkerTrigger,
 )
-from services.raw_storage import source_slug
+from services.raw_storage import build_excerpt, source_slug
 
 
 class StorageError(RuntimeError):
@@ -367,64 +369,174 @@ class PostgresRawStorage:
             rejected=rejected,
         )
 
-    async def list_articles(
+    @staticmethod
+    def _feed_filters(
+        *,
+        since: datetime,
+        until: datetime,
+        cursor: tuple[datetime, int] | None,
+        query: str | None,
+    ) -> list[Any]:
+        filters = [
+            raw_articles.c.event_at >= since,
+            raw_articles.c.event_at < until,
+        ]
+        if cursor is not None:
+            filters.append(
+                tuple_(raw_articles.c.event_at, raw_articles.c.id) < tuple_(*cursor)
+            )
+        if query:
+            filters.append(
+                raw_articles.c.search_tsv.op("@@")(
+                    func.websearch_to_tsquery("english", query)
+                )
+            )
+        return filters
+
+    async def feed_articles(
         self,
         *,
+        since: datetime,
+        until: datetime,
         limit: int,
-        offset: int,
-        source: str | None = None,
+        cursor: tuple[datetime, int] | None = None,
+        source_slugs: Sequence[str] | None = None,
         query: str | None = None,
-    ) -> tuple[list[ArticleListItem], int]:
-        list_columns = (
-            raw_articles.c.id,
-            raw_articles.c.url,
-            raw_articles.c.title,
-            raw_articles.c.source,
-            raw_articles.c.published_at,
-            raw_articles.c.crawled_at,
+        max_per_source: int = 3,
+    ) -> list[ArticleFeedItem]:
+        inner = (
+            select(
+                raw_articles.c.id,
+                raw_articles.c.url,
+                raw_articles.c.title,
+                func.left(raw_articles.c.content, 400).label("excerpt_raw"),
+                raw_articles.c.published_at,
+                raw_articles.c.crawled_at,
+                raw_articles.c.event_at,
+            )
+            .where(raw_articles.c.source_id == sources.c.id)
+            .where(*self._feed_filters(since=since, until=until, cursor=cursor, query=query))
+            .order_by(raw_articles.c.event_at.desc(), raw_articles.c.id.desc())
+            .limit(max_per_source)
+            .lateral("a")
         )
-        filters = []
-        if source:
-            filters.append(raw_articles.c.source == source)
-        if query:
-            filters.append(raw_articles.c.title.ilike(f"%{query}%"))
+        stmt = (
+            select(
+                inner.c.id,
+                inner.c.url,
+                inner.c.title,
+                inner.c.excerpt_raw,
+                inner.c.published_at,
+                inner.c.crawled_at,
+                inner.c.event_at,
+                sources.c.slug,
+                sources.c.name,
+            )
+            .select_from(sources.join(inner, true()))
+        )
+        if source_slugs:
+            stmt = stmt.where(sources.c.slug.in_(source_slugs))
+        stmt = stmt.order_by(inner.c.event_at.desc(), inner.c.id.desc()).limit(limit)
 
         async with self._engine.connect() as connection:
-            count_stmt = select(func.count()).select_from(raw_articles)
-            for condition in filters:
-                count_stmt = count_stmt.where(condition)
-            total = (await connection.execute(count_stmt)).scalar_one()
+            result = await connection.execute(stmt)
+            return [
+                ArticleFeedItem(
+                    id=row.id,
+                    url=row.url,
+                    title=row.title,
+                    excerpt=build_excerpt(row.excerpt_raw or ""),
+                    source_slug=row.slug,
+                    source_name=row.name,
+                    published_at=row.published_at,
+                    crawled_at=row.crawled_at,
+                    event_at=row.event_at,
+                )
+                for row in result
+            ]
 
-            list_stmt = select(*list_columns)
-            for condition in filters:
-                list_stmt = list_stmt.where(condition)
-            list_stmt = (
-                list_stmt.order_by(raw_articles.c.crawled_at.desc())
+    async def source_articles(
+        self,
+        slug: str,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+        cursor: tuple[datetime, int] | None = None,
+        query: str | None = None,
+    ) -> list[ArticleFeedItem] | None:
+        async with self._engine.connect() as connection:
+            source_row = (
+                await connection.execute(
+                    select(sources.c.id, sources.c.slug, sources.c.name).where(
+                        sources.c.slug == slug
+                    )
+                )
+            ).first()
+            if source_row is None:
+                return None
+
+            stmt = (
+                select(
+                    raw_articles.c.id,
+                    raw_articles.c.url,
+                    raw_articles.c.title,
+                    func.left(raw_articles.c.content, 400).label("excerpt_raw"),
+                    raw_articles.c.published_at,
+                    raw_articles.c.crawled_at,
+                    raw_articles.c.event_at,
+                )
+                .where(raw_articles.c.source_id == source_row.id)
+                .where(*self._feed_filters(since=since, until=until, cursor=cursor, query=query))
+                .order_by(raw_articles.c.event_at.desc(), raw_articles.c.id.desc())
                 .limit(limit)
-                .offset(offset)
             )
-            result = await connection.execute(list_stmt)
-            items = [ArticleListItem(**dict(row._mapping)) for row in result]
-            return items, int(total)
+            result = await connection.execute(stmt)
+            return [
+                ArticleFeedItem(
+                    id=row.id,
+                    url=row.url,
+                    title=row.title,
+                    excerpt=build_excerpt(row.excerpt_raw or ""),
+                    source_slug=source_row.slug,
+                    source_name=source_row.name,
+                    published_at=row.published_at,
+                    crawled_at=row.crawled_at,
+                    event_at=row.event_at,
+                )
+                for row in result
+            ]
 
-    async def get_article(self, article_id: int) -> RawArticle | None:
-        columns = (
-            raw_articles.c.url,
-            raw_articles.c.url_original,
-            raw_articles.c.title,
-            raw_articles.c.source,
-            raw_articles.c.lang,
-            raw_articles.c.content,
-            raw_articles.c.content_hash,
-            raw_articles.c.published_at,
-            raw_articles.c.crawled_at,
-        )
+    async def list_sources(self) -> list[SourceItem]:
         async with self._engine.connect() as connection:
             result = await connection.execute(
-                select(*columns).where(raw_articles.c.id == article_id)
+                select(sources.c.slug, sources.c.name, sources.c.homepage).order_by(
+                    sources.c.name
+                )
+            )
+            return [SourceItem(**dict(row._mapping)) for row in result]
+
+    async def get_article(self, article_id: int) -> ArticleDetailItem | None:
+        async with self._engine.connect() as connection:
+            result = await connection.execute(
+                select(
+                    raw_articles.c.url,
+                    raw_articles.c.url_original,
+                    raw_articles.c.title,
+                    raw_articles.c.content,
+                    raw_articles.c.published_at,
+                    raw_articles.c.crawled_at,
+                    raw_articles.c.event_at,
+                    sources.c.slug.label("source_slug"),
+                    sources.c.name.label("source_name"),
+                )
+                .select_from(
+                    raw_articles.outerjoin(sources, raw_articles.c.source_id == sources.c.id)
+                )
+                .where(raw_articles.c.id == article_id)
             )
             row = result.first()
-            return RawArticle(**dict(row._mapping)) if row is not None else None
+            return ArticleDetailItem(**dict(row._mapping)) if row is not None else None
 
     async def due_failures(self, limit: int) -> list[StoredCrawlFailure]:
         now = datetime.now(timezone.utc)

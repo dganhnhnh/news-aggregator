@@ -34,6 +34,16 @@ def _strip_trailing_slash(path: str) -> str:
     return path.rstrip("/") or "/"
 
 
+def build_excerpt(raw: str, limit: int = 280) -> str:
+    """Clean a leading slice of markdown content into a plain-text preview."""
+    text = re.sub(r"[#>*_`\[\]]+", " ", raw)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    truncated = text[:limit].rsplit(" ", 1)[0]
+    return truncated + "…"
+
+
 def normalize_url(url: str) -> str:
     """Conservatively canonicalize a fetched URL for deduplication."""
     parts = urlsplit(url.strip())

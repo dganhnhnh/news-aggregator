@@ -44,6 +44,7 @@ class Settings:
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     cors_allow_origins: tuple[str, ...] = ()
+    api_default_window_days: int = 30
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -77,6 +78,7 @@ class Settings:
             api_host=os.getenv("API_HOST", "0.0.0.0"),
             api_port=_env_int("API_PORT", 8000),
             cors_allow_origins=cors_origins,
+            api_default_window_days=_env_int("API_DEFAULT_WINDOW_DAYS", 30),
         )
 
     @property

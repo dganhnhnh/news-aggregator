@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from adapters.storage.postgres import PostgresRawStorage
 from adapters.storage.schema import crawl_failures, raw_articles, sources, worker_runs
 from models.storage_models import (
-    ArticleListItem,
     CrawlFailureOccurrence,
     FailureTarget,
     IngestRunStats,
@@ -179,27 +178,28 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         assert fetched is not None
         assert fetched.url == url
         assert fetched.content == "two"
+        assert fetched.source_slug == source_slug
         assert await storage.get_article(-1) is None
 
-        listed, total = await storage.list_articles(
-            limit=50, offset=0, query="Renamed", source="Example"
+        listed = await storage.feed_articles(
+            since=now - timedelta(days=1),
+            until=now + timedelta(days=1),
+            limit=50,
+            source_slugs=[source_slug],
+            query="Renamed",
         )
-        assert total == 1
-        assert listed == [
-            ArticleListItem(
-                id=article.id,
-                url=url,
-                title="Renamed",
-                source="Example",
-                published_at=now,
-                crawled_at=now,
-            )
-        ]
-        no_match, no_match_total = await storage.list_articles(
-            limit=50, offset=0, query="no-such-title-xyz"
+        assert [item.id for item in listed] == [article.id]
+        assert listed[0].url == url
+        assert listed[0].title == "Renamed"
+        assert listed[0].source_slug == source_slug
+
+        no_match = await storage.feed_articles(
+            since=now - timedelta(days=1),
+            until=now + timedelta(days=1),
+            limit=50,
+            query="no-such-title-xyz",
         )
         assert no_match == []
-        assert no_match_total == 0
 
         await storage.apply_batch(
             [],

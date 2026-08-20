@@ -77,13 +77,36 @@ class FeedFailureOutcome:
 
 
 @dataclass(frozen=True)
-class ArticleListItem:
+class ArticleFeedItem:
     id: int
     url: str
     title: str | None
-    source: str | None
+    excerpt: str
+    source_slug: str | None
+    source_name: str | None
     published_at: datetime | None
     crawled_at: datetime
+    event_at: datetime
+
+
+@dataclass(frozen=True)
+class ArticleDetailItem:
+    url: str
+    url_original: str | None
+    title: str | None
+    content: str
+    source_slug: str | None
+    source_name: str | None
+    published_at: datetime | None
+    crawled_at: datetime
+    event_at: datetime
+
+
+@dataclass(frozen=True)
+class SourceItem:
+    slug: str
+    name: str
+    homepage: str | None
 
 
 @dataclass

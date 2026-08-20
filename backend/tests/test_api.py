@@ -6,43 +6,56 @@ from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
+from api.cursor import decode_cursor, encode_cursor
 from api.deps import get_storage
 from api.main import create_app
-from models.storage_models import ArticleListItem, RawArticle
+from models.storage_models import ArticleDetailItem, ArticleFeedItem, SourceItem
 
 
 class FakeStorage:
     def __init__(self) -> None:
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        self._articles = {
-            1: RawArticle(
-                url="https://example.com/a",
-                url_original="https://example.com/a",
-                title="Article A",
-                source="Example",
-                lang="en",
-                content="full markdown body",
-                content_hash=b"1" * 32,
-                published_at=now,
-                crawled_at=now,
-            )
-        }
-        self._list = [
-            ArticleListItem(
+        self._feed_items = [
+            ArticleFeedItem(
                 id=1,
                 url="https://example.com/a",
                 title="Article A",
-                source="Example",
+                excerpt="full markdown body",
+                source_slug="example.com",
+                source_name="Example",
                 published_at=now,
                 crawled_at=now,
+                event_at=now,
             )
         ]
+        self._detail = ArticleDetailItem(
+            url="https://example.com/a",
+            url_original="https://example.com/a",
+            title="Article A",
+            content="full markdown body",
+            source_slug="example.com",
+            source_name="Example",
+            published_at=now,
+            crawled_at=now,
+            event_at=now,
+        )
+        self._sources = [SourceItem(slug="example.com", name="Example", homepage=None)]
 
-    async def list_articles(self, *, limit, offset, source=None, query=None):
-        return self._list[offset : offset + limit], len(self._list)
+    async def feed_articles(
+        self, *, since, until, limit, cursor=None, source_slugs=None, query=None, max_per_source=3
+    ):
+        return self._feed_items[:limit]
+
+    async def source_articles(self, slug, *, since, until, limit, cursor=None, query=None):
+        if slug != "example.com":
+            return None
+        return self._feed_items[:limit]
+
+    async def list_sources(self):
+        return self._sources
 
     async def get_article(self, article_id):
-        return self._articles.get(article_id)
+        return self._detail if article_id == 1 else None
 
 
 def _client() -> TestClient:
@@ -60,22 +73,29 @@ def test_health() -> None:
 
 def test_list_articles() -> None:
     client = _client()
-    response = client.get("/api/articles?limit=10&offset=0")
+    response = client.get("/api/articles?limit=10")
     assert response.status_code == 200
     body = response.json()
-    assert body["total"] == 1
-    assert body["limit"] == 10
-    assert body["offset"] == 0
+    assert body["next_cursor"] is None
+    assert "window" in body
     assert body["items"] == [
         {
             "id": 1,
             "url": "https://example.com/a",
             "title": "Article A",
-            "source": "Example",
+            "excerpt": "full markdown body",
+            "source": {"slug": "example.com", "name": "Example"},
             "published_at": "2026-01-01T00:00:00Z",
             "crawled_at": "2026-01-01T00:00:00Z",
+            "event_at": "2026-01-01T00:00:00Z",
         }
     ]
+
+
+def test_list_articles_invalid_cursor_is_400() -> None:
+    client = _client()
+    response = client.get("/api/articles?cursor=not-a-valid-cursor!!!")
+    assert response.status_code == 400
 
 
 def test_get_article_found() -> None:
@@ -89,3 +109,22 @@ def test_get_article_not_found() -> None:
     client = _client()
     response = client.get("/api/articles/999")
     assert response.status_code == 404
+
+
+def test_list_sources() -> None:
+    client = _client()
+    response = client.get("/api/sources")
+    assert response.status_code == 200
+    assert response.json() == [{"slug": "example.com", "name": "Example", "homepage": None}]
+
+
+def test_source_articles_not_found() -> None:
+    client = _client()
+    response = client.get("/api/sources/no-such-source/articles")
+    assert response.status_code == 404
+
+
+def test_cursor_round_trip() -> None:
+    event_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    decoded = decode_cursor(encode_cursor(event_at, 42))
+    assert decoded == (event_at, 42)
