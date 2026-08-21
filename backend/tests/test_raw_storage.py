@@ -196,7 +196,20 @@ def test_prepare_articles_keeps_newest_result_per_url() -> None:
     assert articles[0].content == "new"
 
 
+def _upper_bound(_lo: float, hi: float) -> float:
+    return hi
+
+
 def test_retry_delay_uses_exponential_backoff_with_one_day_cap() -> None:
-    assert retry_delay(1) == timedelta(minutes=5)
-    assert retry_delay(2) == timedelta(minutes=10)
-    assert retry_delay(20) == timedelta(days=1)
+    assert retry_delay(1, random_uniform=_upper_bound) == timedelta(minutes=5)
+    assert retry_delay(2, random_uniform=_upper_bound) == timedelta(minutes=10)
+    assert retry_delay(20, random_uniform=_upper_bound) == timedelta(days=1)
+
+
+def test_retry_delay_applies_full_jitter_between_zero_and_the_cap() -> None:
+    assert retry_delay(2, random_uniform=lambda lo, hi: lo) == timedelta(0)
+    assert retry_delay(2, random_uniform=lambda lo, hi: hi) == timedelta(minutes=10)
+
+    seen = []
+    retry_delay(3, random_uniform=lambda lo, hi: seen.append((lo, hi)) or lo)
+    assert seen == [(0, 1200)]

@@ -37,6 +37,7 @@ class StoredCrawlFailure(CrawlFailureOccurrence):
     first_failed_at: datetime | None = None
     last_failed_at: datetime | None = None
     next_retry_at: datetime | None = None
+    dead_lettered_at: datetime | None = None
 
 
 @dataclass(frozen=True)

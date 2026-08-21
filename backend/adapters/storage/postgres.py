@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping, Sequence
+import random
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
     CrawlFailureOccurrence,
+    FailureKind,
     FailureTarget,
     FeedFailureOutcome,
     FeedPollTarget,
@@ -41,10 +43,24 @@ class StorageError(RuntimeError):
     """Raised when raw storage is unavailable or not migrated."""
 
 
-def retry_delay(attempt_count: int) -> timedelta:
+MAX_FAILURE_ATTEMPTS = 5
+
+
+def retry_delay(
+    attempt_count: int,
+    *,
+    random_uniform: Callable[[float, float], float] = random.uniform,
+) -> timedelta:
+    """Exponential backoff with a one-day cap and full jitter.
+
+    Full jitter (`uniform(0, cap)` rather than a fixed delay) spreads out
+    retries that failed together instead of having them all wake up and
+    retry in lockstep. `random_uniform` is injectable so callers can pass a
+    deterministic stub in tests.
+    """
     exponent = min(max(attempt_count - 1, 0), 9)
-    seconds = min(300 * (2**exponent), 86_400)
-    return timedelta(seconds=seconds)
+    cap = min(300 * (2**exponent), 86_400)
+    return timedelta(seconds=random_uniform(0, cap))
 
 
 class PostgresRawStorage:
@@ -263,6 +279,11 @@ class PostgresRawStorage:
                 for key, failure in failure_by_key.items():
                     previous = existing.get(key)
                     attempt = (previous.attempt_count if previous else 0) + 1
+                    dead_lettered_at = (
+                        previous.dead_lettered_at
+                        if previous and previous.dead_lettered_at
+                        else (now if attempt >= MAX_FAILURE_ATTEMPTS else None)
+                    )
                     values = {
                         "failure_kind": failure.failure_kind,
                         "url": failure.url,
@@ -286,7 +307,12 @@ class PostgresRawStorage:
                         "attempt_count": attempt,
                         "first_failed_at": previous.first_failed_at if previous else now,
                         "last_failed_at": now,
-                        "next_retry_at": now + retry_delay(attempt),
+                        "dead_lettered_at": dead_lettered_at,
+                        "next_retry_at": (
+                            previous.next_retry_at
+                            if dead_lettered_at
+                            else now + retry_delay(attempt)
+                        ),
                     }
                     stmt = pg_insert(crawl_failures).values(**values)
                     await connection.execute(
@@ -507,13 +533,27 @@ class PostgresRawStorage:
                 for row in result
             ]
 
-    async def list_sources(self) -> list[SourceItem]:
-        async with self._engine.connect() as connection:
-            result = await connection.execute(
-                select(sources.c.slug, sources.c.name, sources.c.homepage).order_by(
-                    sources.c.name
+    async def list_sources(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[SourceItem]:
+        stmt = select(sources.c.slug, sources.c.name, sources.c.homepage)
+        if since is not None:
+            stmt = (
+                stmt.select_from(
+                    sources.join(raw_articles, raw_articles.c.source_id == sources.c.id)
                 )
+                .where(raw_articles.c.event_at >= since)
+                .distinct()
             )
+            if until is not None:
+                stmt = stmt.where(raw_articles.c.event_at < until)
+        stmt = stmt.order_by(sources.c.name)
+
+        async with self._engine.connect() as connection:
+            result = await connection.execute(stmt)
             return [SourceItem(**dict(row._mapping)) for row in result]
 
     async def get_article(self, article_id: int) -> ArticleDetailItem | None:
@@ -543,11 +583,76 @@ class PostgresRawStorage:
         async with self._engine.connect() as connection:
             result = await connection.execute(
                 select(crawl_failures)
-                .where(crawl_failures.c.next_retry_at <= now)
+                .where(
+                    crawl_failures.c.next_retry_at <= now,
+                    crawl_failures.c.dead_lettered_at.is_(None),
+                )
                 .order_by(crawl_failures.c.next_retry_at)
                 .limit(limit)
             )
             return [StoredCrawlFailure(**dict(row._mapping)) for row in result]
+
+    async def replay_failures(
+        self, *, kind: FailureKind | None = None, limit: int
+    ) -> int:
+        """Requeue dead-lettered `crawl_failures` rows for another attempt.
+
+        Resets `attempt_count` so a replayed row gets a fresh backoff cycle
+        instead of being immediately eligible for dead-lettering again on
+        its first renewed failure.
+        """
+        now = datetime.now(timezone.utc)
+        async with self._engine.begin() as connection:
+            filters = [crawl_failures.c.dead_lettered_at.is_not(None)]
+            if kind is not None:
+                filters.append(crawl_failures.c.failure_kind == kind)
+            targets = (
+                await connection.execute(
+                    select(crawl_failures.c.failure_kind, crawl_failures.c.url)
+                    .where(*filters)
+                    .order_by(crawl_failures.c.last_failed_at)
+                    .limit(limit)
+                )
+            ).all()
+            if not targets:
+                return 0
+            keys = [(row.failure_kind, row.url) for row in targets]
+            result = await connection.execute(
+                update(crawl_failures)
+                .where(
+                    tuple_(
+                        crawl_failures.c.failure_kind, crawl_failures.c.url
+                    ).in_(keys)
+                )
+                .values(attempt_count=0, dead_lettered_at=None, next_retry_at=now)
+            )
+            return int(result.rowcount or 0)
+
+    async def enable_feed(self, feed_url: str) -> bool:
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                update(feed_state)
+                .where(feed_state.c.feed_url == feed_url)
+                .values(
+                    disabled_at=None,
+                    disabled_reason=None,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            return bool(result.rowcount)
+
+    async def disable_feed(self, feed_url: str, *, reason: str) -> bool:
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                update(feed_state)
+                .where(feed_state.c.feed_url == feed_url)
+                .values(
+                    disabled_at=datetime.now(timezone.utc),
+                    disabled_reason=reason[:2000],
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            return bool(result.rowcount)
 
     async def seed_feeds(self, seeds: Sequence[FeedSeed]) -> int:
         """Insert feeds unknown to `feed_state`; never touch existing rows.

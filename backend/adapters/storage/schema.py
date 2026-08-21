@@ -96,6 +96,7 @@ crawl_failures = Table(
     Column("first_failed_at", DateTime(timezone=True), nullable=False),
     Column("last_failed_at", DateTime(timezone=True), nullable=False),
     Column("next_retry_at", DateTime(timezone=True), nullable=False),
+    Column("dead_lettered_at", DateTime(timezone=True)),
     PrimaryKeyConstraint("failure_kind", "url", name="pk_crawl_failures"),
 )
 Index("ix_crawl_failures_next_retry_at", crawl_failures.c.next_retry_at)

@@ -40,6 +40,8 @@ class FakeStorage:
             event_at=now,
         )
         self._sources = [SourceItem(slug="example.com", name="Example", homepage=None)]
+        self.listed_sources_since = None
+        self.listed_sources_until = None
 
     async def feed_articles(
         self, *, since, until, limit, cursor=None, source_slugs=None, query=None, max_per_source=3
@@ -51,7 +53,9 @@ class FakeStorage:
             return None
         return self._feed_items[:limit]
 
-    async def list_sources(self):
+    async def list_sources(self, *, since=None, until=None):
+        self.listed_sources_since = since
+        self.listed_sources_until = until
         return self._sources
 
     async def get_article(self, article_id):
@@ -116,6 +120,21 @@ def test_list_sources() -> None:
     response = client.get("/api/sources")
     assert response.status_code == 200
     assert response.json() == [{"slug": "example.com", "name": "Example", "homepage": None}]
+
+
+def test_list_sources_passes_since_filter() -> None:
+    app = create_app()
+    storage = FakeStorage()
+    app.dependency_overrides[get_storage] = lambda: storage
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/sources?since=2026-01-01T00:00:00Z&until=2026-02-01T00:00:00Z"
+    )
+
+    assert response.status_code == 200
+    assert storage.listed_sources_since == datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert storage.listed_sources_until == datetime(2026, 2, 1, tzinfo=timezone.utc)
 
 
 def test_source_articles_not_found() -> None:

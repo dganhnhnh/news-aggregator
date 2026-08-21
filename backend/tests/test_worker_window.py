@@ -118,3 +118,45 @@ def test_cli_rejects_last_together_with_since() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["crawl", "--last", "3d", "--since", "2026-08-01"])
+
+
+def test_cli_replay_requires_failures_or_stage() -> None:
+    parser = worker_cli.build_parser(_settings())
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["replay", "--limit", "10"])
+
+    args = parser.parse_args(["replay", "--failures", "--kind", "article"])
+    assert args.command == "replay"
+    assert args.failures is True
+    assert args.kind == "article"
+    assert args.limit == 100
+
+
+def test_cli_replay_rejects_stage_until_implemented() -> None:
+    parser = worker_cli.build_parser(_settings())
+    args = parser.parse_args(["replay", "--stage", "embed"])
+
+    with pytest.raises(SystemExit):
+        worker_cli.validate(args, parser)
+
+
+def test_cli_disable_feed_requires_reason() -> None:
+    parser = worker_cli.build_parser(_settings())
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["disable-feed", "https://example.com/feed.xml"])
+
+    args = parser.parse_args(
+        ["disable-feed", "https://example.com/feed.xml", "--reason", "manual"]
+    )
+    assert args.url == "https://example.com/feed.xml"
+    assert args.reason == "manual"
+
+
+def test_cli_enable_feed_takes_only_a_url() -> None:
+    parser = worker_cli.build_parser(_settings())
+    args = parser.parse_args(["enable-feed", "https://example.com/feed.xml"])
+
+    assert args.command == "enable-feed"
+    assert args.url == "https://example.com/feed.xml"

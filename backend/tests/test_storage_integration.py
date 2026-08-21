@@ -170,9 +170,10 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         assert article.url_original == url
         assert failed.attempt_count == 2
         assert failed.source == "Example"
-        assert (
-            failed.next_retry_at - failed.last_failed_at
-        ).total_seconds() == pytest.approx(600, abs=1)
+        # Full jitter: the delay is uniform(0, cap), cap = 10 minutes at attempt 2.
+        delay_seconds = (failed.next_retry_at - failed.last_failed_at).total_seconds()
+        assert 0 <= delay_seconds <= 600
+        assert failed.dead_lettered_at is None
 
         fetched = await storage.get_article(article.id)
         assert fetched is not None
@@ -192,6 +193,19 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         assert listed[0].url == url
         assert listed[0].title == "Renamed"
         assert listed[0].source_slug == source_slug
+
+        listed_sources = await storage.list_sources(
+            since=now - timedelta(days=1),
+            until=now + timedelta(days=1),
+        )
+        assert [item.slug for item in listed_sources if item.slug == source_slug] == [
+            source_slug
+        ]
+        future_sources = await storage.list_sources(
+            since=now + timedelta(days=1),
+            until=now + timedelta(days=2),
+        )
+        assert source_slug not in [item.slug for item in future_sources]
 
         no_match = await storage.feed_articles(
             since=now - timedelta(days=1),
@@ -291,6 +305,98 @@ async def _test_postgres_upsert_and_failure_state() -> None:
                     )
                 await connection.execute(
                     delete(sources).where(sources.c.slug == source_slug)
+                )
+        await engine.dispose()
+        await storage.close()
+
+
+def test_crawl_failure_dead_letters_after_max_attempts_and_replay_resets() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_crawl_failure_dead_letters_after_max_attempts_and_replay_resets())
+
+
+async def _test_crawl_failure_dead_letters_after_max_attempts_and_replay_resets() -> None:
+    url = "https://integration.example/dead-letter"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        async with engine.begin() as connection:
+            await connection.execute(
+                delete(crawl_failures).where(crawl_failures.c.url == url)
+            )
+
+        failure = CrawlFailureOccurrence(
+            failure_kind="article",
+            url=url,
+            error_type="TimeoutError",
+            error_message="timeout",
+        )
+        for _ in range(5):
+            await storage.apply_batch([], [failure], [], received=0, rejected=0)
+
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    select(crawl_failures).where(crawl_failures.c.url == url)
+                )
+            ).one()
+        assert row.attempt_count == 5
+        assert row.dead_lettered_at is not None
+
+        # Mirror due_failures()'s WHERE clause scoped to our url: a real DB
+        # can carry far more than any page limit of unrelated due rows, so
+        # asserting against a size-bounded due_failures() page would be
+        # fragile. Confirming the row itself fails the filter is equivalent.
+        async with engine.connect() as connection:
+            still_due = (
+                await connection.execute(
+                    select(crawl_failures.c.url).where(
+                        crawl_failures.c.url == url,
+                        crawl_failures.c.next_retry_at <= datetime.now(timezone.utc),
+                        crawl_failures.c.dead_lettered_at.is_(None),
+                    )
+                )
+            ).first()
+        assert still_due is None
+
+        # A sixth failure while dead-lettered must not advance next_retry_at
+        # further, nor clear the dead-letter.
+        await storage.apply_batch([], [failure], [], received=0, rejected=0)
+        async with engine.connect() as connection:
+            still_dead = (
+                await connection.execute(
+                    select(crawl_failures).where(crawl_failures.c.url == url)
+                )
+            ).one()
+        assert still_dead.attempt_count == 6
+        assert still_dead.dead_lettered_at == row.dead_lettered_at
+        assert still_dead.next_retry_at == row.next_retry_at
+
+        replayed = await storage.replay_failures(kind="article", limit=200)
+        assert replayed == 1
+
+        async with engine.connect() as connection:
+            replayed_row = (
+                await connection.execute(
+                    select(crawl_failures).where(crawl_failures.c.url == url)
+                )
+            ).one()
+        assert replayed_row.dead_lettered_at is None
+        assert replayed_row.attempt_count == 0
+        # Replay makes the row immediately due; a real DB can carry far more
+        # than `limit` other due rows, so check the row's own fields against
+        # due_failures()'s filter instead of asserting it appears in a
+        # size-bounded page of production data.
+        assert replayed_row.next_retry_at <= datetime.now(timezone.utc)
+    finally:
+        if ready:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    delete(crawl_failures).where(crawl_failures.c.url == url)
                 )
         await engine.dispose()
         await storage.close()

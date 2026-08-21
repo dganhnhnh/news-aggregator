@@ -9,7 +9,7 @@ from pathlib import Path
 from adapters.storage import PostgresRawStorage, StorageError
 from core.config import Settings
 from core.logger import get_logger, setup_logging
-from workers.base import EXIT_OK, Worker, stale_after_for
+from workers.base import EXIT_FAILED, EXIT_OK, Worker, stale_after_for
 from workers.crawl import CrawlWorker
 from workers.window import RunWindow, build_window
 
@@ -61,7 +61,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser(settings: Settings) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="news-worker", description=__doc__)
-    subparsers = parser.add_subparsers(dest="worker", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
     crawl = subparsers.add_parser("crawl", help="Ingest RSS/Atom feeds")
     _add_common_arguments(crawl)
@@ -136,6 +136,46 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         default=settings.max_retries_per_run,
     )
     crawl.add_argument("--emit-jsonl", action="store_true")
+
+    replay = subparsers.add_parser(
+        "replay", help="Requeue dead-lettered crawl_failures rows"
+    )
+    replay_target = replay.add_mutually_exclusive_group(required=True)
+    replay_target.add_argument(
+        "--failures",
+        action="store_true",
+        help="Replay dead-lettered crawl_failures rows",
+    )
+    replay_target.add_argument(
+        "--stage",
+        metavar="STAGE",
+        help="Replay processing_jobs for STAGE (not yet implemented)",
+    )
+    replay.add_argument(
+        "--kind",
+        choices=("article", "feed"),
+        help="Restrict --failures replay to this failure_kind",
+    )
+    replay.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum rows to requeue",
+    )
+
+    enable_feed = subparsers.add_parser(
+        "enable-feed", help="Clear a feed's disabled_at"
+    )
+    enable_feed.add_argument("url", help="Feed URL, matching feed_state.feed_url")
+
+    disable_feed = subparsers.add_parser(
+        "disable-feed", help="Manually disable a feed"
+    )
+    disable_feed.add_argument("url", help="Feed URL, matching feed_state.feed_url")
+    disable_feed.add_argument(
+        "--reason", required=True, help="Why the feed is being disabled"
+    )
+
     return parser
 
 
@@ -176,33 +216,65 @@ def _validate_crawl(args: argparse.Namespace, parser: argparse.ArgumentParser) -
 
 
 def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    if args.interval is not None and args.interval <= 0:
-        parser.error("--interval must be positive")
-    if args.once and args.interval is not None:
-        parser.error("--once and --interval are mutually exclusive")
-    if args.worker == "crawl":
-        _validate_crawl(args, parser)
+    if args.command in WORKERS:
+        if args.interval is not None and args.interval <= 0:
+            parser.error("--interval must be positive")
+        if args.once and args.interval is not None:
+            parser.error("--once and --interval are mutually exclusive")
+        if args.command == "crawl":
+            _validate_crawl(args, parser)
+    elif args.command == "replay":
+        if args.limit <= 0:
+            parser.error("--limit must be positive")
+        if args.stage is not None:
+            parser.error("--stage replay is not implemented yet; use --failures")
 
 
 async def _dispatch(
     args: argparse.Namespace,
     settings: Settings,
-    window: RunWindow,
+    window: RunWindow | None,
 ) -> int:
     storage = PostgresRawStorage(settings.database_url)
     try:
         await storage.check_ready()
-        worker = WORKERS[args.worker]()
-        return await worker.run(
-            storage,
-            args,
-            window,
-            stale_after=stale_after_for(
-                args, settings.worker_heartbeat_timeout_seconds
-            ),
-        )
+        if args.command in WORKERS:
+            worker = WORKERS[args.command]()
+            return await worker.run(
+                storage,
+                args,
+                window,
+                stale_after=stale_after_for(
+                    args, settings.worker_heartbeat_timeout_seconds
+                ),
+            )
+        return await _dispatch_admin(storage, args)
     finally:
         await storage.close()
+
+
+async def _dispatch_admin(
+    storage: PostgresRawStorage, args: argparse.Namespace
+) -> int:
+    if args.command == "replay":
+        count = await storage.replay_failures(kind=args.kind, limit=args.limit)
+        logger.info("Requeued %d dead-lettered failure(s)", count)
+        return EXIT_OK
+    if args.command == "enable-feed":
+        found = await storage.enable_feed(args.url)
+        if not found:
+            logger.error("Feed not found: %s", args.url)
+            return EXIT_FAILED
+        logger.info("Enabled feed: %s", args.url)
+        return EXIT_OK
+    if args.command == "disable-feed":
+        found = await storage.disable_feed(args.url, reason=args.reason)
+        if not found:
+            logger.error("Feed not found: %s", args.url)
+            return EXIT_FAILED
+        logger.info("Disabled feed: %s", args.url)
+        return EXIT_OK
+    raise AssertionError(f"unhandled admin command: {args.command}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -211,9 +283,9 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser(settings)
     args = parser.parse_args(argv)
     validate(args, parser)
-    window = resolve_window(args, parser)
     if not settings.database_url:
         parser.error("DATABASE_URL is required for news-worker")
+    window = resolve_window(args, parser) if args.command in WORKERS else None
     try:
         exit_code = asyncio.run(_dispatch(args, settings, window))
     except StorageError as exc:

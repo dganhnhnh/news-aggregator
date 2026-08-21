@@ -18,9 +18,14 @@ router = APIRouter(prefix="/api/sources", tags=["sources"])
 
 @router.get("", response_model=list[SourceItem])
 async def list_sources(
+    since: datetime | None = None,
+    until: datetime | None = None,
     storage: PostgresRawStorage = Depends(get_storage),
 ) -> list[SourceItem]:
-    items = await storage.list_sources()
+    items = await storage.list_sources(
+        since=since,
+        until=until or datetime.now(timezone.utc),
+    )
     return [
         SourceItem(slug=item.slug, name=item.name, homepage=item.homepage) for item in items
     ]
