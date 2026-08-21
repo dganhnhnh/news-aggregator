@@ -1,7 +1,9 @@
 .env
+.env*.local
 .venv/
 __pycache__/
 *.py[cod]
+*.tsbuildinfo
 .pytest_cache/
 .ruff_cache/
 build/

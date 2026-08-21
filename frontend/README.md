@@ -1,12 +1,22 @@
-# Frontend
+# News Radar frontend
 
-Chỗ trống dành cho Next.js frontend. Chưa scaffold. Khi cần bắt đầu, chạy từ thư
-mục gốc repo:
+Next.js frontend cho News Radar. Browser gọi các route `/api/*` cùng origin;
+Next.js server proxy các request này tới FastAPI.
+
+Tạo file cấu hình local:
 
 ```bash
-pnpm create next-app@latest frontend --ts --app --tailwind --eslint --src-dir --import-alias "@/*"
+cp .env.example .env.local
 ```
 
-API backend chạy ở `http://localhost:8000` (xem [../README.md](../README.md)).
-`CORS_ALLOW_ORIGINS` trong `.env` cần bao gồm origin dev của frontend (mặc định
-`http://localhost:3000`).
+`API_URL` mặc định là `http://localhost:8000` và chỉ được dùng phía server.
+
+Khởi động frontend:
+
+```bash
+pnpm install
+pnpm dev
+```
+
+Frontend mặc định chạy tại `http://localhost:3000`. API backend cần được khởi
+động riêng; xem [README chính](../README.md).
