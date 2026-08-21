@@ -63,7 +63,7 @@ function stripLeadingTitle(content: string) {
 export function MarkdownContent({ content }: { content: string }) {
   return (
     <div>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown skipHtml remarkPlugins={[remarkGfm]} components={components}>
         {stripLeadingTitle(content)}
       </ReactMarkdown>
     </div>

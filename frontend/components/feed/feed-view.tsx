@@ -18,7 +18,7 @@ export function FeedView({
   const selectedId = searchParams.get('id') ? Number(searchParams.get('id')) : null
 
   const [q, setQ] = useState('')
-  const [range, setRange] = useState<TimeRangeValue>('7d')
+  const [range, setRange] = useState<TimeRangeValue>('all')
   const [selectedSources, setSelectedSources] = useState<string[]>([])
 
   const since = useMemo(() => sinceFromRange(range), [range])

@@ -22,7 +22,8 @@ export default async function SourcesPage() {
           </div>
           <div className="mx-auto w-full max-w-2xl flex-1 overflow-y-auto px-4 py-6">
             <p className="mb-4 text-sm text-muted-foreground">
-              {sources.length} sources are being crawled. Select one to view its dedicated feed.
+              {sources.length} sources have articles since Jan 1, 2026. Select one to view its
+              dedicated feed.
             </p>
             <ul className="flex flex-col overflow-hidden rounded-lg border border-border">
               {sources.map((source) => (

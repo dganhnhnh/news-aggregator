@@ -1,5 +1,6 @@
 import { cache } from 'react'
 import { NextResponse } from 'next/server'
+import { DEFAULT_START_TIME } from './time'
 import type { ArticleDetail, Source } from './types'
 
 const DEFAULT_API_URL = 'http://localhost:8000'
@@ -75,6 +76,7 @@ export const getArticle = cache(async (id: string): Promise<ArticleDetail | null
   }
 })
 
-export const getSources = cache(async (): Promise<Source[]> => {
-  return backendJson<Source[]>('/api/sources')
+export const getSources = cache(async (since = DEFAULT_START_TIME): Promise<Source[]> => {
+  const search = since ? `?${new URLSearchParams({ since }).toString()}` : ''
+  return backendJson<Source[]>(`/api/sources${search}`)
 })

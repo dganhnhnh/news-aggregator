@@ -34,9 +34,15 @@ export type ArticlesParams = {
   q?: string
 }
 
+export type SourcesParams = {
+  since?: string
+  until?: string
+}
+
 export function buildArticlesKey(base: string, params: ArticlesParams): string {
   const sp = new URLSearchParams()
   if (params.since) sp.set('since', params.since)
+  if (params.until) sp.set('until', params.until)
   if (params.until) sp.set('until', params.until)
   if (params.limit) sp.set('limit', String(params.limit))
   if (params.cursor) sp.set('cursor', params.cursor)
@@ -44,6 +50,13 @@ export function buildArticlesKey(base: string, params: ArticlesParams): string {
   for (const s of params.sources ?? []) sp.append('source', s)
   const qs = sp.toString()
   return qs ? `${base}?${qs}` : base
+}
+
+export function buildSourcesKey(params: SourcesParams = {}): string {
+  const sp = new URLSearchParams()
+  if (params.since) sp.set('since', params.since)
+  const qs = sp.toString()
+  return qs ? `/api/sources?${qs}` : '/api/sources'
 }
 
 export type { ArticleDetail, ArticlePage, Source }

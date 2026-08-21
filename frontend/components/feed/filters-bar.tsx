@@ -27,7 +27,7 @@ import {
 } from '@/components/ui/command'
 import { Badge } from '@/components/ui/badge'
 import { useSources } from '@/hooks/use-sources'
-import { TIME_RANGE_OPTIONS, type TimeRangeValue } from '@/lib/time'
+import { sinceFromRange, TIME_RANGE_OPTIONS, type TimeRangeValue } from '@/lib/time'
 import { cn } from '@/lib/utils'
 
 type FiltersBarProps = {
@@ -51,7 +51,8 @@ export function FiltersBar({
   lockedSourceName,
   resultLabel,
 }: FiltersBarProps) {
-  const { sources, error: sourcesError } = useSources()
+  const since = sinceFromRange(range)
+  const { sources, error: sourcesError } = useSources({ since })
   const [sourcePopoverOpen, setSourcePopoverOpen] = useState(false)
 
   function toggleSource(slug: string) {

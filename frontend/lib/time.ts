@@ -32,17 +32,19 @@ export function formatAbsolute(iso: string): string {
   })
 }
 
+export const DEFAULT_START_TIME = '2026-01-01T00:00:00.000Z'
+
 export const TIME_RANGE_OPTIONS = [
   { value: '24h', label: 'Last 24 hours', ms: 1000 * 60 * 60 * 24 },
   { value: '7d', label: 'Last 7 days', ms: 1000 * 60 * 60 * 24 * 7 },
   { value: '30d', label: 'Last 30 days', ms: 1000 * 60 * 60 * 24 * 30 },
-  { value: 'all', label: 'All time', ms: null },
+  { value: 'all', label: 'Since Jan 1, 2026', ms: null },
 ] as const
 
 export type TimeRangeValue = (typeof TIME_RANGE_OPTIONS)[number]['value']
 
 export function sinceFromRange(range: TimeRangeValue, now: Date = new Date()): string {
   const opt = TIME_RANGE_OPTIONS.find((o) => o.value === range) ?? TIME_RANGE_OPTIONS[2]
-  if (opt.ms === null) return '1970-01-01T00:00:00.000Z'
-  return new Date(now.getTime() - opt.ms).toISOString()
+  if (opt.ms === null) return DEFAULT_START_TIME
+  return new Date(Math.max(now.getTime() - opt.ms, Date.parse(DEFAULT_START_TIME))).toISOString()
 }
