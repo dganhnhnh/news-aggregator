@@ -14,8 +14,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from adapters.storage.schema import (
+    article_embeddings,
     crawl_failures,
     feed_state,
+    processing_jobs,
     raw_articles,
     sources,
     worker_runs,
@@ -24,6 +26,8 @@ from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
     CrawlFailureOccurrence,
+    EmbeddingCandidate,
+    EmbeddingRecord,
     FailureKind,
     FailureTarget,
     FeedFailureOutcome,
@@ -72,6 +76,10 @@ class PostgresRawStorage:
             pool_pre_ping=True,
         )
 
+    @property
+    def engine(self) -> AsyncEngine:
+        return self._engine
+
     async def close(self) -> None:
         await self._engine.dispose()
 
@@ -84,7 +92,9 @@ class PostgresRawStorage:
                         "to_regclass('public.crawl_failures'), "
                         "to_regclass('public.worker_runs'), "
                         "to_regclass('public.sources'), "
-                        "to_regclass('public.feed_state')"
+                        "to_regclass('public.feed_state'), "
+                        "to_regclass('public.processing_jobs'), "
+                        "to_regclass('public.article_embeddings')"
                     )
                 )
                 if any(value is None for value in tables.one()):
@@ -250,6 +260,7 @@ class PostgresRawStorage:
         rejected: int,
     ) -> StorageWriteSummary:
         written = 0
+        written_article_ids: list[int] = []
         async with self._engine.begin() as connection:
             article_slugs = {
                 article.url: source_slug(article.url) for article in articles
@@ -382,8 +393,13 @@ class PostgresRawStorage:
                     ),
                 ).returning(raw_articles.c.id)
                 result = await connection.execute(statement)
-                if result.scalar_one_or_none() is not None:
+                written_id = result.scalar_one_or_none()
+                if written_id is not None:
                     written += 1
+                    written_article_ids.append(int(written_id))
+
+            if written_article_ids:
+                await self._enqueue_embed_jobs(connection, written_article_ids)
 
         deduplicated = max(received - rejected - len(articles), 0)
         unchanged = max(len(articles) - written, 0)
@@ -394,6 +410,199 @@ class PostgresRawStorage:
             unchanged=unchanged,
             rejected=rejected,
         )
+
+    @staticmethod
+    async def _enqueue_embed_jobs(
+        connection: AsyncConnection, article_ids: Sequence[int]
+    ) -> None:
+        """Queue (or re-queue) the embed stage for articles just written.
+
+        On conflict, only rows already 'done' or 'dead_letter' are reset to
+        'pending' -- an in-flight 'pending'/'running' job from a previous
+        write in the same run must not be disturbed.
+        """
+        now = datetime.now(timezone.utc)
+        stmt = pg_insert(processing_jobs).values(
+            [
+                {"article_id": article_id, "stage": "embed"}
+                for article_id in article_ids
+            ]
+        )
+        await connection.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[processing_jobs.c.article_id, processing_jobs.c.stage],
+                set_={
+                    "state": "pending",
+                    "attempts": 0,
+                    "available_at": now,
+                    "lease_until": None,
+                    "locked_by": None,
+                    "last_error": None,
+                    "updated_at": now,
+                },
+                where=processing_jobs.c.state.in_(("done", "dead_letter")),
+            )
+        )
+
+    async def embeddable_articles(
+        self, article_ids: Sequence[int]
+    ) -> dict[int, EmbeddingCandidate]:
+        """Load claimed articles alongside their previous embedding, if any.
+
+        Lets `EmbedWorker` skip re-embedding when `content_hash` and `model`
+        both match what's already stored.
+        """
+        if not article_ids:
+            return {}
+        async with self._engine.connect() as connection:
+            result = await connection.execute(
+                select(
+                    raw_articles.c.id,
+                    raw_articles.c.title,
+                    raw_articles.c.content,
+                    raw_articles.c.content_hash,
+                    article_embeddings.c.model.label("existing_model"),
+                    article_embeddings.c.content_hash.label("existing_content_hash"),
+                )
+                .select_from(
+                    raw_articles.outerjoin(
+                        article_embeddings,
+                        raw_articles.c.id == article_embeddings.c.article_id,
+                    )
+                )
+                .where(raw_articles.c.id.in_(article_ids))
+            )
+            return {
+                row.id: EmbeddingCandidate(
+                    article_id=row.id,
+                    title=row.title,
+                    content=row.content,
+                    content_hash=row.content_hash,
+                    existing_model=row.existing_model,
+                    existing_content_hash=row.existing_content_hash,
+                )
+                for row in result
+            }
+
+    async def upsert_embeddings(self, records: Sequence[EmbeddingRecord]) -> None:
+        if not records:
+            return
+        stmt = pg_insert(article_embeddings).values(
+            [
+                {
+                    "article_id": record.article_id,
+                    "model": record.model,
+                    "dim": record.dim,
+                    "content_hash": record.content_hash,
+                    "embedding": record.embedding,
+                }
+                for record in records
+            ]
+        )
+        async with self._engine.begin() as connection:
+            await connection.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[article_embeddings.c.article_id],
+                    set_={
+                        "model": stmt.excluded.model,
+                        "dim": stmt.excluded.dim,
+                        "content_hash": stmt.excluded.content_hash,
+                        "embedding": stmt.excluded.embedding,
+                        "created_at": func.now(),
+                    },
+                )
+            )
+
+    async def reenqueue_embeddings(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        stage: str = "embed",
+        model: str | None = None,
+    ) -> int:
+        """Re-queue already-embedded articles for `--reprocess`/`--model-changed`.
+
+        Filters on `raw_articles.event_at` (the window semantics every other
+        worker uses) rather than `article_embeddings.created_at`, so a
+        backfill window matches articles by when they happened, not by when
+        they were last embedded.
+        """
+        now = datetime.now(timezone.utc)
+        async with self._engine.begin() as connection:
+            candidates = select(raw_articles.c.id).where(
+                raw_articles.c.event_at >= since, raw_articles.c.event_at < until
+            )
+            if model is not None:
+                candidates = candidates.where(
+                    raw_articles.c.id.in_(
+                        select(article_embeddings.c.article_id).where(
+                            article_embeddings.c.model != model
+                        )
+                    )
+                )
+            article_ids = [row.id for row in await connection.execute(candidates)]
+            if not article_ids:
+                return 0
+            stmt = pg_insert(processing_jobs).values(
+                [
+                    {"article_id": article_id, "stage": stage}
+                    for article_id in article_ids
+                ]
+            )
+            result = await connection.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[
+                        processing_jobs.c.article_id,
+                        processing_jobs.c.stage,
+                    ],
+                    set_={
+                        "state": "pending",
+                        "attempts": 0,
+                        "available_at": now,
+                        "lease_until": None,
+                        "locked_by": None,
+                        "last_error": None,
+                        "updated_at": now,
+                    },
+                )
+            )
+            return int(result.rowcount or 0)
+
+    async def replay_stage_jobs(self, stage: str, *, limit: int) -> int:
+        """Requeue dead-lettered `processing_jobs` rows for another attempt."""
+        now = datetime.now(timezone.utc)
+        async with self._engine.begin() as connection:
+            targets = (
+                await connection.execute(
+                    select(processing_jobs.c.article_id)
+                    .where(
+                        processing_jobs.c.stage == stage,
+                        processing_jobs.c.state == "dead_letter",
+                    )
+                    .order_by(processing_jobs.c.updated_at)
+                    .limit(limit)
+                )
+            ).all()
+            if not targets:
+                return 0
+            article_ids = [row.article_id for row in targets]
+            result = await connection.execute(
+                update(processing_jobs)
+                .where(
+                    processing_jobs.c.stage == stage,
+                    processing_jobs.c.article_id.in_(article_ids),
+                )
+                .values(
+                    state="pending",
+                    attempts=0,
+                    available_at=now,
+                    lease_until=None,
+                    locked_by=None,
+                    updated_at=now,
+                )
+            )
+            return int(result.rowcount or 0)
 
     @staticmethod
     def _feed_filters(

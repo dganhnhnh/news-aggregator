@@ -133,12 +133,13 @@ def test_cli_replay_requires_failures_or_stage() -> None:
     assert args.limit == 100
 
 
-def test_cli_replay_rejects_stage_until_implemented() -> None:
+def test_cli_replay_accepts_stage() -> None:
     parser = worker_cli.build_parser(_settings())
     args = parser.parse_args(["replay", "--stage", "embed"])
 
-    with pytest.raises(SystemExit):
-        worker_cli.validate(args, parser)
+    worker_cli.validate(args, parser)
+    assert args.stage == "embed"
+    assert args.limit == 100
 
 
 def test_cli_disable_feed_requires_reason() -> None:

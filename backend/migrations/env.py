@@ -33,6 +33,17 @@ def render_item(type_, obj, autogen_context):
     return False
 
 
+# The HNSW index is created by hand with `op.execute` (see the migration that
+# adds article_embeddings) because SQLAlchemy's Index() cannot reliably
+# round-trip pgvector's access method/operator class through reflection.
+# Excluding it here keeps it invisible to autogenerate in both directions
+# instead of `alembic check` perpetually wanting to drop it.
+def include_object(object_, name, type_, reflected, compare_to):
+    if type_ == "index" and name == "ix_article_embeddings_hnsw":
+        return False
+    return True
+
+
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
     if not url:
@@ -43,6 +54,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         render_item=render_item,
+        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -53,6 +65,7 @@ def do_run_migrations(connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         render_item=render_item,
+        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()

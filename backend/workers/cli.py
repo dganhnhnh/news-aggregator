@@ -11,12 +11,16 @@ from core.config import Settings
 from core.logger import get_logger, setup_logging
 from workers.base import EXIT_FAILED, EXIT_OK, Worker, stale_after_for
 from workers.crawl import CrawlWorker
+from workers.embed import EmbedWorker
 from workers.window import RunWindow, build_window
 
 
 logger = get_logger(__name__)
 
-WORKERS: dict[str, type[Worker]] = {CrawlWorker.name: CrawlWorker}
+WORKERS: dict[str, type[Worker]] = {
+    CrawlWorker.name: CrawlWorker,
+    EmbedWorker.name: EmbedWorker,
+}
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -137,8 +141,37 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     )
     crawl.add_argument("--emit-jsonl", action="store_true")
 
+    embed = subparsers.add_parser(
+        "embed", help="Embed articles queued in processing_jobs(stage='embed')"
+    )
+    _add_common_arguments(embed)
+    embed.add_argument(
+        "--batch-size",
+        type=int,
+        default=settings.embed_batch_size,
+        help="Articles embedded per claim/checkpoint chunk",
+    )
+    embed.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Maximum articles to process this run; 0 means unbounded",
+    )
+    reprocess_group = embed.add_mutually_exclusive_group()
+    reprocess_group.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="Re-queue already-embedded articles in the window, regardless of model",
+    )
+    reprocess_group.add_argument(
+        "--model-changed",
+        action="store_true",
+        help="Re-queue articles in the window whose stored embedding used a "
+        "different model than the one configured now",
+    )
+
     replay = subparsers.add_parser(
-        "replay", help="Requeue dead-lettered crawl_failures rows"
+        "replay", help="Requeue dead-lettered crawl_failures or processing_jobs rows"
     )
     replay_target = replay.add_mutually_exclusive_group(required=True)
     replay_target.add_argument(
@@ -149,7 +182,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     replay_target.add_argument(
         "--stage",
         metavar="STAGE",
-        help="Replay processing_jobs for STAGE (not yet implemented)",
+        help="Replay dead-lettered processing_jobs rows for STAGE (e.g. embed)",
     )
     replay.add_argument(
         "--kind",
@@ -215,6 +248,13 @@ def _validate_crawl(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     )
 
 
+def _validate_embed(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.limit < 0:
+        parser.error("--limit must not be negative")
+
+
 def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.command in WORKERS:
         if args.interval is not None and args.interval <= 0:
@@ -223,11 +263,11 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             parser.error("--once and --interval are mutually exclusive")
         if args.command == "crawl":
             _validate_crawl(args, parser)
+        elif args.command == "embed":
+            _validate_embed(args, parser)
     elif args.command == "replay":
         if args.limit <= 0:
             parser.error("--limit must be positive")
-        if args.stage is not None:
-            parser.error("--stage replay is not implemented yet; use --failures")
 
 
 async def _dispatch(
@@ -257,6 +297,10 @@ async def _dispatch_admin(
     storage: PostgresRawStorage, args: argparse.Namespace
 ) -> int:
     if args.command == "replay":
+        if args.stage is not None:
+            count = await storage.replay_stage_jobs(args.stage, limit=args.limit)
+            logger.info("Requeued %d dead-lettered %s job(s)", count, args.stage)
+            return EXIT_OK
         count = await storage.replay_failures(kind=args.kind, limit=args.limit)
         logger.info("Requeued %d dead-lettered failure(s)", count)
         return EXIT_OK

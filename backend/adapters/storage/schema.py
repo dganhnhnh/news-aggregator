@@ -1,5 +1,6 @@
 """SQLAlchemy Core schema shared by the repository and Alembic."""
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -163,3 +164,70 @@ Index(
     feed_state.c.next_poll_at,
     postgresql_where=text("disabled_at IS NULL"),
 )
+
+processing_jobs = Table(
+    "processing_jobs",
+    metadata,
+    Column(
+        "article_id",
+        BigInteger,
+        ForeignKey("raw_articles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("stage", Text, nullable=False),
+    Column("state", Text, nullable=False, server_default="pending"),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column(
+        "available_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    Column("lease_until", DateTime(timezone=True)),
+    Column("locked_by", Text),
+    Column("last_error", Text),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    PrimaryKeyConstraint("article_id", "stage", name="pk_processing_jobs"),
+)
+# Partial: only pending rows are ever scanned by claim(), so the index stays
+# small no matter how many rows have already reached 'done'.
+Index(
+    "ix_processing_jobs_ready",
+    processing_jobs.c.stage,
+    processing_jobs.c.available_at,
+    postgresql_where=text("state = 'pending'"),
+)
+Index(
+    "ix_processing_jobs_leased",
+    processing_jobs.c.lease_until,
+    postgresql_where=text("state = 'running'"),
+)
+
+article_embeddings = Table(
+    "article_embeddings",
+    metadata,
+    Column(
+        "article_id",
+        BigInteger,
+        ForeignKey("raw_articles.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("model", Text, nullable=False),
+    Column("dim", Integer, nullable=False),
+    Column("content_hash", LargeBinary, nullable=False),
+    Column("embedding", Vector(384), nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+)
+# The HNSW index is created by hand in the migration with `op.execute` --
+# autogenerate cannot render pgvector's access method or operator class, see
+# week1-foundation.md §4.6.

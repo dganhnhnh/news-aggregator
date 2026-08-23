@@ -161,3 +161,34 @@ class StorageWriteSummary:
     written: int
     unchanged: int
     rejected: int
+
+
+@dataclass(frozen=True)
+class EmbeddingCandidate:
+    """An article claimed for embedding, with its previous embedding state."""
+
+    article_id: int
+    title: str | None
+    content: str
+    content_hash: bytes
+    existing_model: str | None
+    existing_content_hash: bytes | None
+
+
+@dataclass(frozen=True)
+class EmbeddingRecord:
+    article_id: int
+    model: str
+    dim: int
+    content_hash: bytes
+    embedding: list[float]
+
+
+@dataclass
+class EmbedRunStats:
+    reclaimed: int = 0
+    requeued: int = 0
+    claimed: int = 0
+    embedded: int = 0
+    skipped_unchanged: int = 0
+    failed: int = 0

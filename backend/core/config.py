@@ -38,6 +38,7 @@ class Settings:
     service_interval_seconds: int
     feed_poll_interval_seconds: int = 1800
     feed_disable_after_failures: int = 10
+    embed_batch_size: int = 32
     # A run checkpoints (and so heartbeats) after every chunk, so this measures
     # silence between chunks rather than total run length.
     worker_heartbeat_timeout_seconds: int = 900
@@ -72,6 +73,7 @@ class Settings:
             service_interval_seconds=_env_int("SERVICE_INTERVAL_SECONDS", 1800),
             feed_poll_interval_seconds=_env_int("FEED_POLL_INTERVAL_SECONDS", 1800),
             feed_disable_after_failures=_env_int("FEED_DISABLE_AFTER_FAILURES", 10),
+            embed_batch_size=_env_int("EMBED_BATCH_SIZE", 32),
             worker_heartbeat_timeout_seconds=_env_int(
                 "WORKER_HEARTBEAT_TIMEOUT_SECONDS", 900
             ),
