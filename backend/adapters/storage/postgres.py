@@ -290,10 +290,11 @@ class PostgresRawStorage:
                 for key, failure in failure_by_key.items():
                     previous = existing.get(key)
                     attempt = (previous.attempt_count if previous else 0) + 1
+                    exhausted = failure.permanent or attempt >= MAX_FAILURE_ATTEMPTS
                     dead_lettered_at = (
                         previous.dead_lettered_at
                         if previous and previous.dead_lettered_at
-                        else (now if attempt >= MAX_FAILURE_ATTEMPTS else None)
+                        else (now if exhausted else None)
                     )
                     values = {
                         "failure_kind": failure.failure_kind,
@@ -319,9 +320,12 @@ class PostgresRawStorage:
                         "first_failed_at": previous.first_failed_at if previous else now,
                         "last_failed_at": now,
                         "dead_lettered_at": dead_lettered_at,
+                        # A dead-lettered row keeps whatever schedule it had;
+                        # one dead-lettered on first sight (a permanent
+                        # failure) has none to keep.
                         "next_retry_at": (
                             previous.next_retry_at
-                            if dead_lettered_at
+                            if dead_lettered_at and previous
                             else now + retry_delay(attempt)
                         ),
                     }
@@ -801,6 +805,30 @@ class PostgresRawStorage:
             )
             return [StoredCrawlFailure(**dict(row._mapping)) for row in result]
 
+    async def purge_stale_feed_failures(self) -> int:
+        """Drop feed failures the feed itself has since disproved.
+
+        A feed-kind row is resolved by the next successful poll, but a run cut
+        short between the poll and the resolving write leaves the row behind
+        forever: nothing else revisits it. Reconciling against
+        `feed_state.last_success_at` keeps the queue honest without waiting
+        for a coincidence.
+        """
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                delete(crawl_failures).where(
+                    crawl_failures.c.failure_kind == "feed",
+                    crawl_failures.c.url.in_(
+                        select(feed_state.c.feed_url).where(
+                            feed_state.c.last_success_at.is_not(None),
+                            feed_state.c.last_success_at
+                            > crawl_failures.c.last_failed_at,
+                        )
+                    ),
+                )
+            )
+            return int(result.rowcount or 0)
+
     async def replay_failures(
         self, *, kind: FailureKind | None = None, limit: int
     ) -> int:
@@ -900,6 +928,7 @@ class PostgresRawStorage:
             feed_state.c.source_label,
             feed_state.c.etag,
             feed_state.c.last_modified,
+            feed_state.c.resolved_url,
         )
         if feed_urls:
             stmt = stmt.where(feed_state.c.feed_url.in_(list(feed_urls)))
@@ -923,6 +952,7 @@ class PostgresRawStorage:
         etag: str | None = None,
         last_modified: str | None = None,
         last_entry_published_at: datetime | None = None,
+        resolved_url: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc)
         values: dict[str, Any] = {
@@ -932,6 +962,10 @@ class PostgresRawStorage:
             "next_poll_at": next_poll_at,
             "updated_at": now,
         }
+        if resolved_url:
+            # Remember where a permanent redirect lands so the next poll goes
+            # straight there; `feed_url` keeps matching the OPML/TSV entry.
+            values["resolved_url"] = resolved_url
         if not not_modified:
             # A 304 carries no new headers/entries, so leave the existing
             # etag/last_modified/last_entry_published_at untouched.
@@ -951,7 +985,15 @@ class PostgresRawStorage:
         *,
         error_message: str,
         disable_after: int,
+        permanent: bool = False,
+        resolved_url: str | None = None,
     ) -> FeedFailureOutcome:
+        """Record one failed poll; `permanent` disables the feed immediately.
+
+        Counting to `disable_after` only makes sense for failures that might
+        stop happening. A 404/410/401 will not, so waiting ten polls to admit
+        it just keeps a dead URL in the rotation.
+        """
         now = datetime.now(timezone.utc)
         async with self._engine.begin() as connection:
             row = (
@@ -962,13 +1004,18 @@ class PostgresRawStorage:
                 )
             ).one()
             consecutive_failures = int(row.consecutive_failures) + 1
-            disabled = consecutive_failures >= disable_after
+            disabled = permanent or consecutive_failures >= disable_after
             values: dict[str, Any] = {
                 "last_polled_at": now,
                 "consecutive_failures": consecutive_failures,
                 "next_poll_at": now + retry_delay(consecutive_failures),
                 "updated_at": now,
             }
+            if resolved_url:
+                # A failed poll can still have proved a permanent redirect on
+                # the way to the error; remember it so the retry starts from
+                # the new URL instead of paying for the redirect every time.
+                values["resolved_url"] = resolved_url
             if disabled:
                 values["disabled_at"] = now
                 values["disabled_reason"] = error_message[:2000]

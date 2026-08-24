@@ -11,11 +11,15 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from adapters.retrieve_news_data.crawler import Crawl4aiProvider
-from adapters.retrieve_news_data.google_news_rss_searcher import RssFeedSearcher
+from adapters.retrieve_news_data.google_news_rss_searcher import (
+    RssFeedSearcher,
+    RssFeedSource,
+)
 from adapters.retrieve_news_data.searcher import SearchFetcher, TavilySearcher
 from adapters.storage import PostgresRawStorage, StorageError
-from core.config import Settings
+from core.config import DEFAULT_USER_AGENT, Settings
 from core.logger import get_logger, setup_logging
+from core.urls import SCHEME_RELATIVE_BASE, UnusableUrl, resolve_crawl_url
 from models.search_and_crawl_models import (
     CrawlError,
     CrawlResult,
@@ -57,26 +61,52 @@ async def run_search(
 
 
 async def run_crawl_batch(urls: list[str]) -> CrawlBatch:
-    provider = Crawl4aiProvider()
-    try:
-        if len(urls) == 1:
-            results = [await provider.crawl(urls[0])]
-        else:
-            results = await provider.crawl_batch(urls)
-    except Exception as exc:
-        return CrawlBatch(
-            failures=[
+    # Command-line URLs have no containing document to resolve against, so a
+    # protocol-relative argument (`//host/path`) defaults to https instead of
+    # reaching the crawler without a scheme. Anything still unresolvable is a
+    # permanent failure: retrying it can never produce a different outcome.
+    crawlable: list[str] = []
+    rejected: list[CrawlFailureOccurrence] = []
+    for url in urls:
+        try:
+            crawlable.append(resolve_crawl_url(url, base_url=SCHEME_RELATIVE_BASE))
+        except UnusableUrl as exc:
+            logger.error("Not crawlable, skipping: %s", exc)
+            rejected.append(
                 CrawlFailureOccurrence(
                     failure_kind="article",
                     url=url,
-                    error_type=type(exc).__name__,
+                    error_type=f"UnusableUrl:{exc.reason}",
                     error_message=str(exc),
+                    permanent=True,
                 )
-                for url in urls
-            ],
-            articles_discovered=len(urls),
+            )
+
+    if not crawlable:
+        return CrawlBatch(failures=rejected, articles_discovered=len(urls))
+
+    provider = Crawl4aiProvider()
+    try:
+        if len(crawlable) == 1:
+            results = [await provider.crawl(crawlable[0])]
+        else:
+            results = await provider.crawl_batch(crawlable)
+    except Exception as exc:
+        rejected.extend(
+            CrawlFailureOccurrence(
+                failure_kind="article",
+                url=url,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            for url in crawlable
         )
-    return direct_crawl_batch(results)
+        return CrawlBatch(failures=rejected, articles_discovered=len(urls))
+
+    batch = direct_crawl_batch(results)
+    batch.failures.extend(rejected)
+    batch.articles_discovered += len(rejected)
+    return batch
 
 
 async def run_crawl(urls: list[str]) -> list[CrawlResult]:
@@ -92,12 +122,14 @@ async def run_rss_batch(
     max_concurrent_feeds: int = 2,
     crawl_batch_size: int = 10,
     feed_offset: int = 0,
+    user_agent: str = DEFAULT_USER_AGENT,
 ) -> CrawlBatch:
     searcher = RssFeedSearcher(
         feed_path=feed_path,
         max_concurrent_crawls=max_concurrent_crawls,
         max_concurrent_feeds=max_concurrent_feeds,
         crawl_batch_size=crawl_batch_size,
+        user_agent=user_agent,
     )
     return await searcher.fetch_batch(
         max_articles_per_feed=max_articles_per_feed,
@@ -143,7 +175,17 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     crawl.add_argument("--persist", action="store_true", help="Upsert into PostgreSQL")
 
     rss = subparsers.add_parser("rss", help="Fetch and crawl RSS/Atom feeds")
-    rss.add_argument(
+    feed_source = rss.add_mutually_exclusive_group()
+    feed_source.add_argument(
+        "feed_urls",
+        nargs="*",
+        metavar="URL",
+        help=(
+            "One or more RSS/Atom URLs to process directly; use --feed-path "
+            "instead to load feeds from TSV/OPML"
+        ),
+    )
+    feed_source.add_argument(
         "--feed-path",
         "--tsv-path",
         dest="feed_path",
@@ -201,11 +243,16 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> None:
         emit_results(results)
         return
 
+    direct_feed_urls: list[str] = []
     if args.command != "crawl":
-        if args.feed_path is None:
+        direct_feed_urls = [
+            resolve_crawl_url(url, base_url=SCHEME_RELATIVE_BASE)
+            for url in args.feed_urls
+        ]
+        if args.feed_path is None and not direct_feed_urls:
             raise ValueError(
-                "rss requires --feed-path/--tsv-path or "
-                "RSS_FEED_PATH/GOOGLE_NEWS_TSV_PATH"
+                "rss requires one or more feed URLs, --feed-path/--tsv-path, "
+                "or RSS_FEED_PATH/GOOGLE_NEWS_TSV_PATH"
             )
 
     storage: PostgresRawStorage | None = None
@@ -229,11 +276,17 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> None:
         if args.command == "crawl":
             batch = await run_crawl_batch(args.urls)
         else:
+            sources = (
+                [RssFeedSource(url, url) for url in direct_feed_urls]
+                if direct_feed_urls
+                else None
+            )
             searcher = RssFeedSearcher(
-                feed_path=args.feed_path,
+                feed_path=None if direct_feed_urls else args.feed_path,
                 max_concurrent_crawls=args.max_concurrent_crawls,
                 max_concurrent_feeds=args.max_concurrent_feeds,
                 crawl_batch_size=args.crawl_batch_size,
+                user_agent=settings.feed_user_agent,
             )
             has_failures = False
             total_received = 0
@@ -244,6 +297,7 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> None:
             async for batch in searcher.iter_batches(
                 max_articles_per_feed=args.max_articles_per_feed,
                 max_feeds=args.max_feeds,
+                sources=sources,
                 feed_offset=args.feed_offset,
             ):
                 if storage is not None:

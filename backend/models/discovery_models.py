@@ -27,6 +27,10 @@ class DiscoveredEntry:
     title: str
     source: str
     published_at: datetime | None
+    # Full article HTML when the feed shipped one (RSS content:encoded / Atom
+    # <content>). Carried through discovery so the crawl step can render it
+    # instead of fetching a page the feed already gave us.
+    content_html: str = ""
 
 
 FeedPollStatus = Literal["fetched", "not_modified", "failed"]
@@ -43,6 +47,12 @@ class FeedPoll:
     etag: str | None = None
     last_modified: str | None = None
     error: CrawlFailureOccurrence | None = None
+    # Set only when the feed answered through a permanent redirect chain, so a
+    # caller can record the new location instead of re-following it every poll.
+    resolved_url: str | None = None
+    # Entries dropped because they point at something that is not an article
+    # (podcast enclosures, other media). Reported rather than silently lost.
+    entries_skipped_non_article: int = 0
 
 
 class DiscoverySource(Protocol):

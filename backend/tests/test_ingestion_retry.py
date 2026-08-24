@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 
+from core.urls import URL_ERROR_CONTEXT_KEY
 from models.search_and_crawl_models import CrawlResult
 from models.storage_models import StoredCrawlFailure
 from services.ingestion import retry_due_failures
@@ -88,3 +89,83 @@ def test_article_retries_are_chunked() -> None:
     assert [len(call) for call in searcher.calls] == [2, 2, 1]
     assert len(batch.results) == 5
     assert attempted == succeeded == 5
+
+
+def test_retrying_a_malformed_queued_url_dead_letters_it_instead_of_looping() -> None:
+    # Rows written before entry links were resolved against the feed URL hold
+    # hrefs no crawler can fetch. Retrying one can never change the outcome, so
+    # it is recorded as permanent rather than burning five attempts.
+    failure = StoredCrawlFailure(
+        failure_kind="article",
+        url="/2020/06/22/post.html",
+        error_type="CrawlError",
+        error_message="crawler runtime error",
+    )
+
+    class FakeStorage:
+        async def due_failures(self, limit: int):
+            return [failure]
+
+    class FakeSearcher:
+        async def crawl_batch(self, urls, *, max_concurrency=None):
+            return [
+                CrawlResult(
+                    url=url,
+                    markdown="",
+                    success=False,
+                    error_message="URL is not absolute",
+                    context={URL_ERROR_CONTEXT_KEY: "relative"},
+                )
+                for url in urls
+            ]
+
+    batch, attempted, succeeded = asyncio.run(
+        retry_due_failures(
+            FakeStorage(),
+            FakeSearcher(),
+            limit=50,
+            max_concurrent_crawls=1,
+        )
+    )
+
+    assert (attempted, succeeded) == (1, 0)
+    assert len(batch.failures) == 1
+    assert batch.failures[0].permanent is True
+    assert batch.failures[0].error_type == "UnusableUrl:relative"
+
+
+def test_a_genuine_crawl_failure_stays_retryable() -> None:
+    failure = StoredCrawlFailure(
+        failure_kind="article",
+        url="https://example.com/article",
+        error_type="TimeoutError",
+        error_message="timeout",
+    )
+
+    class FakeStorage:
+        async def due_failures(self, limit: int):
+            return [failure]
+
+    class FakeSearcher:
+        async def crawl_batch(self, urls, *, max_concurrency=None):
+            return [
+                CrawlResult(
+                    url=url,
+                    markdown="",
+                    success=False,
+                    error_message="ERR_CONNECTION_RESET",
+                )
+                for url in urls
+            ]
+
+    batch, _, _ = asyncio.run(
+        retry_due_failures(
+            FakeStorage(),
+            FakeSearcher(),
+            limit=50,
+            max_concurrent_crawls=1,
+        )
+    )
+
+    assert batch.failures[0].permanent is False
+    assert batch.failures[0].error_type == "CrawlError"

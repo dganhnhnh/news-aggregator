@@ -39,6 +39,7 @@ class CrawlWorker(Worker):
             "max_concurrent_feeds": args.max_concurrent_feeds,
             "max_concurrent_crawls": args.max_concurrent_crawls,
             "crawl_batch_size": args.crawl_batch_size,
+            "user_agent": args.user_agent,
             "poll_interval": args.poll_interval,
             "disable_after_failures": args.disable_after_failures,
             "max_retries_per_run": args.max_retries_per_run,
@@ -52,11 +53,23 @@ class CrawlWorker(Worker):
             max_concurrent_crawls=args.max_concurrent_crawls,
             max_concurrent_feeds=args.max_concurrent_feeds,
             crawl_batch_size=args.crawl_batch_size,
+            feed_content_min_chars=args.feed_content_min_chars,
+            max_crawls_per_host=args.max_crawls_per_host,
+            crawl_delay_per_host=args.crawl_delay_per_host,
+            user_agent=args.user_agent,
         )
         discovery = RssDiscovery(searcher)
         stats = IngestRunStats()
         has_failures = False
         interrupted = False
+
+        stats.stale_failures_purged = await storage.purge_stale_feed_failures()
+        if stats.stale_failures_purged:
+            logger.info(
+                "Purged %d feed failure(s) already disproved by a later "
+                "successful poll",
+                stats.stale_failures_purged,
+            )
 
         if args.feed_path is not None:
             seeded = await storage.seed_feeds(
@@ -114,6 +127,14 @@ class CrawlWorker(Worker):
                     break
 
                 stats.feeds_processed += 1
+                stats.entries_skipped_non_article += poll.entries_skipped_non_article
+                if poll.resolved_url:
+                    stats.feeds_redirected += 1
+                    logger.info(
+                        "Feed permanently moved: %s -> %s",
+                        poll.target.feed_url,
+                        poll.resolved_url,
+                    )
                 next_poll_at = datetime.now(timezone.utc) + timedelta(
                     seconds=args.poll_interval
                 )
@@ -134,6 +155,7 @@ class CrawlWorker(Worker):
                         poll.target.feed_url,
                         next_poll_at=next_poll_at,
                         not_modified=True,
+                        resolved_url=poll.resolved_url,
                     )
                     continue
 
@@ -145,15 +167,24 @@ class CrawlWorker(Worker):
                         poll.target.feed_url,
                         error_message=poll.error.error_message,
                         disable_after=args.disable_after_failures,
+                        permanent=poll.error.permanent,
+                        resolved_url=poll.resolved_url,
                     )
                     await persist_batch(storage, CrawlBatch(failures=[poll.error]))
                     if outcome.disabled:
                         stats.feeds_disabled += 1
-                        logger.warning(
-                            "Feed disabled after %d consecutive failures: %s",
-                            outcome.consecutive_failures,
-                            poll.target.feed_url,
-                        )
+                        if poll.error.permanent:
+                            logger.warning(
+                                "Feed disabled — permanently unreachable: %s (%s)",
+                                poll.target.feed_url,
+                                poll.error.error_message,
+                            )
+                        else:
+                            logger.warning(
+                                "Feed disabled after %d consecutive failures: %s",
+                                outcome.consecutive_failures,
+                                poll.target.feed_url,
+                            )
                     continue
 
                 # poll.status == "fetched"
@@ -239,19 +270,25 @@ class CrawlWorker(Worker):
                     etag=poll.etag,
                     last_modified=poll.last_modified,
                     last_entry_published_at=latest_published,
+                    resolved_url=poll.resolved_url,
                 )
 
         logger.info(
             "Crawl run %d: feeds=%d not_modified=%d failed=%d disabled=%d "
-            "discovered=%d crawled=%d failed_crawls=%d retries=%d/%d "
-            "written=%d unchanged=%d skipped(window=%d undated=%d known=%d)",
+            "redirected=%d purged=%d "
+            "discovered=%d crawled=%d from_feed=%d failed_crawls=%d retries=%d/%d "
+            "written=%d unchanged=%d "
+            "skipped(window=%d undated=%d known=%d non_article=%d)",
             ctx.run_id,
             stats.feeds_processed,
             stats.feeds_not_modified,
             stats.feeds_failed,
             stats.feeds_disabled,
+            stats.feeds_redirected,
+            stats.stale_failures_purged,
             stats.articles_discovered,
             stats.crawl_succeeded,
+            stats.articles_from_feed_content,
             stats.crawl_failed,
             stats.retries_succeeded,
             stats.retries_attempted,
@@ -260,6 +297,7 @@ class CrawlWorker(Worker):
             stats.entries_skipped_out_of_window,
             stats.entries_skipped_undated,
             stats.entries_skipped_known,
+            stats.entries_skipped_non_article,
         )
 
         if interrupted:

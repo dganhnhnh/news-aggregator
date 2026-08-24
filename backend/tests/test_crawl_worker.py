@@ -38,6 +38,10 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "max_concurrent_feeds": 2,
         "max_concurrent_crawls": 2,
         "crawl_batch_size": 10,
+        "max_crawls_per_host": 1,
+        "crawl_delay_per_host": 0.0,
+        "feed_content_min_chars": 1200,
+        "user_agent": "news-radar/1.0",
         "poll_interval": 1800,
         "disable_after_failures": 3,
         "max_retries_per_run": 50,
@@ -79,6 +83,8 @@ class FakeStorage:
         self._known: set[str] = set()
         self._consecutive_failures: dict[str, int] = {}
         self._disabled: set[str] = set()
+        self.resolved_urls: dict[str, str] = {}
+        self.stale_failures_purged = 0
 
     def set_due_feeds(self, targets: list[FeedPollTarget]) -> None:
         self._due_feeds = targets
@@ -88,6 +94,10 @@ class FakeStorage:
 
     async def due_failures(self, limit: int) -> list:
         return []
+
+    async def purge_stale_feed_failures(self) -> int:
+        self.calls.append(("purge_stale_feed_failures",))
+        return self.stale_failures_purged
 
     async def seed_feeds(self, seeds) -> int:
         return 0
@@ -115,8 +125,11 @@ class FakeStorage:
         etag: str | None = None,
         last_modified: str | None = None,
         last_entry_published_at: datetime | None = None,
+        resolved_url: str | None = None,
     ) -> None:
-        self.calls.append(("record_feed_poll", feed_url, not_modified, next_poll_at))
+        self.calls.append(
+            ("record_feed_poll", feed_url, not_modified, next_poll_at, resolved_url)
+        )
         self._consecutive_failures[feed_url] = 0
 
     async def record_feed_failure(
@@ -125,10 +138,14 @@ class FakeStorage:
         *,
         error_message: str,
         disable_after: int,
+        permanent: bool = False,
+        resolved_url: str | None = None,
     ) -> FeedFailureOutcome:
+        if resolved_url:
+            self.resolved_urls[feed_url] = resolved_url
         count = self._consecutive_failures.get(feed_url, 0) + 1
         self._consecutive_failures[feed_url] = count
-        disabled = count >= disable_after
+        disabled = permanent or count >= disable_after
         if disabled:
             self._disabled.add(feed_url)
         self.calls.append(("record_feed_failure", feed_url, count, disabled))
@@ -202,7 +219,7 @@ def test_not_modified_feed_skips_crawl_and_advances_schedule(
     assert outcome.stats.feeds_not_modified == 1
     poll_calls = [c for c in storage.calls if c[0] == "record_feed_poll"]
     assert len(poll_calls) == 1
-    _, feed_url, not_modified, next_poll_at = poll_calls[0]
+    _, feed_url, not_modified, next_poll_at, _resolved = poll_calls[0]
     assert feed_url == target.feed_url
     assert not_modified is True
     assert next_poll_at > NOW
@@ -313,6 +330,126 @@ def test_feed_failure_escalates_to_disabled_after_n_failures(
     # The feed no longer comes back from due_feeds.
     remaining = asyncio.run(storage.due_feeds(limit=0))
     assert remaining == []
+
+
+def test_permanently_missing_feed_is_disabled_on_its_first_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _target()
+    storage = FakeStorage()
+    storage.set_due_feeds([target])
+    discovery = FakeDiscovery(
+        [
+            FeedPoll(
+                target=target,
+                status="failed",
+                error=CrawlFailureOccurrence(
+                    failure_kind="feed",
+                    url=target.feed_url,
+                    error_type="HTTPStatusError",
+                    error_message="Client error '404 Not Found'",
+                    permanent=True,
+                ),
+            )
+        ]
+    )
+
+    outcome = _run(
+        storage, discovery, _args(disable_after_failures=10), monkeypatch=monkeypatch
+    )
+
+    assert outcome.stats.feeds_disabled == 1
+    assert asyncio.run(storage.due_feeds(limit=0)) == []
+
+
+def test_a_redirect_proved_by_a_failed_poll_is_still_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 301 to the new URL, 403 once we get there: the feed is still moved, and
+    # the next run should start from where it moved to.
+    target = _target()
+    storage = FakeStorage()
+    storage.set_due_feeds([target])
+    discovery = FakeDiscovery(
+        [
+            FeedPoll(
+                target=target,
+                status="failed",
+                error=CrawlFailureOccurrence(
+                    failure_kind="feed",
+                    url=target.feed_url,
+                    error_type="HTTPStatusError",
+                    error_message="Client error '403 Forbidden'",
+                    permanent=False,
+                ),
+                resolved_url="https://example.com/moved.xml",
+            )
+        ]
+    )
+
+    outcome = _run(storage, discovery, _args(), monkeypatch=monkeypatch)
+
+    assert storage.resolved_urls[target.feed_url] == "https://example.com/moved.xml"
+    assert outcome.stats.feeds_redirected == 1
+    assert outcome.stats.feeds_failed == 1
+
+
+def test_permanent_redirect_is_recorded_with_the_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _target()
+    storage = FakeStorage()
+    storage.set_due_feeds([target])
+    discovery = FakeDiscovery(
+        [
+            FeedPoll(
+                target=target,
+                status="fetched",
+                resolved_url="https://feed.example/moved.xml",
+            )
+        ]
+    )
+
+    outcome = _run(storage, discovery, _args(), monkeypatch=monkeypatch)
+
+    assert outcome.stats.feeds_redirected == 1
+    poll_calls = [c for c in storage.calls if c[0] == "record_feed_poll"]
+    assert poll_calls[0][-1] == "https://feed.example/moved.xml"
+
+
+def test_stale_feed_failures_are_purged_before_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = FakeStorage()
+    storage.stale_failures_purged = 4
+    discovery = FakeDiscovery([])
+
+    outcome = _run(storage, discovery, _args(), monkeypatch=monkeypatch)
+
+    assert outcome.stats.stale_failures_purged == 4
+    assert storage.calls[0][0] == "purge_stale_feed_failures"
+
+
+def test_non_article_entries_skipped_by_the_feed_are_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _target()
+    storage = FakeStorage()
+    storage.set_due_feeds([target])
+    discovery = FakeDiscovery(
+        [
+            FeedPoll(
+                target=target,
+                status="fetched",
+                entries=[_entry()],
+                entries_skipped_non_article=3,
+            )
+        ]
+    )
+
+    outcome = _run(storage, discovery, _args(), monkeypatch=monkeypatch)
+
+    assert outcome.stats.entries_skipped_non_article == 3
 
 
 def test_record_feed_poll_runs_after_the_last_crawl_chunk_is_persisted(

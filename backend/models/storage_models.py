@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
+from core.html_content import FEED_CONTENT_KEY
 from models.search_and_crawl_models import CrawlResult
 
 
@@ -29,6 +30,10 @@ class CrawlFailureOccurrence:
     source: str | None = None
     title: str | None = None
     published_at: datetime | None = None
+    # A failure retrying cannot fix (404/410/401 on a feed, a link that is not
+    # an article). Storage dead-letters it on the first occurrence instead of
+    # burning MAX_FAILURE_ATTEMPTS on a deterministic outcome.
+    permanent: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,12 @@ class FeedPollTarget:
     source_label: str | None
     etag: str | None
     last_modified: str | None
+    resolved_url: str | None = None
+
+    @property
+    def fetch_url(self) -> str:
+        """Where to send the request; `feed_url` stays the row's identity."""
+        return self.resolved_url or self.feed_url
 
 
 @dataclass(frozen=True)
@@ -126,6 +137,15 @@ class CrawlBatch:
     def crawl_failed(self) -> int:
         return len(self.failures)
 
+    @property
+    def articles_from_feed_content(self) -> int:
+        """Results rendered from the feed body instead of a fetched page."""
+        return sum(
+            1
+            for result in self.results
+            if result.success and result.context.get(FEED_CONTENT_KEY)
+        )
+
 
 @dataclass
 class IngestRunStats:
@@ -143,12 +163,19 @@ class IngestRunStats:
     entries_skipped_out_of_window: int = 0
     entries_skipped_undated: int = 0
     entries_skipped_known: int = 0
+    entries_skipped_non_article: int = 0
+    feeds_redirected: int = 0
+    stale_failures_purged: int = 0
+    # Articles taken from the feed's own content:encoded body, so no page was
+    # fetched for them at all.
+    articles_from_feed_content: int = 0
 
     def add_batch(self, batch: CrawlBatch, *, retry: bool = False) -> None:
         self.feeds_processed += batch.feeds_processed
         self.articles_discovered += batch.articles_discovered
         self.crawl_succeeded += batch.crawl_succeeded
         self.crawl_failed += batch.crawl_failed
+        self.articles_from_feed_content += batch.articles_from_feed_content
         if retry:
             self.retries_attempted += batch.crawl_succeeded + batch.crawl_failed
             self.retries_succeeded += batch.crawl_succeeded

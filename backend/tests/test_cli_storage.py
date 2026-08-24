@@ -52,6 +52,74 @@ def test_persistence_and_worker_output_flags_are_exposed() -> None:
         )
 
 
+def test_rss_command_accepts_direct_feed_urls() -> None:
+    args = pipeline_cli.build_parser(_settings()).parse_args(
+        [
+            "rss",
+            "https://example.com/feed.xml",
+            "https://example.org/atom.xml",
+            "--max-articles-per-feed",
+            "3",
+        ]
+    )
+
+    assert args.feed_urls == [
+        "https://example.com/feed.xml",
+        "https://example.org/atom.xml",
+    ]
+    assert args.feed_path is None
+    assert args.max_articles_per_feed == 3
+
+
+def test_rss_command_rejects_direct_urls_with_feed_path() -> None:
+    parser = pipeline_cli.build_parser(_settings())
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "rss",
+                "https://example.com/feed.xml",
+                "--feed-path",
+                "feeds.opml",
+            ]
+        )
+
+
+def test_rss_dispatch_passes_direct_urls_as_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    class CapturingSearcher:
+        def __init__(self, **kwargs) -> None:
+            calls.append(("init", kwargs["feed_path"]))
+
+        async def iter_batches(self, **kwargs):
+            calls.append(("sources", kwargs["sources"]))
+            if False:
+                yield CrawlBatch()
+
+    monkeypatch.setattr(pipeline_cli, "RssFeedSearcher", CapturingSearcher)
+    args = pipeline_cli.build_parser(_settings()).parse_args(
+        ["rss", "https://example.com/feed.xml"]
+    )
+
+    asyncio.run(pipeline_cli._dispatch(args, _settings()))
+
+    assert calls == [
+        ("init", None),
+        (
+            "sources",
+            [
+                pipeline_cli.RssFeedSource(
+                    "https://example.com/feed.xml",
+                    "https://example.com/feed.xml",
+                )
+            ],
+        ),
+    ]
+
+
 def test_news_service_alias_translates_legacy_flags() -> None:
     # Bare news-service used to loop; the alias must keep doing so even though
     # bare `news-worker crawl` runs once.
@@ -240,6 +308,7 @@ def test_rss_persists_each_chunk_before_later_interruption(
     monkeypatch.setattr(pipeline_cli, "RssFeedSearcher", InterruptedSearcher)
     args = argparse.Namespace(
         command="rss",
+        feed_urls=[],
         feed_path="feeds.opml",
         persist=True,
         max_feeds=0,
@@ -261,3 +330,71 @@ def test_rss_persists_each_chunk_before_later_interruption(
     assert calls[:2] == ["apply", ("checkpoint", 9, 1)]
     assert ("finish", 9, "partial", 1) in calls
     assert calls[-1] == "close"
+
+
+def _capturing_provider(seen: list[list[str]]):
+    """A Crawl4aiProvider stand-in recording the URLs it was asked to crawl."""
+
+    class FakeProvider:
+        async def crawl(self, url: str) -> CrawlResult:
+            seen.append([url])
+            return CrawlResult(url=url, markdown="# Article", success=True)
+
+        async def crawl_batch(self, urls, **kwargs) -> list[CrawlResult]:
+            seen.append(list(urls))
+            return [
+                CrawlResult(url=url, markdown="# Article", success=True)
+                for url in urls
+            ]
+
+    return FakeProvider
+
+
+def test_crawl_command_resolves_a_protocol_relative_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `news-pipeline crawl //host/path` has no containing document, so the CLI
+    # supplies the scheme instead of handing the crawler a scheme-less URL.
+    seen: list[list[str]] = []
+    monkeypatch.setattr(pipeline_cli, "Crawl4aiProvider", _capturing_provider(seen))
+
+    batch = asyncio.run(
+        pipeline_cli.run_crawl_batch(
+            ["//target.github.io/architecture/modernization_Intro"]
+        )
+    )
+
+    assert seen == [["https://target.github.io/architecture/modernization_Intro"]]
+    assert batch.failures == []
+
+
+def test_crawl_command_reports_an_unusable_url_as_a_permanent_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[str]] = []
+    monkeypatch.setattr(pipeline_cli, "Crawl4aiProvider", _capturing_provider(seen))
+
+    batch = asyncio.run(
+        pipeline_cli.run_crawl_batch(
+            ["https://example.com/good", "mailto:editor@example.com"]
+        )
+    )
+
+    assert seen == [["https://example.com/good"]]
+    assert len(batch.failures) == 1
+    failure = batch.failures[0]
+    assert failure.url == "mailto:editor@example.com"
+    assert failure.error_type == "UnusableUrl:unsupported_scheme"
+    assert failure.permanent is True
+
+
+def test_crawl_command_with_no_usable_url_never_builds_a_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[str]] = []
+    monkeypatch.setattr(pipeline_cli, "Crawl4aiProvider", _capturing_provider(seen))
+
+    batch = asyncio.run(pipeline_cli.run_crawl_batch(["/relative/only"]))
+
+    assert seen == []
+    assert [failure.permanent for failure in batch.failures] == [True]

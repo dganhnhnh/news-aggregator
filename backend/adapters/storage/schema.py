@@ -136,6 +136,10 @@ feed_state = Table(
     metadata,
     Column("feed_url", Text, primary_key=True),
     Column("source_label", Text),
+    # Where a permanent (301/308) redirect actually lands. `feed_url` stays the
+    # identity from the OPML/TSV file so re-seeding cannot resurrect a URL we
+    # already know has moved; polls follow `resolved_url` when it is set.
+    Column("resolved_url", Text),
     Column("etag", Text),
     Column("last_modified", Text),
     Column("last_polled_at", DateTime(timezone=True)),

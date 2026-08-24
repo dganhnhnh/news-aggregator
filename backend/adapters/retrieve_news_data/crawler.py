@@ -6,7 +6,9 @@ backend/models/search_and_crawl_models.py so they can be imported without
 pulling in any I/O dependencies.
 """
 
+import asyncio
 from typing import Optional
+from urllib.parse import urlsplit
 
 from crawl4ai import (
     AsyncWebCrawler,
@@ -16,6 +18,7 @@ from crawl4ai import (
 )
 
 from core.logger import get_logger
+from core.urls import URL_ERROR_CONTEXT_KEY, UnusableUrl, resolve_crawl_url
 
 from models.search_and_crawl_models import (
     CrawlError,
@@ -28,6 +31,44 @@ logger = get_logger(__name__)
 
 
 # ─── Internal helpers ────────────────────────────────────────────────────────
+
+
+def _host_waves(
+    items: list[tuple[int, str]],
+    max_per_host: int,
+) -> list[list[tuple[int, str]]]:
+    """Split (position, url) pairs into waves capped at `max_per_host` per host.
+
+    The n-th URL of a host lands in wave n // max_per_host, so a wave never
+    contains more than `max_per_host` requests to any one host and repeats of a
+    host are always separated by a wave boundary. When every URL has a distinct
+    host — the usual case — this returns a single wave and changes nothing.
+    """
+    seen_per_host: dict[str, int] = {}
+    waves: list[list[tuple[int, str]]] = []
+    for index, url in items:
+        host = urlsplit(url).hostname or ""
+        position = seen_per_host.get(host, 0)
+        seen_per_host[host] = position + 1
+        wave_number = position // max_per_host
+        while len(waves) <= wave_number:
+            waves.append([])
+        waves[wave_number].append((index, url))
+    return waves
+
+
+def _rejected_result(url: str, exc: UnusableUrl) -> CrawlResult:
+    """A failed CrawlResult for a URL that never reached the browser."""
+    result = CrawlResult(
+        url=url,
+        markdown="",
+        success=False,
+        error_message=str(exc),
+    )
+    result.context["requested_url"] = url
+    result.context[URL_ERROR_CONTEXT_KEY] = exc.reason
+    return result
+
 
 def _unwrap_result(container) -> tuple[object, str]:
     """
@@ -103,15 +144,29 @@ class Crawl4aiProvider(CrawlerProvider):
         self,
         browser_config: Optional[BrowserConfig] = None,
         run_config: Optional[CrawlerRunConfig] = None,
+        *,
+        max_per_host: int = 1,
+        per_host_delay_seconds: float = 1.0,
     ) -> None:
         self._browser_config = browser_config or BrowserConfig()
         # Default: extract plain text/markdown, skip raw HTML
         self._run_config = run_config or CrawlerRunConfig(only_text=True)
+        # A global concurrency cap says nothing about how hard one publisher is
+        # hit: ten URLs from one feed are usually ten URLs from one host, which
+        # is what trips rate limits and bot filters. These bound per-host load.
+        self._max_per_host = max(1, max_per_host)
+        self._per_host_delay_seconds = max(0.0, per_host_delay_seconds)
         self._logger = get_logger(__name__)
 
     # ── crawl ─────────────────────────────────────────────────────────────────
 
     async def crawl(self, url: str) -> CrawlResult:
+        try:
+            url = resolve_crawl_url(url)
+        except UnusableUrl as exc:
+            self._logger.warning("[crawl4ai] REJECT — %s", exc)
+            return _rejected_result(url, exc)
+
         self._logger.debug("[crawl4ai] fetching %s", url)
         try:
             async with AsyncWebCrawler(config=self._browser_config) as crawler:
@@ -166,31 +221,67 @@ class Crawl4aiProvider(CrawlerProvider):
         if not urls:
             return []
 
-        self._logger.info("[crawl4ai.batch] crawling %d URLs", len(urls))
+        # Callers zip this list against their own inputs, so it must stay the
+        # same length and order as `urls` even when some are never fetched.
+        crawlable: list[tuple[int, str]] = []
+        completed: dict[int, CrawlResult] = {}
+        for index, url in enumerate(urls):
+            try:
+                crawlable.append((index, resolve_crawl_url(url)))
+            except UnusableUrl as exc:
+                self._logger.warning("[crawl4ai.batch] REJECT — %s", exc)
+                completed[index] = _rejected_result(url, exc)
 
-        dispatcher = (
-            SemaphoreDispatcher(semaphore_count=max_concurrency)
-            if max_concurrency is not None
-            else None
-        )
-        async with AsyncWebCrawler(config=self._browser_config) as crawler:
-            containers = await crawler.arun_many(
-                urls=urls,
-                config=self._run_config,
-                dispatcher=dispatcher,
+        if crawlable:
+            waves = _host_waves(crawlable, self._max_per_host)
+            self._logger.info(
+                "[crawl4ai.batch] crawling %d URLs in %d wave(s)",
+                len(crawlable),
+                len(waves),
             )
+            dispatcher = (
+                SemaphoreDispatcher(semaphore_count=max_concurrency)
+                if max_concurrency is not None
+                else None
+            )
+            async with AsyncWebCrawler(config=self._browser_config) as crawler:
+                for wave_number, wave in enumerate(waves):
+                    if wave_number and self._per_host_delay_seconds:
+                        # Consecutive waves only ever hold repeats of the same
+                        # host, so this delay is exactly the per-host politeness
+                        # gap and costs nothing when hosts are all distinct.
+                        await asyncio.sleep(self._per_host_delay_seconds)
+                    containers = await crawler.arun_many(
+                        urls=[url for _, url in wave],
+                        config=self._run_config,
+                        dispatcher=dispatcher,
+                    )
+                    for (index, _), container in zip(wave, containers):
+                        inner, container_url = _unwrap_result(container)
+                        success = bool(getattr(inner, "success", False))
+                        error_msg = (
+                            getattr(inner, "error_message", "") or
+                            ("" if success else "unknown crawl4ai error")
+                        )
+                        result = _build_crawl_result(
+                            url=container_url, inner=inner, success=success
+                        )
+                        if not result.error_message:
+                            result.error_message = error_msg
+                        completed[index] = result
 
         results: list[CrawlResult] = []
-        for container in containers:
-            inner, container_url = _unwrap_result(container)
-            success = bool(getattr(inner, "success", False))
-            error_msg = (
-                getattr(inner, "error_message", "") or
-                ("" if success else "unknown crawl4ai error")
-            )
-            result = _build_crawl_result(url=container_url, inner=inner, success=success)
-            if not result.error_message:
-                result.error_message = error_msg
+        for index, url in enumerate(urls):
+            result = completed.get(index)
+            if result is None:
+                # crawl4ai returned fewer containers than it was given; a
+                # missing result is still a result the caller must account for.
+                result = CrawlResult(
+                    url=url,
+                    markdown="",
+                    success=False,
+                    error_message="Crawler returned no result for this URL",
+                )
             results.append(result)
 
         ok_count = sum(1 for r in results if r.success)

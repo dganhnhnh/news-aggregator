@@ -8,8 +8,19 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from core.html_content import MIN_FULL_CONTENT_CHARS
+
 
 load_dotenv()
+
+
+# Identify honestly. Claiming to be a well-known crawler we are not gets us
+# blocked by the bot filters in front of many feeds — Slashdot/Feedburner
+# answer a Googlebot-shaped User-Agent from a non-Google IP with 403 — and
+# those 403s then count towards `--disable-after-failures` until a perfectly
+# good feed is disabled. Lives here rather than in the adapter so `Settings`
+# can default to it without `core` importing `adapters`.
+DEFAULT_USER_AGENT = "news-radar/1.0"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -20,6 +31,16 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
 
 
 @dataclass(frozen=True)
@@ -38,6 +59,17 @@ class Settings:
     service_interval_seconds: int
     feed_poll_interval_seconds: int = 1800
     feed_disable_after_failures: int = 10
+    # Per-host politeness. max_concurrent_crawls bounds total browser load;
+    # these bound how hard any single publisher is hit, which is what actually
+    # trips rate limits and bot filters.
+    max_crawls_per_host: int = 1
+    crawl_delay_per_host_seconds: float = 1.0
+    # Minimum rendered length for a feed's own article body to be stored
+    # instead of crawling the page. 0 disables the substitution entirely.
+    feed_content_min_chars: int = MIN_FULL_CONTENT_CHARS
+    # How we identify to feed hosts. Set this to something with your own
+    # contact URL if a publisher needs to reach you about crawl volume.
+    feed_user_agent: str = DEFAULT_USER_AGENT
     embed_batch_size: int = 32
     # A run checkpoints (and so heartbeats) after every chunk, so this measures
     # silence between chunks rather than total run length.
@@ -73,6 +105,16 @@ class Settings:
             service_interval_seconds=_env_int("SERVICE_INTERVAL_SECONDS", 1800),
             feed_poll_interval_seconds=_env_int("FEED_POLL_INTERVAL_SECONDS", 1800),
             feed_disable_after_failures=_env_int("FEED_DISABLE_AFTER_FAILURES", 10),
+            max_crawls_per_host=_env_int("MAX_CRAWLS_PER_HOST", 1),
+            crawl_delay_per_host_seconds=_env_float(
+                "CRAWL_DELAY_PER_HOST_SECONDS", 1.0
+            ),
+            feed_content_min_chars=_env_int(
+                "FEED_CONTENT_MIN_CHARS", MIN_FULL_CONTENT_CHARS
+            ),
+            feed_user_agent=(
+                os.getenv("FEED_USER_AGENT", "").strip() or DEFAULT_USER_AGENT
+            ),
             embed_batch_size=_env_int("EMBED_BATCH_SIZE", 32),
             worker_heartbeat_timeout_seconds=_env_int(
                 "WORKER_HEARTBEAT_TIMEOUT_SECONDS", 900

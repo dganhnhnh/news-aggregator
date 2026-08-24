@@ -5,33 +5,24 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import re
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
+# Canonicalization lives in core.urls with the rest of the URL rules; it stays
+# importable from here because callers across the codebase already do so.
+from core.urls import normalize_url, source_slug
 from models.search_and_crawl_models import CrawlResult
 from models.storage_models import RawArticle
 
 
-_TRACKING_PARAMETERS = {
-    "fbclid",
-    "gclid",
-    "mc_cid",
-    "mc_eid",
-    "igshid",
-    "ref",
-    "ref_src",
-    "_hsenc",
-}
-_SOURCE_HOST_PREFIXES = ("www.", "m.", "amp.")
-# Only m./amp. are collapsed at the URL level; www. is left alone since it is
-# not reliably an alias of the bare host the way AMP/mobile mirrors are.
-_AMBIGUOUS_HOST_PREFIXES = ("m.", "amp.")
-_AMP_SUFFIX_RE = re.compile(r"(?:/amp/?|\.amp)$", re.IGNORECASE)
-
-
-def _strip_trailing_slash(path: str) -> str:
-    if path == "/" or not path.endswith("/"):
-        return path
-    return path.rstrip("/") or "/"
+__all__ = [
+    "build_excerpt",
+    "content_hash",
+    "normalize_content",
+    "normalize_url",
+    "prepare_articles",
+    "source_slug",
+    "to_raw_article",
+]
 
 
 def build_excerpt(raw: str, limit: int = 280) -> str:
@@ -42,53 +33,6 @@ def build_excerpt(raw: str, limit: int = 280) -> str:
         return text
     truncated = text[:limit].rsplit(" ", 1)[0]
     return truncated + "…"
-
-
-def normalize_url(url: str) -> str:
-    """Conservatively canonicalize a fetched URL for deduplication."""
-    parts = urlsplit(url.strip())
-    scheme = parts.scheme.lower()
-    hostname = (parts.hostname or "").lower()
-    if not scheme or not hostname:
-        raise ValueError(f"Invalid article URL: {url!r}")
-
-    for prefix in _AMBIGUOUS_HOST_PREFIXES:
-        if hostname.startswith(prefix):
-            hostname = hostname[len(prefix):]
-            break
-
-    port = parts.port
-    if port is not None and not (
-        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
-    ):
-        hostname = f"{hostname}:{port}"
-    if parts.username or parts.password:
-        credentials = parts.username or ""
-        if parts.password:
-            credentials += f":{parts.password}"
-        hostname = f"{credentials}@{hostname}"
-
-    path = _AMP_SUFFIX_RE.sub("", parts.path or "/") or "/"
-    path = _strip_trailing_slash(path)
-
-    query_items = sorted(
-        (key, value)
-        for key, value in parse_qsl(parts.query, keep_blank_values=True)
-        if key.lower() not in _TRACKING_PARAMETERS
-        and not key.lower().startswith("utm_")
-    )
-    return urlunsplit((scheme, hostname, path, urlencode(query_items), ""))
-
-
-def source_slug(normalized_url: str) -> str:
-    """Return the stable publisher hostname used to identify an article source."""
-    hostname = (urlsplit(normalized_url).hostname or "").lower()
-    if not hostname:
-        raise ValueError(f"Invalid article URL: {normalized_url!r}")
-    for prefix in _SOURCE_HOST_PREFIXES:
-        if hostname.startswith(prefix):
-            return hostname.removeprefix(prefix)
-    return hostname
 
 
 def normalize_content(content: str) -> str:

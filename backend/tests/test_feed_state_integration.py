@@ -340,6 +340,192 @@ async def _test_disable_feed_and_enable_feed_toggle_disabled_state() -> None:
         await storage.close()
 
 
+def test_permanent_feed_failure_disables_immediately_and_dead_letters_the_row() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_permanent_feed_failure_disables_immediately())
+
+
+async def _test_permanent_feed_failure_disables_immediately() -> None:
+    feed_url = "https://feed-state.integration.example/gone.xml"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        await _delete_feeds(engine, [feed_url])
+        await _delete_failures(engine, [feed_url])
+        await storage.seed_feeds([FeedSeed(feed_url=feed_url, source_label="Gone")])
+
+        outcome = await storage.record_feed_failure(
+            feed_url,
+            error_message="Client error '404 Not Found'",
+            disable_after=10,
+            permanent=True,
+        )
+        # One failure, not ten: a 404 is a verdict, not a streak.
+        assert outcome.consecutive_failures == 1
+        assert outcome.disabled is True
+
+        await storage.apply_batch(
+            [],
+            [
+                CrawlFailureOccurrence(
+                    failure_kind="feed",
+                    url=feed_url,
+                    error_type="HTTPStatusError",
+                    error_message="Client error '404 Not Found'",
+                    permanent=True,
+                )
+            ],
+            [],
+            received=0,
+            rejected=0,
+        )
+
+        async with engine.connect() as connection:
+            failure = (
+                await connection.execute(
+                    select(
+                        crawl_failures.c.attempt_count,
+                        crawl_failures.c.dead_lettered_at,
+                    ).where(crawl_failures.c.url == feed_url)
+                )
+            ).one()
+        assert failure.attempt_count == 1
+        assert failure.dead_lettered_at is not None
+        assert await storage.due_feeds(limit=0, ignore_schedule=True) is not None
+    finally:
+        if ready:
+            await _delete_feeds(engine, [feed_url])
+            await _delete_failures(engine, [feed_url])
+        await engine.dispose()
+        await storage.close()
+
+
+def test_record_feed_poll_stores_the_resolved_url_for_later_polls() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_record_feed_poll_stores_the_resolved_url())
+
+
+async def _test_record_feed_poll_stores_the_resolved_url() -> None:
+    feed_url = "https://feed-state.integration.example/moved.xml"
+    moved_to = "https://feed-state.integration.example/new/moved.xml"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        await _delete_feeds(engine, [feed_url])
+        await storage.seed_feeds([FeedSeed(feed_url=feed_url, source_label="Moved")])
+
+        await storage.record_feed_poll(
+            feed_url,
+            next_poll_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            resolved_url=moved_to,
+        )
+
+        target = next(
+            t
+            for t in await storage.due_feeds(limit=0, feed_urls=[feed_url])
+            if t.feed_url == feed_url
+        )
+        assert target.resolved_url == moved_to
+        # Identity still matches the feed file, so re-seeding cannot duplicate it.
+        assert target.fetch_url == moved_to
+
+        # A later poll that reports no redirect leaves the recorded home alone.
+        await storage.record_feed_poll(
+            feed_url, next_poll_at=datetime.now(timezone.utc) - timedelta(minutes=1)
+        )
+        target = next(
+            t
+            for t in await storage.due_feeds(limit=0, feed_urls=[feed_url])
+            if t.feed_url == feed_url
+        )
+        assert target.resolved_url == moved_to
+    finally:
+        if ready:
+            await _delete_feeds(engine, [feed_url])
+        await engine.dispose()
+        await storage.close()
+
+
+def test_purge_stale_feed_failures_drops_rows_a_later_success_disproved() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_purge_stale_feed_failures())
+
+
+async def _test_purge_stale_feed_failures() -> None:
+    recovered = "https://feed-state.integration.example/recovered.xml"
+    still_broken = "https://feed-state.integration.example/still-broken.xml"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    ready = False
+    urls = [recovered, still_broken]
+    try:
+        await storage.check_ready()
+        ready = True
+        await _delete_feeds(engine, urls)
+        await _delete_failures(engine, urls)
+        await storage.seed_feeds(
+            [FeedSeed(feed_url=url, source_label="Feed") for url in urls]
+        )
+        await storage.apply_batch(
+            [],
+            [
+                CrawlFailureOccurrence(
+                    failure_kind="feed",
+                    url=url,
+                    error_type="ConnectError",
+                    error_message="boom",
+                )
+                for url in urls
+            ],
+            [],
+            received=0,
+            rejected=0,
+        )
+
+        # Only one of the two has since been polled successfully.
+        await storage.record_feed_poll(
+            recovered, next_poll_at=datetime.now(timezone.utc) + timedelta(minutes=30)
+        )
+
+        # The count covers whatever else the database had to reconcile, so
+        # assert on this test's own rows rather than on the total.
+        assert await storage.purge_stale_feed_failures() >= 1
+
+        async with engine.connect() as connection:
+            remaining = [
+                row.url
+                for row in await connection.execute(
+                    select(crawl_failures.c.url).where(crawl_failures.c.url.in_(urls))
+                )
+            ]
+        assert remaining == [still_broken]
+
+        # Nothing left to reconcile on a second pass.
+        assert await storage.purge_stale_feed_failures() == 0
+    finally:
+        if ready:
+            await _delete_feeds(engine, urls)
+            await _delete_failures(engine, urls)
+        await engine.dispose()
+        await storage.close()
+
+
 async def _delete_feeds(engine, urls: list[str]) -> None:
     async with engine.begin() as connection:
         await connection.execute(delete(feed_state).where(feed_state.c.feed_url.in_(urls)))
+
+
+async def _delete_failures(engine, urls: list[str]) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(
+            delete(crawl_failures).where(crawl_failures.c.url.in_(urls))
+        )

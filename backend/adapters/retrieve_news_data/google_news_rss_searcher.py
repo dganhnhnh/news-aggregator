@@ -28,7 +28,15 @@ import feedparser
 import httpx
 from googlenewsdecoder import new_decoderv1
 
+from core.html_content import (
+    FEED_CONTENT_KEY,
+    MIN_FULL_CONTENT_CHARS,
+    html_to_markdown,
+    is_full_article,
+)
+from core.config import DEFAULT_USER_AGENT
 from core.logger import get_logger
+from core.urls import UnusableUrl, is_probably_article, resolve_crawl_url
 from models.discovery_models import DiscoveredEntry, FeedPoll
 from models.search_and_crawl_models import (
     CrawlMetadata,
@@ -162,20 +170,66 @@ def _decode_google_news_url(goog_url: str) -> str:
 # ─── RSS parsing helpers ───────────────────────────────────────────────────────
 
 
-def _parse_rss_entry(entry: dict) -> dict:
+def _select_entry_link(entry: dict, base_url: str) -> str:
+    """Pick an article link from a feedparser entry and make it absolute.
+
+    Two failures this exists to prevent, both seen in production:
+      * relative or protocol-relative hrefs (`/2020/06/22/post.html`,
+        `//host/path`) reaching the crawler verbatim, because
+        ``feedparser.parse`` is handed a string and so has no base URI;
+      * podcast enclosures being crawled as if they were articles.
+    """
+    candidates: list[tuple[str, str]] = []
+    if entry.get("link"):
+        candidates.append((entry["link"], ""))
+    for link in entry.get("links") or []:
+        href = link.get("href", "")
+        if not href:
+            continue
+        if link.get("rel") == "enclosure":
+            continue
+        candidates.append((href, link.get("type", "") or ""))
+
+    for href, link_type in candidates:
+        # Strip the #ref=crwt... fragment that Google adds to every redirect URL
+        href = href.split("#", 1)[0].strip()
+        if not href or not is_probably_article(href, link_type):
+            continue
+        try:
+            return resolve_crawl_url(href, base_url=base_url)
+        except UnusableUrl:
+            continue
+    return ""
+
+
+def _select_entry_content(entry: dict) -> str:
+    """Return the entry's full article HTML, or "" if it only carries a teaser.
+
+    Only `content` is considered — RSS `content:encoded` and Atom `<content>`
+    both land there. `summary`/`description` is deliberately ignored: it is a
+    teaser by convention, and storing it would silently replace articles with
+    their own blurbs.
+    """
+    bodies = entry.get("content") or []
+    if isinstance(bodies, dict):  # some feeds expose a single mapping
+        bodies = [bodies]
+    values = [
+        (body.get("value") or "")
+        for body in bodies
+        if isinstance(body, dict)
+        and (body.get("type") or "text/html") not in ("text/plain",)
+    ]
+    return max(values, key=len, default="")
+
+
+def _parse_rss_entry(entry: dict, base_url: str = "") -> dict:
     """
     Extract a flat dict from a feedparser entry dict.
 
-    Handles both RSS 2.0 and Atom formats transparently.
+    Handles both RSS 2.0 and Atom formats transparently. ``base_url`` is the
+    URL the feed was actually fetched from, used to resolve relative links.
     """
-    raw_link: str = (
-        entry.get("link") or
-        (entry.get("links", [{}])[0].get("href", "") if entry.get("links") else "") or
-        ""
-    )
-
-    # Strip the #ref=crwt... fragment that Google adds to every redirect URL
-    raw_link = raw_link.split("#", 1)[0]
+    raw_link = _select_entry_link(entry, base_url)
 
     raw_title: str = (entry.get("title") or "").strip()
 
@@ -209,6 +263,7 @@ def _parse_rss_entry(entry: dict) -> dict:
         "feed_entry_url": raw_link,
         "source": raw_source,
         "published_date": pub_date,
+        "content_html": _select_entry_content(entry),
     }
 
 
@@ -221,6 +276,51 @@ class FeedFetch(NamedTuple):
     etag: str | None
     last_modified: str | None
     not_modified: bool
+    # Final location when every hop of the redirect chain was permanent;
+    # None when the feed answered directly or moved only temporarily.
+    permanent_url: str | None = None
+    entries_skipped_non_article: int = 0
+
+
+# Status codes that make a feed URL permanently wrong: retrying cannot fix a
+# feed that is gone (404/410) or one that demands credentials we do not have
+# (401). 403 is deliberately absent — it is usually a bot filter, not a
+# permanent verdict on the URL.
+_PERMANENT_FEED_STATUSES = frozenset({401, 404, 410})
+_PERMANENT_REDIRECT_STATUSES = frozenset({301, 308})
+
+
+def _is_permanent_feed_error(exc: BaseException) -> bool:
+    """Whether a feed fetch failed in a way no amount of retrying will fix."""
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code in _PERMANENT_FEED_STATUSES
+    )
+
+
+def _permanent_redirect_url(response, requested_url: str) -> str | None:
+    """The final URL when the whole redirect chain was permanent."""
+    history = response.history
+    if not history:
+        return None
+    if any(hop.status_code not in _PERMANENT_REDIRECT_STATUSES for hop in history):
+        return None
+    final_url = str(response.url)
+    return final_url if final_url != requested_url else None
+
+
+def _redirect_from_failure(exc: BaseException, requested_url: str) -> str | None:
+    """The permanent redirect a failed fetch still proves.
+
+    A 301 followed by a 403 tells us two independent things: where the feed
+    now lives, and that we were turned away there. Discarding the first
+    because of the second means re-learning the redirect on every poll, so
+    the stale URL never leaves the rotation.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    return _permanent_redirect_url(response, requested_url)
 
 
 async def _fetch_rss(
@@ -246,7 +346,14 @@ async def _fetch_rss(
     try:
         response = await client.get(url, timeout=20.0, headers=headers or None)
         if response.status_code == 304:
-            return FeedFetch([], "", etag, last_modified, True)
+            return FeedFetch(
+                [],
+                "",
+                etag,
+                last_modified,
+                True,
+                _permanent_redirect_url(response, url),
+            )
         response.raise_for_status()
     except httpx.HTTPError as exc:
         logger.warning("[GoogleNews RSS] failed to fetch %s: %s", url, exc)
@@ -258,13 +365,27 @@ async def _fetch_rss(
     if feed.bozo and not feed.entries:
         raise ValueError(f"Malformed RSS/Atom feed: {feed.bozo_exception}")
 
-    entries = [_parse_rss_entry(e) for e in feed.entries]
+    # Relative hrefs resolve against where the feed actually came from, which
+    # is the post-redirect URL rather than the one we asked for.
+    base_url = str(response.url)
+    parsed = [_parse_rss_entry(e, base_url) for e in feed.entries]
+    entries = [entry for entry in parsed if entry["feed_entry_url"]]
+    skipped = len(parsed) - len(entries)
+    if skipped:
+        logger.info(
+            "[GoogleNews RSS] %s — skipped %d/%d entries with no article link",
+            url,
+            skipped,
+            len(parsed),
+        )
     return FeedFetch(
         entries,
         feed_title,
         response.headers.get("ETag"),
         response.headers.get("Last-Modified"),
         False,
+        _permanent_redirect_url(response, url),
+        skipped,
     )
 
 
@@ -304,6 +425,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         crawl_provider: CrawlerProvider | None = None,
         *,
         tsv_path: Optional[str | Path] = None,
+        feed_content_min_chars: int = MIN_FULL_CONTENT_CHARS,
+        max_crawls_per_host: int = 1,
+        crawl_delay_per_host: float = 1.0,
+        user_agent: str = DEFAULT_USER_AGENT,
     ) -> None:
         if feed_path is not None and tsv_path is not None:
             raise ValueError("Pass only one of feed_path or tsv_path")
@@ -315,6 +440,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         self._max_concurrent_feeds = max_concurrent_feeds
         self._crawl_batch_size = crawl_batch_size
         self._crawl_provider = crawl_provider
+        self._feed_content_min_chars = feed_content_min_chars
+        self._max_crawls_per_host = max_crawls_per_host
+        self._crawl_delay_per_host = crawl_delay_per_host
+        self._user_agent = user_agent or DEFAULT_USER_AGENT
         self._feed_offset = 0
         self._last_feed_offset = 0
         self._logger = get_logger(__name__)
@@ -368,7 +497,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 fetched = await asyncio.gather(
                     *[
                         _fetch_rss(
-                            target.feed_url,
+                            target.fetch_url,
                             client,
                             etag=target.etag,
                             last_modified=target.last_modified,
@@ -388,6 +517,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                                 source=target.source_label,
                                 error_type=type(outcome).__name__,
                                 error_message=str(outcome),
+                                permanent=_is_permanent_feed_error(outcome),
+                            ),
+                            resolved_url=_redirect_from_failure(
+                                outcome, target.fetch_url
                             ),
                         )
                         continue
@@ -399,6 +532,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                             status="not_modified",
                             etag=fetch.etag,
                             last_modified=fetch.last_modified,
+                            resolved_url=fetch.permanent_url,
                         )
                         continue
 
@@ -411,6 +545,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                             title=entry["title"],
                             source=entry["source"],
                             published_at=entry["published_date"],
+                            content_html=entry.get("content_html", ""),
                         )
                         for entry in fetch.entries
                     ]
@@ -421,6 +556,8 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                         feed_title=fetch.feed_title,
                         etag=fetch.etag,
                         last_modified=fetch.last_modified,
+                        resolved_url=fetch.permanent_url,
+                        entries_skipped_non_article=fetch.entries_skipped_non_article,
                     )
         finally:
             if own_client:
@@ -435,6 +572,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                     "title": entry.title,
                     "source": entry.source,
                     "published_date": entry.published_at,
+                    "content_html": entry.content_html,
                 },
                 entry.query_label,
                 entry.feed_title,
@@ -443,16 +581,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         ]
         return await self._crawl_job_batch(jobs)
 
-    @staticmethod
-    def _build_default_client() -> httpx.AsyncClient:
+    def _build_default_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             follow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (compatible; GoogleNewsBot/1.0; "
-                    "+https://news.google.com)"
-                )
-            },
+            headers={"User-Agent": self._user_agent},
         )
 
     async def iter_batches(
@@ -468,6 +600,13 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         CrawlWorker (via RssDiscovery) share one fetch/crawl implementation.
         """
         configured = sources if sources is not None else self._load_queries()
+        # Naming the feed file when the caller passed URLs directly reads as
+        # if the arguments were ignored; say where the feeds actually came from.
+        origin = (
+            f"{len(configured)} explicit feed URL(s)"
+            if sources is not None
+            else str(self._feed_path)
+        )
         queries = self._select_sources(
             configured,
             max_feeds=max_feeds,
@@ -475,16 +614,14 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             advance_offset=sources is None,
         )
         if not queries:
-            self._logger.warning(
-                "[GoogleNews RSS] No RSS URLs found in %s", self._feed_path
-            )
+            self._logger.warning("[GoogleNews RSS] No RSS URLs found in %s", origin)
             return
 
         self._logger.info(
             "[GoogleNews RSS] Processing %d/%d RSS feeds from %s at offset %d",
             len(queries),
             len(configured),
-            self._feed_path,
+            origin,
             self._last_feed_offset,
         )
 
@@ -571,7 +708,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         if self._crawl_provider is None:
             from adapters.retrieve_news_data.crawler import Crawl4aiProvider
 
-            self._crawl_provider = Crawl4aiProvider()
+            self._crawl_provider = Crawl4aiProvider(
+                max_per_host=self._max_crawls_per_host,
+                per_host_delay_seconds=self._crawl_delay_per_host,
+            )
         return self._crawl_provider
 
     async def _crawl_job_batch(
@@ -596,7 +736,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             zip(jobs, decoded_urls, strict=True)
         ):
             feed_entry_url = job.entry.get("feed_entry_url", "")
-            if not real_url:
+            from_feed = self._result_from_feed_content(job, real_url)
+            if from_feed is not None:
+                outcomes[index] = from_feed
+            elif not real_url:
                 outcomes[index] = CrawlResult(
                     url=feed_entry_url,
                     markdown="",
@@ -647,6 +790,30 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             enriched = self._enrich_result(result, job, real_url)
             self._add_article_outcome(batch, job, enriched)
         return batch
+
+    def _result_from_feed_content(
+        self,
+        job: _ArticleJob,
+        real_url: str,
+    ) -> CrawlResult | None:
+        """Render the feed's own article body, or None to crawl the page.
+
+        The URL recorded is the entry link rather than a final redirect target,
+        since nothing was fetched to observe one. For feeds that ship full
+        content this is the canonical article URL anyway.
+        """
+        if self._feed_content_min_chars <= 0:
+            return None
+        markdown = html_to_markdown(job.entry.get("content_html", ""))
+        if not is_full_article(markdown, min_chars=self._feed_content_min_chars):
+            return None
+
+        url = real_url or job.entry.get("feed_entry_url", "")
+        if not url:
+            return None
+        result = CrawlResult(url=url, markdown=markdown, success=True)
+        result.context[FEED_CONTENT_KEY] = True
+        return result
 
     def _enrich_result(
         self,

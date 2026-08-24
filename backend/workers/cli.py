@@ -122,6 +122,33 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Maximum crawled articles retained before each DB checkpoint",
     )
     crawl.add_argument(
+        "--max-crawls-per-host",
+        type=int,
+        default=settings.max_crawls_per_host,
+        help="Concurrent crawls allowed against any single host",
+    )
+    crawl.add_argument(
+        "--crawl-delay-per-host",
+        type=float,
+        metavar="SECONDS",
+        default=settings.crawl_delay_per_host_seconds,
+        help="Pause between consecutive crawls of the same host",
+    )
+    crawl.add_argument(
+        "--feed-content-min-chars",
+        type=int,
+        default=settings.feed_content_min_chars,
+        help=(
+            "Store the feed's own article body when it renders to at least "
+            "this many characters instead of crawling the page; 0 disables it"
+        ),
+    )
+    crawl.add_argument(
+        "--user-agent",
+        default=settings.feed_user_agent,
+        help="User-Agent sent when fetching feeds",
+    )
+    crawl.add_argument(
         "--poll-interval",
         type=int,
         metavar="SECONDS",
@@ -235,6 +262,12 @@ def _validate_crawl(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         parser.error("--max-concurrent-crawls must be positive")
     if args.crawl_batch_size <= 0:
         parser.error("--crawl-batch-size must be positive")
+    if args.max_crawls_per_host <= 0:
+        parser.error("--max-crawls-per-host must be positive")
+    if args.crawl_delay_per_host < 0:
+        parser.error("--crawl-delay-per-host must not be negative")
+    if args.feed_content_min_chars < 0:
+        parser.error("--feed-content-min-chars must not be negative")
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be positive")
     if args.disable_after_failures <= 0:

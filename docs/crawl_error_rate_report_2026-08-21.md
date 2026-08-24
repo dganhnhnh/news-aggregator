@@ -115,3 +115,54 @@ recent feed failures.
 4. Review the retry schedule before the next worker cycle. Every unresolved
    row is currently due, so the queue will attempt 581 items unless bounded by
    `MAX_RETRIES_PER_RUN`.
+
+## Remediation status — 2026-08-24
+
+Clusters 1–5 and 7 of the ranked plan are closed. Clusters 6 and 8 (a
+write-time error taxonomy and the anti-bot/paywall sources) are untouched.
+
+| # | Cluster | Change |
+| --- | --- | --- |
+| 1 | `crawler_runtime_error`, `ERR_NAME_NOT_RESOLVED` (~82) | Entry links are resolved against the feed's final URL with `urljoin`, so relative links no longer reach the crawler verbatim and hostnames are no longer concatenated with the path. |
+| 2 | `anti_bot:structural_minimal_content` (~40) | Enclosure links, media content types and media file extensions are rejected when choosing an entry's link; an episode page still wins over its audio file. Skips are counted as `entries_skipped_non_article`. |
+| 3 | `http_redirect:301/302` (39) | Permanent (301/308) redirect targets are stored in `feed_state.resolved_url` and polled thereafter, while `feed_url` stays the identity from the OPML/TSV so re-seeding cannot resurrect the old URL. Temporary redirects are deliberately not recorded. Stale rows are reconciled by `purge_stale_feed_failures()` at the start of each run. |
+| 4 | `http_client:404`/`401` (34) | 401/404/410 on a feed are flagged `permanent`: the source is disabled and the failure dead-lettered on first occurrence instead of burning five attempts. 403 is excluded, since it is commonly transient anti-bot behaviour. This is self-healing — no manual feed-list curation is needed. |
+| 5 | Medium/`content:encoded`, per-host load | An entry's own `content:encoded`/`<content>` body is rendered to Markdown and stored directly when it reaches `FEED_CONTENT_MIN_CHARS` (1200), so the page is never fetched; `summary`/`description` is deliberately excluded because it is a teaser by convention. Crawls are partitioned into per-host waves (`MAX_CRAWLS_PER_HOST`, default 1) with `CRAWL_DELAY_PER_HOST_SECONDS` (default 1.0) between them; batches of distinct hosts still run in a single wave. Counted as `articles_from_feed_content` / `from_feed=` in the run log. |
+| 7 | `ERR_CONNECTION_CLOSED/RESET/ABORTED/NETWORK_CHANGED`, `readtimeout`, `http_server:522` (~21) | **No code change, by decision.** These are genuinely transient: the origin or the network dropped a connection that may well succeed later. Exponential backoff with full jitter (capped at one day) already spaces the retries out, and `MAX_FAILURE_ATTEMPTS = 5` dead-letters anything that turns out to be permanent. Adding a special case would either retry sooner than the origin can cope with or discard recoverable articles. Revisit only if a single host dominates this cluster, which is a throttling problem (cluster 5), not a retry-policy one. |
+
+Existing queue rows created by the cluster 1 and 2 bugs are not repaired by the
+code fix — the URLs stored in them are unfetchable. Clear them once with
+`docs/crawl_failure_cleanup_2026-08-24.sql` (56 relative links, 40 media
+enclosures, 20 mangled `tech.finn.no<year>` hosts); the underlying articles are
+re-queued with correct URLs on the next poll.
+
+### Follow-up — 2026-08-24, self-inflicted 403s
+
+Investigating why `http://rss.slashdot.org/Slashdot/slashdotMain` still failed
+after the cluster 3 fix turned up a separate cause, now also fixed:
+
+- **The User-Agent was impersonating a Google crawler.** The default HTTP
+  client announced `Mozilla/5.0 (compatible; GoogleNewsBot/1.0;
+  +https://news.google.com)`. Bot filters answer a Googlebot-shaped agent from
+  a non-Google IP with 403. Measured on the same URL: that agent gets 403,
+  `news-radar/1.0` gets 200. Across a 20-feed sample from
+  `data/engineering_blogs.opml` the honest agent is not worse anywhere. Since
+  403 is (correctly) treated as transient, these failures were counting towards
+  `--disable-after-failures` and would eventually have disabled working feeds.
+  The default is now `news-radar/1.0` in `core.config.DEFAULT_USER_AGENT`,
+  overridable via `FEED_USER_AGENT` or `--user-agent`. No feed had been
+  disabled yet, so no repair was needed.
+- **A redirect proved by a failed poll was discarded.** `_permanent_redirect_url`
+  ran only on the 304 and success paths, so a 301→403 chain re-learned the same
+  hop on every poll. The redirect is now read off the error response and
+  persisted by `record_feed_failure(resolved_url=...)`, which already updates
+  that row. Temporary redirects and connection failures still record nothing.
+- **The run log named the feed file even for explicitly passed URLs**, which
+  read as though the argument had been ignored. It now reports
+  `N explicit feed URL(s)`.
+
+One open question remains from the original investigation: resolved failures
+were leaking rather than being deleted (17 feed, 4 article). The composite
+`DELETE ... IN ((kind, url))` was verified to compile correctly, so the cause is
+still unexplained. `purge_stale_feed_failures()` reconciles the feed half as a
+side effect but is not a diagnosis.

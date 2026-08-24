@@ -57,6 +57,7 @@ Các lệnh không có `--persist` chỉ emit JSON Lines ra stdout:
 ```bash
 uv run news-pipeline search "gold market news" --max-results 5
 uv run news-pipeline crawl https://example.com
+uv run news-pipeline rss https://example.com/feed.xml --max-articles-per-feed 5
 uv run news-pipeline rss --feed-path ./data/engineering_blogs.opml --max-feeds 5 --max-articles-per-feed 1
 uv run news-pipeline rss --tsv-path ./queries.tsv --max-articles-per-feed 5
 ```
@@ -70,6 +71,9 @@ uv run news-pipeline rss --feed-path ./data/engineering_blogs.opml --max-feeds 5
 ```
 
 `search` của Tavily không hỗ trợ `--persist`.
+
+`news-pipeline rss` cũng nhận trực tiếp một hoặc nhiều URL RSS/Atom ở vị trí
+đối số. URL trực tiếp và `--feed-path`/`--tsv-path` loại trừ lẫn nhau.
 
 ## Chạy worker
 

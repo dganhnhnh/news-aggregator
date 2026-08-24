@@ -7,6 +7,7 @@ from dataclasses import replace
 
 from adapters.retrieve_news_data.google_news_rss_searcher import RssFeedSearcher
 from adapters.storage.postgres import PostgresRawStorage
+from core.urls import URL_ERROR_CONTEXT_KEY
 from models.search_and_crawl_models import CrawlMetadata, CrawlResult
 from models.storage_models import (
     CrawlBatch,
@@ -16,6 +17,11 @@ from models.storage_models import (
     StorageWriteSummary,
 )
 from services.raw_storage import prepare_articles
+
+
+def _url_rejection_reason(result: CrawlResult) -> str:
+    """The reason the crawler refused the URL, or "" if it actually tried."""
+    return result.context.get(URL_ERROR_CONTEXT_KEY, "")
 
 
 def direct_crawl_batch(results: list[CrawlResult]) -> CrawlBatch:
@@ -32,12 +38,14 @@ def direct_crawl_batch(results: list[CrawlResult]) -> CrawlBatch:
                 if url
             )
         else:
+            rejection = _url_rejection_reason(result)
             batch.failures.append(
                 CrawlFailureOccurrence(
                     failure_kind="article",
                     url=result.url,
-                    error_type="CrawlError",
+                    error_type=f"UnusableUrl:{rejection}" if rejection else "CrawlError",
                     error_message=result.error_message or "Unknown crawl failure",
+                    permanent=bool(rejection),
                 )
             )
     return batch
@@ -152,6 +160,7 @@ async def iter_retry_batches(
                         FailureTarget(failure_kind="article", url=failure.url)
                     )
                 else:
+                    rejection = _url_rejection_reason(outcome)
                     batch.failures.append(
                         CrawlFailureOccurrence(
                             failure_kind="article",
@@ -159,10 +168,17 @@ async def iter_retry_batches(
                             source=failure.source,
                             title=failure.title,
                             published_at=failure.published_at,
-                            error_type="CrawlError",
+                            error_type=(
+                                f"UnusableUrl:{rejection}"
+                                if rejection
+                                else "CrawlError"
+                            ),
                             error_message=(
                                 outcome.error_message or "Unknown crawl failure"
                             ),
+                            # A queued row whose URL is malformed can never
+                            # succeed; dead-letter it instead of re-crawling.
+                            permanent=bool(rejection),
                         )
                     )
             yield batch, len(failures), succeeded

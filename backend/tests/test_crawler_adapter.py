@@ -1,8 +1,11 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from adapters.retrieve_news_data import crawler as crawler_module
 from adapters.retrieve_news_data.crawler import Crawl4aiProvider, _build_crawl_result
+from core.urls import URL_ERROR_CONTEXT_KEY
 
 
 def test_build_result_normalizes_crawl4ai_markdown_object() -> None:
@@ -91,9 +94,10 @@ def test_batch_uses_one_browser_and_bounded_dispatcher(monkeypatch) -> None:
             ]
 
     monkeypatch.setattr(crawler_module, "AsyncWebCrawler", FakeCrawler)
+    # Distinct hosts, so per-host throttling leaves this a single wave.
     results = asyncio.run(
         Crawl4aiProvider().crawl_batch(
-            ["https://example.com/1", "https://example.com/2"],
+            ["https://one.example.com/1", "https://two.example.com/2"],
             max_concurrency=2,
         )
     )
@@ -104,8 +108,214 @@ def test_batch_uses_one_browser_and_bounded_dispatcher(monkeypatch) -> None:
         "entered",
         (
             "batch",
-            ["https://example.com/1", "https://example.com/2"],
+            ["https://one.example.com/1", "https://two.example.com/2"],
             2,
         ),
         "closed",
     ]
+
+
+def _fake_crawler(calls: list[object]):
+    """A crawl4ai stand-in that records every URL it is actually handed."""
+
+    class FakeCrawler:
+        def __init__(self, config) -> None:
+            calls.append("created")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def _page(self, url: str):
+            return SimpleNamespace(
+                url=url,
+                redirected_url=None,
+                markdown="# Article",
+                cleaned_html="",
+                metadata={},
+                success=True,
+                error_message="",
+            )
+
+        async def arun(self, *, url, config):
+            calls.append(("single", url))
+            return self._page(url)
+
+        async def arun_many(self, *, urls, config, dispatcher):
+            calls.append(("batch", list(urls)))
+            return [self._page(url) for url in urls]
+
+    return FakeCrawler
+
+
+@pytest.mark.parametrize(
+    "url", ["/2020/06/22/post.html", "//host/path", "mailto:editor@example.com", ""]
+)
+def test_unusable_url_never_reaches_the_browser(monkeypatch, url: str) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(crawler_module, "AsyncWebCrawler", _fake_crawler(calls))
+
+    result = asyncio.run(Crawl4aiProvider().crawl(url))
+
+    assert result.success is False
+    assert result.context[URL_ERROR_CONTEXT_KEY]
+    assert calls == []
+
+
+def test_batch_results_stay_aligned_when_some_urls_are_rejected(monkeypatch) -> None:
+    # Callers zip this list against their own input, so a rejected URL has to
+    # occupy its original slot rather than shrink or reorder the results.
+    calls: list[object] = []
+    monkeypatch.setattr(crawler_module, "AsyncWebCrawler", _fake_crawler(calls))
+
+    urls = [
+        "https://one.example.com/first",
+        "/relative/second",
+        "https://two.example.com/third",
+    ]
+    results = asyncio.run(
+        Crawl4aiProvider(per_host_delay_seconds=0).crawl_batch(urls)
+    )
+
+    assert [result.url for result in results] == [
+        "https://one.example.com/first",
+        "/relative/second",
+        "https://two.example.com/third",
+    ]
+    assert [result.success for result in results] == [True, False, True]
+    assert results[1].context[URL_ERROR_CONTEXT_KEY] == "relative"
+    assert calls == [
+        "created",
+        ("batch", ["https://one.example.com/first", "https://two.example.com/third"]),
+    ]
+
+
+def test_batch_of_only_unusable_urls_does_not_open_a_browser(monkeypatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(crawler_module, "AsyncWebCrawler", _fake_crawler(calls))
+
+    results = asyncio.run(Crawl4aiProvider().crawl_batch(["/a", "/b"]))
+
+    assert [result.success for result in results] == [False, False]
+    assert calls == []
+
+
+def test_missing_container_still_produces_a_result_per_url(monkeypatch) -> None:
+    class ShortCrawler:
+        def __init__(self, config) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def arun_many(self, *, urls, config, dispatcher):
+            return []
+
+    monkeypatch.setattr(crawler_module, "AsyncWebCrawler", ShortCrawler)
+
+    results = asyncio.run(
+        Crawl4aiProvider().crawl_batch(
+            ["https://example.com/1", "https://example.com/2"]
+        )
+    )
+
+    assert len(results) == 2
+    assert [result.url for result in results] == [
+        "https://example.com/1",
+        "https://example.com/2",
+    ]
+    assert all(result.success is False for result in results)
+
+
+def test_same_host_urls_are_split_into_waves(monkeypatch) -> None:
+    # Ten articles from one feed are usually ten URLs on one host, which is
+    # exactly what trips rate limits. Only one may be in flight at a time.
+    calls: list[object] = []
+    monkeypatch.setattr(crawler_module, "AsyncWebCrawler", _fake_crawler(calls))
+
+    urls = [f"https://blog.example.com/{index}" for index in range(3)]
+    results = asyncio.run(
+        Crawl4aiProvider(per_host_delay_seconds=0).crawl_batch(urls)
+    )
+
+    assert [result.url for result in results] == urls
+    assert [call for call in calls if call != "created"] == [
+        ("batch", ["https://blog.example.com/0"]),
+        ("batch", ["https://blog.example.com/1"]),
+        ("batch", ["https://blog.example.com/2"]),
+    ]
+
+
+def test_a_higher_per_host_cap_packs_more_into_each_wave(monkeypatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(crawler_module, "AsyncWebCrawler", _fake_crawler(calls))
+
+    urls = [f"https://blog.example.com/{index}" for index in range(3)]
+    asyncio.run(
+        Crawl4aiProvider(
+            max_per_host=2, per_host_delay_seconds=0
+        ).crawl_batch(urls)
+    )
+
+    assert [call for call in calls if call != "created"] == [
+        ("batch", ["https://blog.example.com/0", "https://blog.example.com/1"]),
+        ("batch", ["https://blog.example.com/2"]),
+    ]
+
+
+def test_distinct_hosts_still_run_in_one_wave(monkeypatch) -> None:
+    # Per-host throttling must not serialize a batch of unrelated publishers.
+    calls: list[object] = []
+    monkeypatch.setattr(crawler_module, "AsyncWebCrawler", _fake_crawler(calls))
+
+    urls = [f"https://host{index}.example.com/a" for index in range(5)]
+    asyncio.run(Crawl4aiProvider(per_host_delay_seconds=0).crawl_batch(urls))
+
+    assert [call for call in calls if call != "created"] == [("batch", urls)]
+
+
+def test_the_delay_falls_between_waves_of_the_same_host(monkeypatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(crawler_module, "AsyncWebCrawler", _fake_crawler(calls))
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(crawler_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(
+        Crawl4aiProvider(per_host_delay_seconds=2.5).crawl_batch(
+            [
+                "https://blog.example.com/a",
+                "https://blog.example.com/b",
+                "https://other.example.com/c",
+            ]
+        )
+    )
+
+    # Two waves means exactly one gap, not one sleep per URL.
+    assert slept == [2.5]
+
+
+def test_waves_keep_results_aligned_with_the_input(monkeypatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(crawler_module, "AsyncWebCrawler", _fake_crawler(calls))
+
+    urls = [
+        "https://blog.example.com/a",
+        "https://other.example.com/b",
+        "https://blog.example.com/c",
+        "/relative",
+    ]
+    results = asyncio.run(
+        Crawl4aiProvider(per_host_delay_seconds=0).crawl_batch(urls)
+    )
+
+    assert [result.url for result in results] == urls
+    assert [result.success for result in results] == [True, True, True, False]
