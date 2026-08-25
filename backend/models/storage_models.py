@@ -6,11 +6,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
-from core.html_content import FEED_CONTENT_KEY
+from core.html_content import FEED_CONTENT_KEY, FEED_SUMMARY_KEY
 from models.search_and_crawl_models import CrawlResult
 
 
 FailureKind = Literal["feed", "article"]
+# Where an article's stored `content` came from. 'feed_summary' means there is
+# no content at all — only the dek survived.
+ContentSource = Literal["feed_content", "crawl", "feed_summary"]
+# Which text the embedder was actually handed.
+TextKind = Literal["content", "feed_summary", "title"]
 RunStatus = Literal["running", "succeeded", "partial", "failed", "abandoned"]
 WorkerTrigger = Literal["scheduled", "manual", "backfill"]
 
@@ -56,6 +61,8 @@ class RawArticle:
     content_hash: bytes
     published_at: datetime | None
     crawled_at: datetime
+    feed_summary: str = ""
+    content_source: ContentSource = "crawl"
 
 
 @dataclass(frozen=True)
@@ -146,6 +153,15 @@ class CrawlBatch:
             if result.success and result.context.get(FEED_CONTENT_KEY)
         )
 
+    @property
+    def articles_summary_only(self) -> int:
+        """Failed crawls the feed's dek rescues into a storable row."""
+        return sum(
+            1
+            for result in self.results
+            if not result.success and result.context.get(FEED_SUMMARY_KEY)
+        )
+
 
 @dataclass
 class IngestRunStats:
@@ -169,6 +185,9 @@ class IngestRunStats:
     # Articles taken from the feed's own content:encoded body, so no page was
     # fetched for them at all.
     articles_from_feed_content: int = 0
+    # Articles whose page could not be crawled but whose feed dek was stored
+    # anyway, so they still carry text to search and embed.
+    articles_summary_only: int = 0
 
     def add_batch(self, batch: CrawlBatch, *, retry: bool = False) -> None:
         self.feeds_processed += batch.feeds_processed
@@ -176,6 +195,7 @@ class IngestRunStats:
         self.crawl_succeeded += batch.crawl_succeeded
         self.crawl_failed += batch.crawl_failed
         self.articles_from_feed_content += batch.articles_from_feed_content
+        self.articles_summary_only += batch.articles_summary_only
         if retry:
             self.retries_attempted += batch.crawl_succeeded + batch.crawl_failed
             self.retries_succeeded += batch.crawl_succeeded
@@ -192,12 +212,18 @@ class StorageWriteSummary:
 
 @dataclass(frozen=True)
 class EmbeddingCandidate:
-    """An article claimed for embedding, with its previous embedding state."""
+    """An article claimed for embedding, with its previous embedding state.
+
+    Carries every candidate text rather than a pre-picked one: choosing among
+    them is `services.text.article_text`'s job, so that embed and cluster
+    cannot drift into two different answers.
+    """
 
     article_id: int
     title: str | None
     content: str
-    content_hash: bytes
+    feed_summary: str
+    content_source: ContentSource
     existing_model: str | None
     existing_content_hash: bytes | None
 
@@ -209,6 +235,7 @@ class EmbeddingRecord:
     dim: int
     content_hash: bytes
     embedding: list[float]
+    text_kind: TextKind = "content"
 
 
 @dataclass

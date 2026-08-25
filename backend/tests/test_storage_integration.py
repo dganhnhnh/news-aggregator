@@ -14,6 +14,7 @@ from models.storage_models import (
     IngestRunStats,
     RawArticle,
 )
+from services.raw_storage import content_hash
 
 
 DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -303,6 +304,101 @@ async def _test_postgres_upsert_and_failure_state() -> None:
                     await connection.execute(
                         delete(worker_runs).where(worker_runs.c.id.in_(run_ids))
                     )
+                await connection.execute(
+                    delete(sources).where(sources.c.slug == source_slug)
+                )
+        await engine.dispose()
+        await storage.close()
+
+
+def test_a_summary_only_row_is_searchable_and_never_blanks_a_crawled_body() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_a_summary_only_row_is_searchable_and_never_blanks_a_crawled_body())
+
+
+async def _test_a_summary_only_row_is_searchable_and_never_blanks_a_crawled_body() -> None:
+    url = "https://integration.example/summary-only"
+    source_slug = "integration.example"
+    summary = "Hugging Face pushes for openness after the zestily unusual breach."
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    now = datetime.now(timezone.utc)
+    ready = False
+
+    def article(*, content: str, feed_summary: str, content_source: str) -> RawArticle:
+        return RawArticle(
+            url=url,
+            url_original=url,
+            title="Hugging Face breach",
+            source="Example",
+            lang="en",
+            content=content,
+            content_hash=content_hash(content),
+            feed_summary=feed_summary,
+            content_source=content_source,
+            published_at=now,
+            crawled_at=now,
+        )
+
+    try:
+        await storage.check_ready()
+        ready = True
+        async with engine.begin() as connection:
+            await connection.execute(delete(raw_articles).where(raw_articles.c.url == url))
+            await connection.execute(delete(sources).where(sources.c.slug == source_slug))
+
+        summary_only = article(
+            content="", feed_summary=summary, content_source="feed_summary"
+        )
+        assert (
+            await storage.apply_batch([summary_only], [], [], received=1, rejected=0)
+        ).written == 1
+
+        # A row with no content is still findable: search_tsv covers the dek.
+        found = await storage.feed_articles(
+            since=now - timedelta(days=1),
+            until=now + timedelta(days=1),
+            limit=50,
+            source_slugs=[source_slug],
+            query="zestily",
+        )
+        assert [item.url for item in found] == [url]
+        assert "zestily" in found[0].excerpt
+
+        crawled = article(
+            content="The real article body.",
+            feed_summary=summary,
+            content_source="crawl",
+        )
+        assert (
+            await storage.apply_batch([crawled], [], [], received=1, rejected=0)
+        ).written == 1
+
+        # The retry queue can hand back the same failure long after the crawl
+        # succeeded. Re-applying the summary-only row must be a no-op, not a
+        # regression that erases the body.
+        replayed = await storage.apply_batch(
+            [summary_only], [], [], received=1, rejected=0
+        )
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    select(raw_articles).where(raw_articles.c.url == url)
+                )
+            ).one()
+
+        assert replayed.unchanged == 1
+        assert row.content == "The real article body."
+        assert row.content_hash == content_hash("The real article body.")
+        assert row.content_source == "crawl"
+        assert row.feed_summary == summary
+    finally:
+        if ready:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    delete(raw_articles).where(raw_articles.c.url == url)
+                )
                 await connection.execute(
                     delete(sources).where(sources.c.slug == source_slug)
                 )

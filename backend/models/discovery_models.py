@@ -31,6 +31,11 @@ class DiscoveredEntry:
     # <content>). Carried through discovery so the crawl step can render it
     # instead of fetching a page the feed already gave us.
     content_html: str = ""
+    # The entry's <description>/<summary> HTML, kept separately from
+    # `content_html` even when the two are the same string: this one is stored
+    # for every article as a preview and as a fallback for embedding, and it is
+    # unrecoverable once the entry scrolls out of the feed.
+    summary_html: str = ""
 
 
 FeedPollStatus = Literal["fetched", "not_modified", "failed"]

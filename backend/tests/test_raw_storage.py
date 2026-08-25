@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from adapters.storage.postgres import retry_delay
+from core.html_content import FEED_CONTENT_KEY, FEED_SUMMARY_KEY
+from core.urls import URL_ERROR_CONTEXT_KEY
 from models.search_and_crawl_models import CrawlMetadata, CrawlResult
 from services.raw_storage import (
     content_hash,
@@ -11,6 +13,12 @@ from services.raw_storage import (
     normalize_url,
     prepare_articles,
     source_slug,
+)
+
+
+SUMMARY = (
+    "Hugging Face is using the breach to push for openness in AI development, "
+    "arguing that closed models make incidents like this harder to audit."
 )
 
 
@@ -174,6 +182,86 @@ def test_crawl_result_mapping_lang_is_none_when_undetected() -> None:
     article = crawl_result_to_article(result)
 
     assert article.lang is None
+
+
+def test_a_failed_crawl_still_becomes_a_row_when_the_feed_gave_a_dek() -> None:
+    # The point of the whole feed_summary column: an entry drops out of its
+    # feed after ~10-20 newer items, so a dek not stored on the first failure
+    # is gone for good, long before the retry queue gives up.
+    result = CrawlResult(
+        url="https://www.nytimes.com/article",
+        markdown="",
+        success=False,
+        error_message="HTTP 403 anti-bot",
+        metadata=CrawlMetadata(title="Hugging Face breached by rogue bots"),
+        context={FEED_SUMMARY_KEY: SUMMARY, "feed_title": "NYT Technology"},
+    )
+
+    article = crawl_result_to_article(result)
+
+    assert article.content == ""
+    assert article.feed_summary == SUMMARY
+    assert article.content_source == "feed_summary"
+    assert article.title == "Hugging Face breached by rogue bots"
+
+
+def test_a_successful_crawl_records_where_its_content_came_from() -> None:
+    crawled = crawl_result_to_article(
+        CrawlResult(url="https://example.com/a", markdown="# Body")
+    )
+    from_feed = crawl_result_to_article(
+        CrawlResult(
+            url="https://example.com/b",
+            markdown="# Body",
+            context={FEED_CONTENT_KEY: True},
+        )
+    )
+
+    assert crawled.content_source == "crawl"
+    assert from_feed.content_source == "feed_content"
+
+
+def test_a_failed_crawl_with_no_dek_is_still_rejected() -> None:
+    result = CrawlResult(url="https://example.com/a", markdown="", success=False)
+
+    with pytest.raises(ValueError):
+        crawl_result_to_article(result)
+
+
+def test_an_unusable_url_is_rejected_even_when_a_dek_exists() -> None:
+    # Storage identity is the normalized URL; a URL that never resolved has no
+    # identity to key a row on, however much text came with it.
+    result = CrawlResult(
+        url="/relative/path",
+        markdown="",
+        success=False,
+        context={URL_ERROR_CONTEXT_KEY: "relative_url", FEED_SUMMARY_KEY: SUMMARY},
+    )
+
+    with pytest.raises(ValueError):
+        crawl_result_to_article(result)
+
+
+def test_a_summary_only_result_never_displaces_real_content_in_a_batch() -> None:
+    now = datetime.now(timezone.utc)
+    crawled = CrawlResult(
+        url="https://example.com/article",
+        markdown="The real body.",
+        fetched_at=now - timedelta(minutes=1),
+    )
+    later_failure = CrawlResult(
+        url="https://example.com/article",
+        markdown="",
+        success=False,
+        fetched_at=now,
+        context={FEED_SUMMARY_KEY: SUMMARY},
+    )
+
+    articles, rejected = prepare_articles([crawled, later_failure])
+
+    assert rejected == 0
+    assert len(articles) == 1
+    assert articles[0].content == "The real body."
 
 
 def test_prepare_articles_keeps_newest_result_per_url() -> None:

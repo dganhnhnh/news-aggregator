@@ -30,13 +30,21 @@ from googlenewsdecoder import new_decoderv1
 
 from core.html_content import (
     FEED_CONTENT_KEY,
+    FEED_SUMMARY_KEY,
     MIN_FULL_CONTENT_CHARS,
     html_to_markdown,
     is_full_article,
+    render_feed_summary,
 )
 from core.config import DEFAULT_USER_AGENT
+from core.content_quality import crawl_failure_error_type
 from core.logger import get_logger
-from core.urls import UnusableUrl, is_probably_article, resolve_crawl_url
+from core.urls import (
+    URL_ERROR_CONTEXT_KEY,
+    UnusableUrl,
+    is_probably_article,
+    resolve_crawl_url,
+)
 from models.discovery_models import DiscoveredEntry, FeedPoll
 from models.search_and_crawl_models import (
     CrawlMetadata,
@@ -202,13 +210,25 @@ def _select_entry_link(entry: dict, base_url: str) -> str:
     return ""
 
 
+def _select_entry_summary(entry: dict) -> str:
+    """The entry's `<description>`/Atom `<summary>` HTML, unjudged."""
+    return entry.get("summary") or ""
+
+
 def _select_entry_content(entry: dict) -> str:
     """Return the entry's full article HTML, or "" if it only carries a teaser.
 
-    Only `content` is considered — RSS `content:encoded` and Atom `<content>`
-    both land there. `summary`/`description` is deliberately ignored: it is a
-    teaser by convention, and storing it would silently replace articles with
-    their own blurbs.
+    `content` — where RSS `content:encoded` and Atom `<content>` both land —
+    is the conventional home for a full body, but a sizeable minority of feeds
+    (TechCrunch, Slashdot, Martin Fowler, Etsy) leave it empty and put the whole
+    article in `<description>` instead. Ignoring those, as this function used
+    to, meant re-fetching a page the feed had already handed over.
+
+    So `summary` competes here, but only on the one ground that matters: when
+    it is long enough to be an article in its own right. Markup only ever adds
+    characters, so HTML shorter than the threshold cannot render past it — the
+    cheap length test rules out every dek without rendering anything, and
+    leaves `content` the winner whenever both are teasers.
     """
     bodies = entry.get("content") or []
     if isinstance(bodies, dict):  # some feeds expose a single mapping
@@ -219,6 +239,9 @@ def _select_entry_content(entry: dict) -> str:
         if isinstance(body, dict)
         and (body.get("type") or "text/html") not in ("text/plain",)
     ]
+    summary = _select_entry_summary(entry)
+    if len(summary) >= MIN_FULL_CONTENT_CHARS:
+        values.append(summary)
     return max(values, key=len, default="")
 
 
@@ -264,6 +287,7 @@ def _parse_rss_entry(entry: dict, base_url: str = "") -> dict:
         "source": raw_source,
         "published_date": pub_date,
         "content_html": _select_entry_content(entry),
+        "summary_html": _select_entry_summary(entry),
     }
 
 
@@ -546,6 +570,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                             source=entry["source"],
                             published_at=entry["published_date"],
                             content_html=entry.get("content_html", ""),
+                            summary_html=entry.get("summary_html", ""),
                         )
                         for entry in fetch.entries
                     ]
@@ -573,6 +598,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                     "source": entry.source,
                     "published_date": entry.published_at,
                     "content_html": entry.content_html,
+                    "summary_html": entry.summary_html,
                 },
                 entry.query_label,
                 entry.feed_title,
@@ -823,6 +849,15 @@ class GoogleNewsRssSearcher(CrawlerProvider):
     ) -> CrawlResult:
         feed_entry_url = job.entry.get("feed_entry_url", "")
         crawl_meta = result.metadata or CrawlMetadata()
+        if not result.success:
+            # A failed crawl's metadata describes whatever page came back, and
+            # for a blocked article that page is the interstitial: NYT's
+            # DataDome wall is titled "nytimes.com", CloudFront's is "ERROR:
+            # The request could not be satisfied", Imperva's is "Human
+            # Verification". Rejecting the body while keeping its <title> is
+            # how those became headlines on stored articles. The feed entry is
+            # the only description of this article we still trust.
+            crawl_meta = CrawlMetadata()
         enriched = replace(
             result,
             metadata=CrawlMetadata(
@@ -848,6 +883,11 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 ),
                 "published_date": job.entry.get("published_date"),
                 "requested_url": real_url or feed_entry_url,
+                # Attached even when the crawl failed: a failed article is
+                # exactly the one whose dek is the only text we will ever have.
+                FEED_SUMMARY_KEY: render_feed_summary(
+                    job.entry.get("summary_html", "")
+                ),
             }
         )
         return enriched
@@ -880,8 +920,11 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 source=source,
                 title=job.entry.get("title") or None,
                 published_at=job.entry.get("published_date"),
-                error_type="CrawlError",
+                error_type=crawl_failure_error_type(result.context),
                 error_message=result.error_message or "Unknown crawl failure",
+                # A malformed URL can never succeed, so it is dead-lettered
+                # rather than requeued. A block page stays retryable.
+                permanent=bool(result.context.get(URL_ERROR_CONTEXT_KEY)),
             )
         )
 

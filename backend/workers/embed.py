@@ -9,14 +9,15 @@ import os
 from asyncio import to_thread
 from collections.abc import Mapping
 from datetime import timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 from adapters.embedding.embedder import Embedder
 from adapters.embedding.fastembed_embedder import FastEmbedEmbedder
 from adapters.storage import PostgresRawStorage
 from core.logger import get_logger
-from models.storage_models import EmbedRunStats, EmbeddingRecord
-from services.text import embed_text
+from models.storage_models import EmbedRunStats, EmbeddingRecord, TextKind
+from services.raw_storage import content_hash
+from services.text import article_embed_text
 from workers.base import RunContext, RunOutcome, Worker
 from workers.queue import DEFAULT_MAX_ATTEMPTS, JobQueue, PostgresJobQueue
 
@@ -26,6 +27,15 @@ logger = get_logger(__name__)
 STAGE = "embed"
 LEASE = timedelta(minutes=10)
 MAX_ATTEMPTS = DEFAULT_MAX_ATTEMPTS
+
+
+class _EmbedItem(NamedTuple):
+    """One article's embedding input, resolved and hashed."""
+
+    article_id: int
+    text: str
+    text_hash: bytes
+    text_kind: TextKind
 
 
 class EmbedWorker(Worker):
@@ -80,22 +90,39 @@ class EmbedWorker(Worker):
             candidates = await storage.embeddable_articles(
                 [job.article_id for job in jobs]
             )
-            to_embed: list[tuple[int, str, bytes]] = []
+            to_embed: list[_EmbedItem] = []
             for job in jobs:
                 candidate = candidates.get(job.article_id)
                 if candidate is None:
                     # Article vanished since it was claimed; nothing to embed.
                     await queue.complete(job.article_id, STAGE)
                     continue
+                text, text_kind = article_embed_text(
+                    title=candidate.title,
+                    content=candidate.content,
+                    feed_summary=candidate.feed_summary,
+                    content_source=candidate.content_source,
+                )
+                if not text.strip():
+                    # No title, no body, no dek: there is nothing to place in
+                    # the vector space, and a zero vector would be worse than
+                    # an absent one.
+                    await queue.complete(job.article_id, STAGE)
+                    continue
+                # Hashing the chosen text, not the article's content, is what
+                # makes this skip correct when the fallback chain changes which
+                # text wins without `content` itself changing.
+                text_hash = content_hash(text)
                 if (
                     candidate.existing_model == embedder.model_name
-                    and candidate.existing_content_hash == candidate.content_hash
+                    and candidate.existing_content_hash == text_hash
                 ):
                     stats.skipped_unchanged += 1
                     await queue.complete(job.article_id, STAGE)
                     continue
-                text = embed_text(candidate.title, candidate.content)
-                to_embed.append((job.article_id, text, candidate.content_hash))
+                to_embed.append(
+                    _EmbedItem(job.article_id, text, text_hash, text_kind)
+                )
 
             if to_embed:
                 await self._embed_and_store(
@@ -125,15 +152,14 @@ class EmbedWorker(Worker):
 
     async def _embed_and_store(
         self,
-        items: list[tuple[int, str, bytes]],
+        items: list[_EmbedItem],
         embedder: Embedder,
         storage: PostgresRawStorage,
         queue: JobQueue,
         stats: EmbedRunStats,
     ) -> None:
-        texts = [text for _, text, _ in items]
         try:
-            vectors = await to_thread(embedder.embed, texts)
+            vectors = await to_thread(embedder.embed, [item.text for item in items])
         except Exception as exc:
             # Poison-pill isolation: one bad article must not fail the whole
             # batch, so retry each item alone and let only the culprit's
@@ -143,57 +169,52 @@ class EmbedWorker(Worker):
                 len(items),
                 exc,
             )
-            for article_id, text, content_hash in items:
-                await self._embed_one(
-                    article_id, text, content_hash, embedder, storage, queue, stats
-                )
+            for item in items:
+                await self._embed_one(item, embedder, storage, queue, stats)
             return
 
         records = [
-            EmbeddingRecord(
-                article_id=article_id,
-                model=embedder.model_name,
-                dim=embedder.dim,
-                content_hash=content_hash,
-                embedding=vector,
-            )
-            for (article_id, _, content_hash), vector in zip(items, vectors)
+            self._record(item, embedder, vector)
+            for item, vector in zip(items, vectors)
         ]
         await storage.upsert_embeddings(records)
-        for article_id, _, _ in items:
-            await queue.complete(article_id, STAGE)
+        for item in items:
+            await queue.complete(item.article_id, STAGE)
         stats.embedded += len(items)
 
     async def _embed_one(
         self,
-        article_id: int,
-        text: str,
-        content_hash: bytes,
+        item: _EmbedItem,
         embedder: Embedder,
         storage: PostgresRawStorage,
         queue: JobQueue,
         stats: EmbedRunStats,
     ) -> None:
         try:
-            vectors = await to_thread(embedder.embed, [text])
+            vectors = await to_thread(embedder.embed, [item.text])
         except Exception as exc:
-            logger.warning("Embed failed for article %d: %s", article_id, exc)
+            logger.warning("Embed failed for article %d: %s", item.article_id, exc)
             await queue.fail(
-                article_id, STAGE, str(exc), max_attempts=MAX_ATTEMPTS
+                item.article_id, STAGE, str(exc), max_attempts=MAX_ATTEMPTS
             )
             stats.failed += 1
             return
 
         await storage.upsert_embeddings(
-            [
-                EmbeddingRecord(
-                    article_id=article_id,
-                    model=embedder.model_name,
-                    dim=embedder.dim,
-                    content_hash=content_hash,
-                    embedding=vectors[0],
-                )
-            ]
+            [self._record(item, embedder, vectors[0])]
         )
-        await queue.complete(article_id, STAGE)
+        await queue.complete(item.article_id, STAGE)
         stats.embedded += 1
+
+    @staticmethod
+    def _record(
+        item: _EmbedItem, embedder: Embedder, vector: list[float]
+    ) -> EmbeddingRecord:
+        return EmbeddingRecord(
+            article_id=item.article_id,
+            model=embedder.model_name,
+            dim=embedder.dim,
+            content_hash=item.text_hash,
+            embedding=vector,
+            text_kind=item.text_kind,
+        )

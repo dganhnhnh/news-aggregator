@@ -17,6 +17,7 @@ from crawl4ai import (
     SemaphoreDispatcher,
 )
 
+from core.content_quality import BLOCK_PAGE_CONTEXT_KEY, block_page_reason
 from core.logger import get_logger
 from core.urls import URL_ERROR_CONTEXT_KEY, UnusableUrl, resolve_crawl_url
 
@@ -100,10 +101,20 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
     # like text but still contains a non-JSON-serializable generation object.
     raw_markdown = str(raw_markdown)
 
+    title = raw_meta.get("title") if isinstance(raw_meta, dict) else None
+
     effective_success = success and bool(raw_markdown.strip())
     error_message = getattr(inner, "error_message", "") or ""
     if success and not effective_success:
         error_message = "Crawler returned empty Markdown content"
+
+    # An anti-bot interstitial that renders as a normal document arrives here
+    # as a perfectly successful crawl. Judging the Markdown is the last chance
+    # to catch it before it is persisted and embedded as an article.
+    blocked = block_page_reason(title, raw_markdown) if effective_success else ""
+    if blocked:
+        effective_success = False
+        error_message = f"Blocked page: {blocked}"
 
     final_url = (
         getattr(inner, "redirected_url", None)
@@ -115,7 +126,7 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
         markdown=raw_markdown,
         html=getattr(inner, "cleaned_html", "") or "",
         metadata=CrawlMetadata(
-            title=raw_meta.get("title") if isinstance(raw_meta, dict) else None,
+            title=title,
             description=raw_meta.get("description") if isinstance(raw_meta, dict) else None,
             language=raw_meta.get("language") if isinstance(raw_meta, dict) else None,
             author=raw_meta.get("author") if isinstance(raw_meta, dict) else None,
@@ -125,6 +136,8 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
         error_message=error_message,
     )
     result.context["requested_url"] = url
+    if blocked:
+        result.context[BLOCK_PAGE_CONTEXT_KEY] = blocked
     return result
 
 

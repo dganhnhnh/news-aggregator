@@ -58,6 +58,16 @@ raw_articles = Table(
     Column("source", Text),
     Column("content", Text, nullable=False),
     Column("content_hash", LargeBinary, nullable=False),
+    # The feed's own dek, rendered to Markdown. Stored for every article, not
+    # just ones that failed to crawl: it is the preview text, and for sources
+    # whose pages crawl into navigation chrome it is the better embedding
+    # input. Empty when the feed shipped no usable summary.
+    Column("feed_summary", Text, nullable=False, server_default=""),
+    # Where `content` came from: 'feed_content' (the feed shipped the body),
+    # 'crawl' (a page was fetched), or 'feed_summary' (neither — the row exists
+    # only to carry the dek of an article whose page could not be crawled, and
+    # `content` is empty).
+    Column("content_source", Text, nullable=False, server_default="crawl"),
     Column("published_at", DateTime(timezone=True)),
     Column("crawled_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
@@ -72,7 +82,11 @@ raw_articles = Table(
         "search_tsv",
         TSVECTOR,
         Computed(
-            "to_tsvector('english', coalesce(title, '') || ' ' || left(content, 200000))",
+            # feed_summary is part of the document, not an afterthought: a
+            # summary-only row has no content at all, and would otherwise be
+            # invisible to search.
+            "to_tsvector('english', coalesce(title, '') || ' ' "
+            "|| left(content, 200000) || ' ' || coalesce(feed_summary, ''))",
             persisted=True,
         ),
     ),
@@ -223,7 +237,15 @@ article_embeddings = Table(
     ),
     Column("model", Text, nullable=False),
     Column("dim", Integer, nullable=False),
+    # Hash of the text actually embedded, not of `raw_articles.content`. The
+    # two differ whenever the fallback chain picks the feed summary, and only
+    # this one answers the question the embed worker asks: has the input to the
+    # model changed since last time?
     Column("content_hash", LargeBinary, nullable=False),
+    # Which link in that chain won: 'content', 'feed_summary' or 'title'.
+    # Vectors built from a 1200-character body and from a 100-character dek are
+    # not equally placed, so cluster quality has to be readable per kind.
+    Column("text_kind", Text, nullable=False, server_default="content"),
     Column("embedding", Vector(384), nullable=False),
     Column(
         "created_at",

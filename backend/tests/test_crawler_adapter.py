@@ -5,6 +5,7 @@ import pytest
 
 from adapters.retrieve_news_data import crawler as crawler_module
 from adapters.retrieve_news_data.crawler import Crawl4aiProvider, _build_crawl_result
+from core.content_quality import BLOCK_PAGE_CONTEXT_KEY
 from core.urls import URL_ERROR_CONTEXT_KEY
 
 
@@ -62,6 +63,44 @@ def test_build_result_does_not_treat_html_as_markdown() -> None:
     assert result.markdown == ""
     assert result.success is False
     assert result.error_message == "Crawler returned empty Markdown content"
+
+
+def test_build_result_rejects_an_anti_bot_interstitial() -> None:
+    inner = SimpleNamespace(
+        url="https://www.infoq.com/news/some-article/",
+        redirected_url=None,
+        markdown=(
+            "# Human Verification\n\n"
+            "Please complete the security check to access this site.\n"
+        ),
+        cleaned_html="<main>Human Verification</main>",
+        metadata={"title": "Human Verification"},
+        error_message="",
+    )
+
+    result = _build_crawl_result(
+        "https://www.infoq.com/news/some-article/", inner, success=True
+    )
+
+    assert result.success is False
+    assert result.error_message.startswith("Blocked page: ")
+    assert result.context[BLOCK_PAGE_CONTEXT_KEY]
+
+
+def test_build_result_keeps_a_real_article() -> None:
+    inner = SimpleNamespace(
+        url="https://example.com/article",
+        redirected_url=None,
+        markdown="# Nvidia beats estimates\n\nThe chipmaker reported...",
+        cleaned_html="<main>...</main>",
+        metadata={"title": "Nvidia beats estimates"},
+        error_message="",
+    )
+
+    result = _build_crawl_result("https://example.com/article", inner, success=True)
+
+    assert result.success is True
+    assert BLOCK_PAGE_CONTEXT_KEY not in result.context
 
 
 def test_batch_uses_one_browser_and_bounded_dispatcher(monkeypatch) -> None:

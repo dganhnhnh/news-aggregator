@@ -7,12 +7,13 @@ import httpx
 from adapters.retrieve_news_data.google_news_rss_searcher import (
     GoogleNewsRssSearcher,
     RssFeedSource,
+    _ArticleJob,
     _parse_rss_entry,
 )
 from core.config import DEFAULT_USER_AGENT
 from adapters.retrieve_news_data.crawler import Crawl4aiProvider
 from models.discovery_models import DiscoveredEntry
-from models.search_and_crawl_models import CrawlResult
+from models.search_and_crawl_models import CrawlMetadata, CrawlResult
 from models.storage_models import FeedPollTarget
 
 
@@ -855,9 +856,9 @@ def test_the_feed_content_threshold_is_honoured() -> None:
     assert batch.articles_from_feed_content == 1
 
 
-def test_content_encoded_is_read_but_summary_is_ignored() -> None:
-    # description/summary is a teaser by convention; storing it would replace
-    # articles with their own blurbs.
+def test_a_teasing_summary_never_becomes_content() -> None:
+    # A dek must not replace an article with its own blurb -- not even when the
+    # dek happens to be the longer string of the two.
     parsed = _parse_rss_entry(
         {
             "link": "https://blog.example.com/post",
@@ -880,6 +881,99 @@ def test_content_encoded_is_read_but_summary_is_ignored() -> None:
     )
 
     assert summary_only["content_html"] == ""
+
+
+def test_a_summary_carrying_the_whole_article_becomes_content() -> None:
+    # TechCrunch, Slashdot, Martin Fowler and Etsy all leave <content> empty and
+    # put the article in <description>. Ignoring it re-fetched a page the feed
+    # had already handed over.
+    body = "<p>" + ("The whole article body. " * 80) + "</p>"
+    assert len(body) >= 1200
+
+    parsed = _parse_rss_entry(
+        {
+            "link": "https://blog.example.com/post",
+            "title": "A post",
+            "summary": body,
+        },
+        "https://blog.example.com/feed.xml",
+    )
+
+    assert parsed["content_html"] == body
+
+
+def test_the_summary_is_always_captured_separately_from_content() -> None:
+    # Whichever tag wins, the dek is stored in its own right: it is the preview
+    # text, and it is unrecoverable once the entry drops out of the feed.
+    parsed = _parse_rss_entry(
+        {
+            "link": "https://blog.example.com/post",
+            "title": "A post",
+            "summary": "<p>Teaser only.</p>",
+            "content": [{"type": "text/html", "value": "<p>Full body.</p>"}],
+        },
+        "https://blog.example.com/feed.xml",
+    )
+
+    assert parsed["content_html"] == "<p>Full body.</p>"
+    assert parsed["summary_html"] == "<p>Teaser only.</p>"
+
+
+def _enrich(result: CrawlResult, *, entry_title: str = "The real headline"):
+    searcher = GoogleNewsRssSearcher()
+    job = _ArticleJob(
+        {
+            "feed_entry_url": "https://www.nytimes.com/2026/08/22/technology/pigeons.html",
+            "title": entry_title,
+            "source": "NYT",
+            "published_date": None,
+            "summary_html": "<p>A dek long enough to clear the summary threshold "
+            "and stand on its own as a preview.</p>",
+        },
+        "Technology",
+        "NYT > Technology",
+    )
+    return searcher._enrich_result(result, job, result.url)
+
+
+@pytest.mark.parametrize(
+    "block_page_title",
+    [
+        # Every one of these was stored as an article headline before the fix.
+        "nytimes.com",                                 # DataDome
+        "ERROR: The request could not be satisfied",   # CloudFront
+        "Human Verification",                          # Imperva
+    ],
+)
+def test_a_blocked_crawl_does_not_donate_its_title_to_the_article(
+    block_page_title: str,
+) -> None:
+    blocked = CrawlResult(
+        url="https://www.nytimes.com/2026/08/22/technology/pigeons.html",
+        markdown="",
+        success=False,
+        error_message="Blocked by anti-bot protection: DataDome captcha",
+        metadata=CrawlMetadata(title=block_page_title, language="en"),
+    )
+
+    enriched = _enrich(blocked)
+
+    assert enriched.metadata.title == "The real headline"
+    # The interstitial's language is no more trustworthy than its title.
+    assert enriched.metadata.language is None
+
+
+def test_a_successful_crawl_still_prefers_its_own_title() -> None:
+    crawled = CrawlResult(
+        url="https://www.nytimes.com/2026/08/22/technology/pigeons.html",
+        markdown="# The article\n\nBody.",
+        metadata=CrawlMetadata(title="The page's fuller headline", language="en"),
+    )
+
+    enriched = _enrich(crawled)
+
+    assert enriched.metadata.title == "The page's fuller headline"
+    assert enriched.metadata.language == "en"
 
 
 def test_the_longest_content_block_wins() -> None:

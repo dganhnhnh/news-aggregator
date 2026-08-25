@@ -9,19 +9,20 @@ from urllib.parse import urlsplit
 
 # Canonicalization lives in core.urls with the rest of the URL rules; it stays
 # importable from here because callers across the codebase already do so.
-from core.urls import normalize_url, source_slug
+from core.html_content import FEED_CONTENT_KEY, FEED_SUMMARY_KEY
+from core.urls import URL_ERROR_CONTEXT_KEY, normalize_url, source_slug
 from models.search_and_crawl_models import CrawlResult
-from models.storage_models import RawArticle
+from models.storage_models import ContentSource, RawArticle
 
 
 __all__ = [
     "build_excerpt",
     "content_hash",
+    "crawl_result_to_article",
     "normalize_content",
     "normalize_url",
     "prepare_articles",
     "source_slug",
-    "to_raw_article",
 ]
 
 
@@ -68,12 +69,29 @@ def article_source(result: CrawlResult, normalized_url: str) -> str:
     )
 
 
-def crawl_result_to_article(result: CrawlResult) -> RawArticle:
-    if not result.success:
-        raise ValueError("Cannot persist an unsuccessful crawl result")
-    content = normalize_content(result.markdown)
+def _content_source(result: CrawlResult, content: str) -> ContentSource:
     if not content:
-        raise ValueError("Cannot persist an empty crawl result")
+        return "feed_summary"
+    return "feed_content" if result.context.get(FEED_CONTENT_KEY) else "crawl"
+
+
+def crawl_result_to_article(result: CrawlResult) -> RawArticle:
+    """Build the row to persist, or raise ValueError when there is nothing to.
+
+    A failed crawl is no longer automatically nothing. When the feed supplied a
+    dek, the article still deserves a row — with empty `content` — because that
+    dek is searchable, embeddable, and gone forever once the entry drops out of
+    the feed. The row does not resolve the crawl failure, so the retry queue
+    keeps its chance to upgrade it to a real body later.
+    """
+    if result.context.get(URL_ERROR_CONTEXT_KEY):
+        # The URL never resolved to something fetchable, so there is no stable
+        # identity to key a row on. Storage identity is the normalized URL.
+        raise ValueError("Cannot persist a result for an unusable URL")
+    content = normalize_content(result.markdown) if result.success else ""
+    feed_summary = normalize_content(result.context.get(FEED_SUMMARY_KEY, "") or "")
+    if not content and not feed_summary:
+        raise ValueError("Cannot persist a result with neither content nor summary")
     url_original = result.url.strip()
     url = normalize_url(url_original)
     return RawArticle(
@@ -84,13 +102,27 @@ def crawl_result_to_article(result: CrawlResult) -> RawArticle:
         lang=_optional_text(result.metadata.language),
         content=content,
         content_hash=content_hash(content),
+        feed_summary=feed_summary,
+        content_source=_content_source(result, content),
         published_at=_published_at(result),
         crawled_at=result.fetched_at,
     )
 
 
+def _supersedes(candidate: RawArticle, current: RawArticle) -> bool:
+    """Whether `candidate` should replace `current` for the same URL.
+
+    Real content always beats a summary-only row regardless of age, so a failed
+    retry landing in the same batch as a successful crawl cannot blank it out.
+    Between two rows of the same kind, the newer one wins.
+    """
+    if bool(candidate.content) != bool(current.content):
+        return bool(candidate.content)
+    return candidate.crawled_at > current.crawled_at
+
+
 def prepare_articles(results: list[CrawlResult]) -> tuple[list[RawArticle], int]:
-    """Convert valid results and keep the newest result for each normalized URL."""
+    """Convert valid results and keep the best result for each normalized URL."""
     by_url: dict[str, RawArticle] = {}
     rejected = 0
     for result in results:
@@ -100,6 +132,6 @@ def prepare_articles(results: list[CrawlResult]) -> tuple[list[RawArticle], int]
             rejected += 1
             continue
         current = by_url.get(article.url)
-        if current is None or article.crawled_at > current.crawled_at:
+        if current is None or _supersedes(article, current):
             by_url[article.url] = article
     return list(by_url.values()), rejected

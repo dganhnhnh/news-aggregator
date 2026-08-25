@@ -1,4 +1,13 @@
-from services.text import embed_text, first_paragraphs
+from services.text import article_embed_text, article_text, first_paragraphs
+
+
+# Roughly what CNET and Slashdot crawl into: a masthead and a category bar,
+# with the article somewhere past the embedder's 1200-character horizon.
+NAV_CHROME = "".join(f"* [Section {i}](https://example.com/s{i})\n" for i in range(30))
+DEK = (
+    "Hugging Face is using the breach to push for openness in AI development, "
+    "arguing that closed models make incidents like this harder to audit."
+)
 
 
 def test_first_paragraphs_strips_code_fences() -> None:
@@ -30,11 +39,97 @@ def test_first_paragraphs_truncates_on_a_word_boundary() -> None:
     assert result == content[: len(result)]
 
 
-def test_embed_text_joins_title_and_body() -> None:
-    result = embed_text("Headline", "Body paragraph.")
-    assert result == "Headline\n\nBody paragraph."
+def test_a_clean_crawled_body_is_used() -> None:
+    body, kind = article_text(
+        content="The chipmaker reported record quarterly revenue.",
+        feed_summary=DEK,
+        content_source="crawl",
+    )
+
+    assert kind == "content"
+    assert body.startswith("The chipmaker")
 
 
-def test_embed_text_without_title_is_just_the_body() -> None:
-    result = embed_text(None, "Body paragraph.")
-    assert result == "Body paragraph."
+def test_a_feed_body_is_used_even_when_it_looks_link_heavy() -> None:
+    """A feed body is the publisher's own article HTML, so its links are the
+    article's links -- there is no site chrome to mistake them for."""
+    body, kind = article_text(
+        content=NAV_CHROME + "\n\nThe article itself.",
+        feed_summary=DEK,
+        content_source="feed_content",
+    )
+
+    assert kind == "content"
+    assert "Section 0" in body
+
+
+def test_a_nav_dense_crawl_loses_to_the_feed_dek() -> None:
+    body, kind = article_text(
+        content=NAV_CHROME + "\n\nThe article itself.",
+        feed_summary=DEK,
+        content_source="crawl",
+    )
+
+    assert kind == "feed_summary"
+    assert body == DEK
+
+
+def test_a_nav_dense_crawl_is_kept_when_there_is_no_dek() -> None:
+    """Nav-dense is a demotion, not a rejection: the body is still in there."""
+    content = NAV_CHROME + "\n\nThe article itself."
+
+    body, kind = article_text(content=content, feed_summary="", content_source="crawl")
+
+    assert kind == "content"
+    assert "The article itself." in body
+
+
+def test_a_dek_too_short_to_say_anything_is_not_used() -> None:
+    body, kind = article_text(
+        content=NAV_CHROME, feed_summary="Comments", content_source="crawl"
+    )
+
+    assert kind == "content"
+
+
+def test_an_article_with_no_text_at_all_falls_back_to_the_title() -> None:
+    assert article_text(content="", feed_summary="", content_source="feed_summary") == (
+        "",
+        "title",
+    )
+
+
+def test_a_summary_only_article_embeds_its_dek_under_its_title() -> None:
+    text, kind = article_embed_text(
+        title="Hugging Face breached by rogue bots",
+        content="",
+        feed_summary=DEK,
+        content_source="feed_summary",
+    )
+
+    assert kind == "feed_summary"
+    assert text == f"Hugging Face breached by rogue bots\n\n{DEK}"
+
+
+def test_an_untitled_article_embeds_just_its_body() -> None:
+    text, kind = article_embed_text(
+        title=None,
+        content="The chipmaker reported record quarterly revenue.",
+        feed_summary="",
+        content_source="crawl",
+    )
+
+    assert kind == "content"
+    assert text == "The chipmaker reported record quarterly revenue."
+
+
+def test_a_title_only_article_embeds_just_the_title() -> None:
+    text, kind = article_embed_text(
+        title="A headline",
+        content="",
+        feed_summary="",
+        content_source="feed_summary",
+    )
+
+    assert kind == "title"
+    assert text == "A headline"

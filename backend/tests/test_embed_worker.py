@@ -7,6 +7,8 @@ from typing import Any
 import pytest
 
 from models.storage_models import EmbeddingCandidate, EmbeddingRecord
+from services.raw_storage import content_hash
+from services.text import article_embed_text
 from workers.base import RunContext
 from workers.embed import EmbedWorker
 from workers.queue import Job
@@ -34,18 +36,32 @@ def _args(**overrides: Any) -> argparse.Namespace:
 def _candidate(
     article_id: int,
     *,
-    content_hash: bytes = b"hash",
+    content: str = "Body text.",
+    feed_summary: str = "",
+    content_source: str = "crawl",
     existing_model: str | None = None,
     existing_content_hash: bytes | None = None,
 ) -> EmbeddingCandidate:
     return EmbeddingCandidate(
         article_id=article_id,
         title="Title",
-        content="Body text.",
-        content_hash=content_hash,
+        content=content,
+        feed_summary=feed_summary,
+        content_source=content_source,
         existing_model=existing_model,
         existing_content_hash=existing_content_hash,
     )
+
+
+def _embedded_hash(candidate: EmbeddingCandidate) -> bytes:
+    """The hash the worker will compute for this candidate's chosen text."""
+    text, _ = article_embed_text(
+        title=candidate.title,
+        content=candidate.content,
+        feed_summary=candidate.feed_summary,
+        content_source=candidate.content_source,
+    )
+    return content_hash(text)
 
 
 class FakeQueue:
@@ -152,8 +168,11 @@ def test_new_articles_are_embedded_and_completed() -> None:
 
 
 def test_unchanged_content_is_skipped_without_calling_the_embedder() -> None:
+    unchanged = _candidate(1, existing_model="fake-model")
     unchanged = _candidate(
-        1, content_hash=b"same", existing_model="fake-model", existing_content_hash=b"same"
+        1,
+        existing_model="fake-model",
+        existing_content_hash=_embedded_hash(unchanged),
     )
     storage = FakeStorage({1: unchanged})
     queue = FakeQueue([1])
@@ -170,7 +189,7 @@ def test_unchanged_content_is_skipped_without_calling_the_embedder() -> None:
 
 def test_changed_content_is_reembedded_despite_a_prior_embedding() -> None:
     changed = _candidate(
-        1, content_hash=b"new", existing_model="fake-model", existing_content_hash=b"old"
+        1, existing_model="fake-model", existing_content_hash=b"a stale hash"
     )
     storage = FakeStorage({1: changed})
     queue = FakeQueue([1])
@@ -196,8 +215,16 @@ def test_batch_failure_isolates_only_the_poison_pill_article() -> None:
 
     storage = FakeStorage(
         {
-            1: EmbeddingCandidate(1, "T", "good body", b"h1", None, None),
-            2: EmbeddingCandidate(2, None, "poison", b"h2", None, None),
+            1: _candidate(1, content="good body"),
+            2: EmbeddingCandidate(
+                article_id=2,
+                title=None,
+                content="poison",
+                feed_summary="",
+                content_source="crawl",
+                existing_model=None,
+                existing_content_hash=None,
+            ),
         }
     )
     embedder = SelectiveEmbedder()

@@ -7,6 +7,7 @@ from dataclasses import replace
 
 from adapters.retrieve_news_data.google_news_rss_searcher import RssFeedSearcher
 from adapters.storage.postgres import PostgresRawStorage
+from core.content_quality import crawl_failure_error_type
 from core.urls import URL_ERROR_CONTEXT_KEY
 from models.search_and_crawl_models import CrawlMetadata, CrawlResult
 from models.storage_models import (
@@ -43,8 +44,10 @@ def direct_crawl_batch(results: list[CrawlResult]) -> CrawlBatch:
                 CrawlFailureOccurrence(
                     failure_kind="article",
                     url=result.url,
-                    error_type=f"UnusableUrl:{rejection}" if rejection else "CrawlError",
+                    error_type=crawl_failure_error_type(result.context),
                     error_message=result.error_message or "Unknown crawl failure",
+                    # Only a malformed URL is hopeless. A block page is not: the
+                    # same URL may well serve the article on a later attempt.
                     permanent=bool(rejection),
                 )
             )
@@ -168,11 +171,7 @@ async def iter_retry_batches(
                             source=failure.source,
                             title=failure.title,
                             published_at=failure.published_at,
-                            error_type=(
-                                f"UnusableUrl:{rejection}"
-                                if rejection
-                                else "CrawlError"
-                            ),
+                            error_type=crawl_failure_error_type(outcome.context),
                             error_message=(
                                 outcome.error_message or "Unknown crawl failure"
                             ),

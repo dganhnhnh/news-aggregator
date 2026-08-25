@@ -9,7 +9,18 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, or_, select, text, true, tuple_, union, update
+from sqlalchemy import (
+    case,
+    delete,
+    func,
+    or_,
+    select,
+    text,
+    true,
+    tuple_,
+    union,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -361,6 +372,8 @@ class PostgresRawStorage:
                     lang=article.lang,
                     content=article.content,
                     content_hash=article.content_hash,
+                    feed_summary=article.feed_summary,
+                    content_source=article.content_source,
                     published_at=article.published_at,
                     crawled_at=article.crawled_at,
                 )
@@ -372,6 +385,28 @@ class PostgresRawStorage:
                     incoming.published_at,
                     raw_articles.c.published_at,
                 )
+                # A summary-only row must never blank out a body we already
+                # have: the same URL can arrive again from a retry that failed,
+                # and the three content columns have to move together or not
+                # at all.
+                has_content = incoming.content != ""
+                merged_content = case(
+                    (has_content, incoming.content), else_=raw_articles.c.content
+                )
+                merged_content_hash = case(
+                    (has_content, incoming.content_hash),
+                    else_=raw_articles.c.content_hash,
+                )
+                merged_content_source = case(
+                    (has_content, incoming.content_source),
+                    else_=raw_articles.c.content_source,
+                )
+                # Same rule for the dek, in its own right: a retry carries no
+                # feed entry, so its empty summary says "unknown", not "gone".
+                merged_feed_summary = case(
+                    (incoming.feed_summary != "", incoming.feed_summary),
+                    else_=raw_articles.c.feed_summary,
+                )
                 statement = stmt.on_conflict_do_update(
                     index_elements=[raw_articles.c.url],
                     set_={
@@ -380,14 +415,20 @@ class PostgresRawStorage:
                         "source": merged_source,
                         "source_id": incoming.source_id,
                         "lang": merged_lang,
-                        "content": incoming.content,
-                        "content_hash": incoming.content_hash,
+                        "content": merged_content,
+                        "content_hash": merged_content_hash,
+                        "feed_summary": merged_feed_summary,
+                        "content_source": merged_content_source,
                         "published_at": merged_published,
                         "crawled_at": incoming.crawled_at,
                         "updated_at": func.now(),
                     },
                     where=or_(
-                        raw_articles.c.content_hash.is_distinct_from(incoming.content_hash),
+                        raw_articles.c.content_hash.is_distinct_from(merged_content_hash),
+                        raw_articles.c.feed_summary.is_distinct_from(merged_feed_summary),
+                        raw_articles.c.content_source.is_distinct_from(
+                            merged_content_source
+                        ),
                         raw_articles.c.title.is_distinct_from(merged_title),
                         raw_articles.c.source.is_distinct_from(merged_source),
                         raw_articles.c.source_id.is_distinct_from(incoming.source_id),
@@ -453,8 +494,10 @@ class PostgresRawStorage:
     ) -> dict[int, EmbeddingCandidate]:
         """Load claimed articles alongside their previous embedding, if any.
 
-        Lets `EmbedWorker` skip re-embedding when `content_hash` and `model`
-        both match what's already stored.
+        Every candidate text comes back, not a pre-chosen one: which of them is
+        embedded is `services.text.article_text`'s call, and the hash the
+        worker compares against `existing_content_hash` is the hash of that
+        chosen text rather than of `raw_articles.content`.
         """
         if not article_ids:
             return {}
@@ -464,7 +507,8 @@ class PostgresRawStorage:
                     raw_articles.c.id,
                     raw_articles.c.title,
                     raw_articles.c.content,
-                    raw_articles.c.content_hash,
+                    raw_articles.c.feed_summary,
+                    raw_articles.c.content_source,
                     article_embeddings.c.model.label("existing_model"),
                     article_embeddings.c.content_hash.label("existing_content_hash"),
                 )
@@ -481,7 +525,8 @@ class PostgresRawStorage:
                     article_id=row.id,
                     title=row.title,
                     content=row.content,
-                    content_hash=row.content_hash,
+                    feed_summary=row.feed_summary,
+                    content_source=row.content_source,
                     existing_model=row.existing_model,
                     existing_content_hash=row.existing_content_hash,
                 )
@@ -498,6 +543,7 @@ class PostgresRawStorage:
                     "model": record.model,
                     "dim": record.dim,
                     "content_hash": record.content_hash,
+                    "text_kind": record.text_kind,
                     "embedding": record.embedding,
                 }
                 for record in records
@@ -511,6 +557,7 @@ class PostgresRawStorage:
                         "model": stmt.excluded.model,
                         "dim": stmt.excluded.dim,
                         "content_hash": stmt.excluded.content_hash,
+                        "text_kind": stmt.excluded.text_kind,
                         "embedding": stmt.excluded.embedding,
                         "created_at": func.now(),
                     },
@@ -609,6 +656,21 @@ class PostgresRawStorage:
             return int(result.rowcount or 0)
 
     @staticmethod
+    def _excerpt_source():
+        """The text a list preview is cut from.
+
+        Preview ranks differently from embedding: a dek is written to be read
+        as a standalone blurb, so it wins outright here even when the crawled
+        body is perfectly clean. The leading slice of `content` is the fallback,
+        and both still go through `build_excerpt`, since a feed that ships its
+        whole article in <description> would otherwise fill the card.
+        """
+        return func.coalesce(
+            func.nullif(func.left(raw_articles.c.feed_summary, 400), ""),
+            func.left(raw_articles.c.content, 400),
+        )
+
+    @staticmethod
     def _feed_filters(
         *,
         since: datetime,
@@ -648,7 +710,7 @@ class PostgresRawStorage:
                 raw_articles.c.id,
                 raw_articles.c.url,
                 raw_articles.c.title,
-                func.left(raw_articles.c.content, 400).label("excerpt_raw"),
+                self._excerpt_source().label("excerpt_raw"),
                 raw_articles.c.published_at,
                 raw_articles.c.crawled_at,
                 raw_articles.c.event_at,
@@ -720,7 +782,7 @@ class PostgresRawStorage:
                     raw_articles.c.id,
                     raw_articles.c.url,
                     raw_articles.c.title,
-                    func.left(raw_articles.c.content, 400).label("excerpt_raw"),
+                    self._excerpt_source().label("excerpt_raw"),
                     raw_articles.c.published_at,
                     raw_articles.c.crawled_at,
                     raw_articles.c.event_at,
