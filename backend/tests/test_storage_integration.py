@@ -7,7 +7,13 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from adapters.storage.postgres import PostgresRawStorage
-from adapters.storage.schema import crawl_failures, raw_articles, sources, worker_runs
+from adapters.storage.schema import (
+    crawl_failures,
+    processing_jobs,
+    raw_articles,
+    sources,
+    worker_runs,
+)
 from models.storage_models import (
     CrawlFailureOccurrence,
     FailureTarget,
@@ -398,6 +404,104 @@ async def _test_a_summary_only_row_is_searchable_and_never_blanks_a_crawled_body
             async with engine.begin() as connection:
                 await connection.execute(
                     delete(raw_articles).where(raw_articles.c.url == url)
+                )
+                await connection.execute(
+                    delete(sources).where(sources.c.slug == source_slug)
+                )
+        await engine.dispose()
+        await storage.close()
+
+
+def test_historical_block_page_cleanup_preserves_summary_and_requeues_crawl() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_historical_block_page_cleanup())
+
+
+async def _test_historical_block_page_cleanup() -> None:
+    url = "https://cleanup.integration.example/article"
+    source_slug = "cleanup.integration.example"
+    summary = "A trusted feed summary that remains useful while the page is retried."
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    now = datetime.now(timezone.utc)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        async with engine.begin() as connection:
+            await connection.execute(
+                delete(raw_articles).where(raw_articles.c.url == url)
+            )
+            await connection.execute(
+                delete(crawl_failures).where(crawl_failures.c.url == url)
+            )
+            await connection.execute(
+                delete(sources).where(sources.c.slug == source_slug)
+            )
+
+        article = RawArticle(
+            url=url,
+            url_original=url,
+            title="Human Verification",
+            source="Cleanup Integration",
+            lang=None,
+            content="",
+            content_hash=content_hash(""),
+            feed_summary=summary,
+            content_source="feed_summary",
+            published_at=now,
+            crawled_at=now,
+        )
+        await storage.apply_batch([article], [], [], received=1, rejected=0)
+
+        findings = await storage.historical_block_pages(limit=10_000)
+        target = [item for item in findings if item.url == url]
+        assert len(target) == 1
+        assert await storage.quarantine_historical_block_pages(target) == 1
+        assert await storage.quarantine_historical_block_pages(target) == 0
+
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    select(
+                        raw_articles.c.title,
+                        raw_articles.c.feed_summary,
+                        processing_jobs.c.state,
+                    )
+                    .select_from(
+                        raw_articles.join(
+                            processing_jobs,
+                            (processing_jobs.c.article_id == raw_articles.c.id)
+                            & (processing_jobs.c.stage == "embed"),
+                        )
+                    )
+                    .where(raw_articles.c.url == url)
+                )
+            ).one()
+            failure = (
+                await connection.execute(
+                    select(crawl_failures).where(
+                        crawl_failures.c.failure_kind == "article",
+                        crawl_failures.c.url == url,
+                    )
+                )
+            ).one()
+
+        assert row.title is None
+        assert row.feed_summary == summary
+        assert row.state == "pending"
+        assert failure.error_type == "BlockedPage"
+        assert failure.title is None
+        assert failure.dead_lettered_at is None
+    finally:
+        if ready:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    delete(raw_articles).where(raw_articles.c.url == url)
+                )
+                await connection.execute(
+                    delete(crawl_failures).where(crawl_failures.c.url == url)
                 )
                 await connection.execute(
                     delete(sources).where(sources.c.slug == source_slug)

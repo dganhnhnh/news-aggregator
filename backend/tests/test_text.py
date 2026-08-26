@@ -74,22 +74,35 @@ def test_a_nav_dense_crawl_loses_to_the_feed_dek() -> None:
     assert body == DEK
 
 
-def test_a_nav_dense_crawl_is_kept_when_there_is_no_dek() -> None:
-    """Nav-dense is a demotion, not a rejection: the body is still in there."""
+def test_a_nav_dense_crawl_without_a_dek_falls_back_to_title_only() -> None:
+    """Publisher chrome must not become the semantic representation."""
     content = NAV_CHROME + "\n\nThe article itself."
 
     body, kind = article_text(content=content, feed_summary="", content_source="crawl")
 
-    assert kind == "content"
-    assert "The article itself." in body
+    assert kind == "title"
+    assert body == ""
 
 
-def test_a_dek_too_short_to_say_anything_is_not_used() -> None:
+def test_a_dek_too_short_to_say_anything_falls_back_to_title_only() -> None:
     body, kind = article_text(
         content=NAV_CHROME, feed_summary="Comments", content_source="crawl"
     )
 
-    assert kind == "content"
+    assert kind == "title"
+    assert body == ""
+
+
+def test_embed_text_uses_the_title_when_nav_dense_content_has_no_dek() -> None:
+    text, kind = article_embed_text(
+        title="A distinct article headline",
+        content=NAV_CHROME + "\n\nThe article itself.",
+        feed_summary="",
+        content_source="crawl",
+    )
+
+    assert kind == "title"
+    assert text == "A distinct article headline"
 
 
 def test_an_article_with_no_text_at_all_falls_back_to_the_title() -> None:

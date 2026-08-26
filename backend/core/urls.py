@@ -34,6 +34,10 @@ _TRACKING_PARAMETERS = {
     "ref_src",
     "_hsenc",
 }
+# Reddit's anti-bot challenge redirects back to the article with fresh values
+# on every crawl. They are transport state, not article identity. Keep this
+# host-scoped: generic names such as ``token`` can be meaningful elsewhere.
+_REDDIT_TRANSIENT_PARAMETERS = {"js_challenge", "solution", "token"}
 _SOURCE_HOST_PREFIXES = ("www.", "m.", "amp.")
 # Only m./amp. are collapsed at the URL level; www. is left alone since it is
 # not reliably an alias of the bare host the way AMP/mobile mirrors are.
@@ -157,11 +161,13 @@ def normalize_url(url: str) -> str:
     path = _AMP_SUFFIX_RE.sub("", parts.path or "/") or "/"
     path = _strip_trailing_slash(path)
 
+    is_reddit = hostname == "reddit.com" or hostname.endswith(".reddit.com")
     query_items = sorted(
         (key, value)
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
         if key.lower() not in _TRACKING_PARAMETERS
         and not key.lower().startswith("utm_")
+        and not (is_reddit and key.lower() in _REDDIT_TRANSIENT_PARAMETERS)
     )
     return urlunsplit((scheme, hostname, path, urlencode(query_items), ""))
 

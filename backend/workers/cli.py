@@ -223,6 +223,22 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Maximum rows to requeue",
     )
 
+    cleanup_block_pages = subparsers.add_parser(
+        "cleanup-block-pages",
+        help="Quarantine legacy summary-only rows with block-page titles",
+    )
+    cleanup_block_pages.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum rows to inspect/apply in one run",
+    )
+    cleanup_block_pages.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the cleanup; without this flag the command is a dry run",
+    )
+
     enable_feed = subparsers.add_parser(
         "enable-feed", help="Clear a feed's disabled_at"
     )
@@ -298,7 +314,7 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             _validate_crawl(args, parser)
         elif args.command == "embed":
             _validate_embed(args, parser)
-    elif args.command == "replay":
+    elif args.command in {"replay", "cleanup-block-pages"}:
         if args.limit <= 0:
             parser.error("--limit must be positive")
 
@@ -329,6 +345,49 @@ async def _dispatch(
 async def _dispatch_admin(
     storage: PostgresRawStorage, args: argparse.Namespace
 ) -> int:
+    if args.command == "cleanup-block-pages":
+        if args.apply:
+            # A claimed embed job may already hold the stale title in memory,
+            # while crawl could resolve the same failure during cleanup. Take
+            # both worker locks so the transaction has a clean boundary.
+            async with storage.worker_lock("crawl") as crawl_locked:
+                if not crawl_locked:
+                    logger.error("Crawl worker is active; cleanup was not applied")
+                    return EXIT_FAILED
+                async with storage.worker_lock("embed") as embed_locked:
+                    if not embed_locked:
+                        logger.error("Embed worker is active; cleanup was not applied")
+                        return EXIT_FAILED
+                    findings = await storage.historical_block_pages(limit=args.limit)
+                    for item in findings:
+                        logger.info(
+                            "Legacy block-page title: article=%d url=%s reason=%s",
+                            item.article_id,
+                            item.url,
+                            item.reason,
+                        )
+                    count = await storage.quarantine_historical_block_pages(findings)
+            logger.info(
+                "Quarantined %d legacy block-page title(s); summaries remain "
+                "embeddable and article URLs are due for re-crawl",
+                count,
+            )
+            return EXIT_OK
+
+        findings = await storage.historical_block_pages(limit=args.limit)
+        for item in findings:
+            logger.info(
+                "Legacy block-page title: article=%d url=%s reason=%s",
+                item.article_id,
+                item.url,
+                item.reason,
+            )
+        logger.info(
+            "Dry run found %d row(s); pass --apply to quarantine them",
+            len(findings),
+        )
+        return EXIT_OK
+
     if args.command == "replay":
         if args.stage is not None:
             count = await storage.replay_stage_jobs(args.stage, limit=args.limit)

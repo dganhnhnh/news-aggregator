@@ -52,6 +52,17 @@ def test_persistence_and_worker_output_flags_are_exposed() -> None:
         )
 
 
+def test_block_page_cleanup_is_dry_run_by_default() -> None:
+    parser = worker_cli.build_parser(_settings())
+
+    dry_run = parser.parse_args(["cleanup-block-pages", "--limit", "25"])
+    applied = parser.parse_args(["cleanup-block-pages", "--apply"])
+
+    assert dry_run.limit == 25
+    assert dry_run.apply is False
+    assert applied.apply is True
+
+
 def test_rss_command_accepts_direct_feed_urls() -> None:
     args = pipeline_cli.build_parser(_settings()).parse_args(
         [

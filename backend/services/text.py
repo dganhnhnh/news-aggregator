@@ -56,11 +56,12 @@ def article_text(
        boilerplate stripping, which fails on roughly a third of sources.
     3. **Feed dek.** Short, but short and on-topic beats 1200 characters of
        navigation menu.
-    4. **Crawled body anyway.** Nav-dense and no dek to fall back on; the
-       article is in there somewhere, and it still beats nothing.
+    4. **Title only.** A nav-dense crawl with no usable dek contains the article
+       somewhere, but not inside the model's 1200-character horizon. Returning
+       that chrome would make unrelated articles from one publisher look alike.
 
-    The caller adds the title, which is why there is no title rung here: a
-    title-only article is `("", "title")`.
+    The caller adds the title itself; this function represents that final rung
+    as `("", "title")` so no publisher chrome leaks into the text.
     """
     body = first_paragraphs(content) if content else ""
     summary = feed_summary.strip()
@@ -71,8 +72,6 @@ def article_text(
         return body, "content"
     if len(summary) >= MIN_FEED_SUMMARY_CHARS:
         return first_paragraphs(summary), "feed_summary"
-    if body:
-        return body, "content"
     return "", "title"
 
 

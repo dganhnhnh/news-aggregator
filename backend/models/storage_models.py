@@ -122,6 +122,17 @@ class ArticleDetailItem:
 
 
 @dataclass(frozen=True)
+class HistoricalBlockPage:
+    """A summary-only article whose title came from an old block page."""
+
+    article_id: int
+    url: str
+    source: str | None
+    published_at: datetime | None
+    reason: str
+
+
+@dataclass(frozen=True)
 class SourceItem:
     slug: str
     name: str

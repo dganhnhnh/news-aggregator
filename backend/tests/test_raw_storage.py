@@ -124,6 +124,17 @@ NORMALIZE_URL_CASES = [
         "https://example.com/example-amp",
         "https://example.com/example-amp",
     ),
+    (
+        "Reddit challenge state is not article identity",
+        "https://www.reddit.com/r/python/comments/abc/story/"
+        "?token=second&solution=new&js_challenge=1&sort=new",
+        "https://www.reddit.com/r/python/comments/abc/story?sort=new",
+    ),
+    (
+        "generic token parameters remain meaningful outside Reddit",
+        "https://example.com/article?token=identity",
+        "https://example.com/article?token=identity",
+    ),
 ]
 
 

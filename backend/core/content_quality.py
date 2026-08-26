@@ -30,6 +30,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from core.urls import URL_ERROR_CONTEXT_KEY
 
@@ -39,6 +40,7 @@ __all__ = [
     "BLOCK_PAGE_TITLES",
     "block_page_reason",
     "crawl_failure_error_type",
+    "historical_summary_title_reason",
     "is_nav_dense",
     "leading_link_count",
 ]
@@ -70,6 +72,7 @@ BLOCK_PAGE_TITLES = frozenset(
         "checking your browser before accessing",
         "verifying you are human",
         "verify you are human",
+        "error: the request could not be satisfied",
     }
 )
 
@@ -122,6 +125,30 @@ def block_page_reason(title: str | None, markdown: str) -> str:
             f"interstitial phrase {match.group(0).lower()!r} "
             f"in a {len(markdown)}-character page"
         )
+    return ""
+
+
+def historical_summary_title_reason(title: str | None, url: str) -> str:
+    """Why a legacy summary-only row inherited an untrusted crawl title.
+
+    Older RSS enrichment kept the title of a failed crawl even though the body
+    was correctly discarded in favour of the feed summary. Most such titles
+    are ordinary block-page titles. DataDome's NYT shell is the less obvious
+    case: its title is only the publisher hostname. This helper is deliberately
+    used only by the cleanup command on rows already known to be summary-only;
+    a fetched article is never rejected merely because its title resembles its
+    host.
+    """
+    reason = block_page_reason(title, "")
+    if reason:
+        return reason
+
+    normalized = _normalize_title(title)
+    hostname = (urlsplit(url).hostname or "").lower()
+    if hostname.startswith("www."):
+        hostname = hostname.removeprefix("www.")
+    if normalized and normalized == hostname:
+        return f"summary-only row inherited publisher-host title: {hostname!r}"
     return ""
 
 

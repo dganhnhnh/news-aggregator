@@ -33,6 +33,7 @@ from adapters.storage.schema import (
     sources,
     worker_runs,
 )
+from core.content_quality import historical_summary_title_reason
 from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
@@ -44,6 +45,7 @@ from models.storage_models import (
     FeedFailureOutcome,
     FeedPollTarget,
     FeedSeed,
+    HistoricalBlockPage,
     RawArticle,
     RunStatus,
     SourceItem,
@@ -926,6 +928,148 @@ class PostgresRawStorage:
                 .values(attempt_count=0, dead_lettered_at=None, next_retry_at=now)
             )
             return int(result.rowcount or 0)
+
+    async def historical_block_pages(
+        self, *, limit: int = 100
+    ) -> list[HistoricalBlockPage]:
+        """Find legacy summary-only rows that inherited a block-page title.
+
+        The body of these rows was already discarded, so their feed summary is
+        still trustworthy. Only the title needs quarantine and the original URL
+        needs another crawl attempt.
+        """
+        async with self._engine.connect() as connection:
+            rows = await connection.execute(
+                select(
+                    raw_articles.c.id,
+                    raw_articles.c.url,
+                    raw_articles.c.title,
+                    raw_articles.c.source,
+                    raw_articles.c.published_at,
+                )
+                .where(
+                    raw_articles.c.content_source == "feed_summary",
+                    raw_articles.c.content == "",
+                    raw_articles.c.feed_summary != "",
+                    raw_articles.c.title.is_not(None),
+                )
+                .order_by(raw_articles.c.id)
+            )
+
+            findings: list[HistoricalBlockPage] = []
+            for row in rows:
+                reason = historical_summary_title_reason(row.title, row.url)
+                if not reason:
+                    continue
+                findings.append(
+                    HistoricalBlockPage(
+                        article_id=int(row.id),
+                        url=row.url,
+                        source=row.source,
+                        published_at=row.published_at,
+                        reason=reason,
+                    )
+                )
+                if len(findings) >= limit:
+                    break
+            return findings
+
+    async def quarantine_historical_block_pages(
+        self, findings: Sequence[HistoricalBlockPage]
+    ) -> int:
+        """Clear untrusted titles and make their URLs immediately retryable.
+
+        Feed summaries remain in ``raw_articles`` and are re-embedded without
+        the interstitial title. Existing embeddings are invalidated. A durable
+        crawl failure is also created (or replayed), allowing a future crawl to
+        upgrade the row with the real title and body.
+        """
+        if not findings:
+            return 0
+
+        requested = {item.article_id for item in findings}
+        now = datetime.now(timezone.utc)
+        async with self._engine.begin() as connection:
+            rows = (
+                await connection.execute(
+                    select(
+                        raw_articles.c.id,
+                        raw_articles.c.url,
+                        raw_articles.c.title,
+                        raw_articles.c.source,
+                        raw_articles.c.published_at,
+                    )
+                    .where(
+                        raw_articles.c.id.in_(requested),
+                        raw_articles.c.content_source == "feed_summary",
+                        raw_articles.c.content == "",
+                        raw_articles.c.feed_summary != "",
+                    )
+                    .order_by(raw_articles.c.id)
+                    .with_for_update()
+                )
+            ).all()
+
+            eligible: list[tuple[Any, str]] = []
+            for row in rows:
+                reason = historical_summary_title_reason(row.title, row.url)
+                if reason:
+                    eligible.append((row, reason))
+            if not eligible:
+                return 0
+
+            article_ids = [int(row.id) for row, _ in eligible]
+            await connection.execute(
+                update(raw_articles)
+                .where(raw_articles.c.id.in_(article_ids))
+                .values(title=None, updated_at=now)
+            )
+            await connection.execute(
+                delete(article_embeddings).where(
+                    article_embeddings.c.article_id.in_(article_ids)
+                )
+            )
+
+            for row, reason in eligible:
+                stmt = pg_insert(crawl_failures).values(
+                    failure_kind="article",
+                    url=row.url,
+                    source=row.source,
+                    title=None,
+                    published_at=row.published_at,
+                    error_type="BlockedPage",
+                    error_message=f"Historical block-page metadata: {reason}"[:2000],
+                    attempt_count=0,
+                    first_failed_at=now,
+                    last_failed_at=now,
+                    next_retry_at=now,
+                    dead_lettered_at=None,
+                )
+                await connection.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=[
+                            crawl_failures.c.failure_kind,
+                            crawl_failures.c.url,
+                        ],
+                        set_={
+                            "source": stmt.excluded.source,
+                            "title": None,
+                            "published_at": func.coalesce(
+                                stmt.excluded.published_at,
+                                crawl_failures.c.published_at,
+                            ),
+                            "error_type": stmt.excluded.error_type,
+                            "error_message": stmt.excluded.error_message,
+                            "attempt_count": 0,
+                            "last_failed_at": now,
+                            "next_retry_at": now,
+                            "dead_lettered_at": None,
+                        },
+                    )
+                )
+
+            await self._enqueue_embed_jobs(connection, article_ids)
+            return len(article_ids)
 
     async def enable_feed(self, feed_url: str) -> bool:
         async with self._engine.begin() as connection:

@@ -2,6 +2,7 @@ from core.content_quality import (
     BLOCK_PAGE_CONTEXT_KEY,
     block_page_reason,
     crawl_failure_error_type,
+    historical_summary_title_reason,
     is_nav_dense,
 )
 from core.urls import URL_ERROR_CONTEXT_KEY
@@ -27,6 +28,27 @@ def test_imperva_human_verification_page_is_rejected() -> None:
 def test_block_title_is_matched_regardless_of_case_and_punctuation() -> None:
     for title in ("Just a moment...", "JUST A MOMENT", "Just a moment…"):
         assert block_page_reason(title, "# Body"), title
+
+
+def test_cloudfront_request_block_page_is_rejected_by_title() -> None:
+    assert block_page_reason("ERROR: The request could not be satisfied", "")
+
+
+def test_historical_summary_cleanup_recognizes_publisher_host_title() -> None:
+    assert historical_summary_title_reason(
+        "nytimes.com",
+        "https://www.nytimes.com/2026/08/technology/example.html",
+    )
+
+
+def test_historical_summary_cleanup_keeps_a_real_feed_title() -> None:
+    assert (
+        historical_summary_title_reason(
+            "Open-source model release changes AI tooling",
+            "https://www.nytimes.com/2026/08/technology/example.html",
+        )
+        == ""
+    )
 
 
 def test_interstitial_phrase_near_the_top_of_a_short_page_is_rejected() -> None:

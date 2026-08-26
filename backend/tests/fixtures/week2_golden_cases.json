@@ -1,0 +1,302 @@
+[
+  {
+    "case_id": "same_event_two_publishers",
+    "scenario_number": 1,
+    "description": "Two different publishers reporting the same event: Apple announces the Mac mini M6 and Mac Studio M5 Ultra on 2026-08-25.",
+    "source_note": "Excerpted from real raw_articles rows (theverge.com, cnet.com), audited 2026-08-26 in docs/measurements.md.",
+    "articles": [
+      {
+        "key": "mac-launch-theverge",
+        "source": "theverge.com",
+        "published_at": "2026-08-25T13:00:00Z",
+        "title": "Apple launches new Mac Studios with its most powerful chip ever, the M5 Ultra",
+        "text": "Apple is announcing new models of the Mac Studio, now using the existing M5 Max and a new M5 Ultra chip. The company says the M5 Ultra is its most powerful chip yet, aimed at professional workloads and AI compute on the desktop.",
+        "expected_topics": ["consumer-hardware"],
+        "forbidden_topics": ["cybersecurity"]
+      },
+      {
+        "key": "mac-launch-cnet",
+        "source": "cnet.com",
+        "published_at": "2026-08-25T13:00:00Z",
+        "title": "New M6 Mac Mini and Mac Studio With M5 Ultra Promise Needed Boost for AI and Graphics",
+        "text": "Apple refreshed its desktop computer lineup with a new M6 Mac mini and an updated Mac Studio built around the M5 Ultra chip, promising a meaningful performance boost for AI workloads and graphics-heavy tasks.",
+        "expected_topics": ["consumer-hardware"],
+        "forbidden_topics": ["cybersecurity"]
+      }
+    ],
+    "expected_clusters": [["mac-launch-theverge", "mac-launch-cnet"]],
+    "expected_member_kinds": {
+      "mac-launch-theverge": "primary",
+      "mac-launch-cnet": "primary"
+    },
+    "expected_distinct_sources": 2,
+    "notes": "Expected: same cluster, both sources retained as evidence, neither article suppressed."
+  },
+  {
+    "case_id": "same_event_strong_paraphrase",
+    "scenario_number": 2,
+    "description": "Same event (AliExpress accused of audio fingerprinting) but the title and phrasing are strongly paraphrased between the two publishers.",
+    "source_note": "Excerpted from real raw_articles rows (theregister.com, arstechnica.com), audited 2026-08-26.",
+    "articles": [
+      {
+        "key": "aliexpress-fingerprint-register",
+        "source": "theregister.com",
+        "published_at": "2026-08-24T12:32:00Z",
+        "title": "AliExpress accused of fingerprinting shoppers with silent audio trick",
+        "text": "Developer Matt Callaghan claims he caught Alibaba trying to track web users by playing inaudible sounds through browsers vulnerable to audio fingerprinting, an outdated technique that also impeded his ability to use a Bluetooth headset while browsing the site.",
+        "expected_topics": ["privacy-security"],
+        "forbidden_topics": ["consumer-hardware"]
+      },
+      {
+        "key": "aliexpress-fingerprint-arstechnica",
+        "source": "arstechnica.com",
+        "published_at": "2026-08-24T19:19:21Z",
+        "title": "Inaudible sounds used to fingerprint browsers catch AliExpress red-handed",
+        "text": "Chinese retailer AliExpress has been caught fingerprinting visitors after one of the metrics it collects, an outdated technique that measures inaudible sounds sent to browsers, interfered with a researcher's ability to use his Bluetooth headphones.",
+        "expected_topics": ["privacy-security"],
+        "forbidden_topics": ["consumer-hardware"]
+      }
+    ],
+    "expected_clusters": [["aliexpress-fingerprint-register", "aliexpress-fingerprint-arstechnica"]],
+    "expected_member_kinds": {
+      "aliexpress-fingerprint-register": "primary",
+      "aliexpress-fingerprint-arstechnica": "primary"
+    },
+    "expected_distinct_sources": 2,
+    "notes": "Wording differs heavily (title, opening sentence) but it is the same concrete event: must still cluster together."
+  },
+  {
+    "case_id": "same_topic_different_event",
+    "scenario_number": 3,
+    "description": "Two articles both about Apple/consumer hardware but two completely different events: the Mac Studio launch vs. an AirTags discount.",
+    "source_note": "Excerpted from real raw_articles rows (theverge.com), audited 2026-08-26.",
+    "articles": [
+      {
+        "key": "mac-launch-theverge-2",
+        "source": "theverge.com",
+        "published_at": "2026-08-25T13:00:00Z",
+        "title": "Apple launches new Mac Studios with its most powerful chip ever, the M5 Ultra",
+        "text": "Apple is announcing new models of the Mac Studio, now using the existing M5 Max and a new M5 Ultra chip. The company says the M5 Ultra is its most powerful chip yet, aimed at professional workloads and AI compute on the desktop.",
+        "expected_topics": ["consumer-hardware"],
+        "forbidden_topics": []
+      },
+      {
+        "key": "airtags-discount-theverge",
+        "source": "theverge.com",
+        "published_at": "2026-08-24T14:04:00Z",
+        "title": "Apple's four-pack of second-gen AirTags is $20 off",
+        "text": "A four-pack of Apple's second-generation AirTags is discounted by $20 for a limited time, making it a good moment to pick up a set for tracking luggage, keys, or a bag.",
+        "expected_topics": ["consumer-hardware"],
+        "forbidden_topics": []
+      }
+    ],
+    "expected_clusters": [["mac-launch-theverge-2"], ["airtags-discount-theverge"]],
+    "expected_member_kinds": {
+      "mac-launch-theverge-2": "primary",
+      "airtags-discount-theverge": "primary"
+    },
+    "expected_distinct_sources": null,
+    "notes": "Expected: DIFFERENT clusters (different concrete events) even though they may share the consumer-hardware topic. This tests the invariant that 'same topic' does not imply 'same event'."
+  },
+  {
+    "case_id": "same_publisher_duplicate",
+    "scenario_number": 4,
+    "description": "The same Reddit thread crawled twice because of a URL bug: the js_challenge/solution/token query parameters change on every crawl, so UNIQUE(url) fails to recognize this as the same article.",
+    "source_note": "Real finding from the 2026-08-26 data audit (docs/measurements.md) -- 14 duplicate rows for the same thread reddit.com/r/programming/comments/1vwyjg2. The two records chosen here have different content lengths (16,961 and 19,919 characters) because the challenge page renders differently each time, but they are the same shared article.",
+    "articles": [
+      {
+        "key": "reddit-zig-rust-a",
+        "source": "reddit.com",
+        "published_at": "2026-08-24T10:06:30Z",
+        "title": "What Zig felt like, coming from Rust : r/programming",
+        "text": "What Zig felt like, coming from Rust. Posted to r/programming, linking to besok.github.io/posts/what-zig-felt-like-coming-from-rust/. A developer's account of switching from Rust to Zig and the differences they noticed.",
+        "expected_topics": ["programming-languages"],
+        "forbidden_topics": []
+      },
+      {
+        "key": "reddit-zig-rust-b",
+        "source": "reddit.com",
+        "published_at": "2026-08-24T10:06:30Z",
+        "title": "What Zig felt like, coming from Rust : r/programming",
+        "text": "What Zig felt like, coming from Rust. Posted to r/programming, linking to besok.github.io/posts/what-zig-felt-like-coming-from-rust/. A developer's account of switching from Rust to Zig and the differences they noticed.",
+        "expected_topics": ["programming-languages"],
+        "forbidden_topics": []
+      }
+    ],
+    "expected_clusters": [["reddit-zig-rust-a", "reddit-zig-rust-b"]],
+    "expected_member_kinds": {
+      "reddit-zig-rust-a": "primary",
+      "reddit-zig-rust-b": "near_duplicate"
+    },
+    "expected_distinct_sources": 1,
+    "notes": "Expected: the article that arrives later (by published_at/crawled_at) is marked member_kind=near_duplicate and does NOT pull the centroid. n_distinct_sources must be 1, not 2, since this is the same publisher."
+  },
+  {
+    "case_id": "near_identical_cross_publisher",
+    "scenario_number": 5,
+    "description": "Near-identical content from two publishers: Slashdot quotes Ars Technica almost verbatim.",
+    "source_note": "Excerpted from real raw_articles rows (arstechnica.com, science.slashdot.org), audited 2026-08-26.",
+    "articles": [
+      {
+        "key": "antibody-images-arstechnica",
+        "source": "arstechnica.com",
+        "published_at": "2026-08-25T16:16:57Z",
+        "title": "Lab supply companies have been selling antibodies using manipulated images",
+        "text": "Antibodies play a central role in the body's immune defense and are also nearly ubiquitous in biological research, essential for several widely used lab techniques. An investigation found some lab supply companies have sold antibodies validated with manipulated images.",
+        "expected_topics": ["science-research"],
+        "forbidden_topics": []
+      },
+      {
+        "key": "antibody-images-slashdot",
+        "source": "science.slashdot.org",
+        "published_at": "2026-08-26T03:30:00Z",
+        "title": "Lab Supply Companies Have Been Selling Antibodies Using Manipulated Images",
+        "text": "An anonymous reader quotes a report from Ars Technica: Antibodies play a central role in the body's immune defense and are also nearly ubiquitous in biological research, essential for several widely used lab techniques.",
+        "expected_topics": ["science-research"],
+        "forbidden_topics": []
+      }
+    ],
+    "expected_clusters": [["antibody-images-arstechnica", "antibody-images-slashdot"]],
+    "expected_member_kinds": {
+      "antibody-images-arstechnica": "primary",
+      "antibody-images-slashdot": "primary"
+    },
+    "expected_distinct_sources": 2,
+    "notes": "Expected: even though the content is nearly sentence-for-sentence identical, because they are DIFFERENT publishers both remain primary members and both are retained as evidence (no cross-source suppression, per plan Sec 2.5)."
+  },
+  {
+    "case_id": "multi_label_article",
+    "scenario_number": 6,
+    "description": "An article that belongs to both the AI topic and the semiconductors/hardware topic.",
+    "source_note": "Excerpted from a real raw_articles row (theregister.com), audited 2026-08-26.",
+    "articles": [
+      {
+        "key": "ai-custom-hardware-register",
+        "source": "theregister.com",
+        "published_at": "2026-08-24T10:57:00Z",
+        "title": "AI vendors are turning to custom hardware as Microsoft winds back the clock",
+        "text": "This week showed more about what's going on inside the datacenter. GPUs may still be king but their exclusive reign on the rack is over, as AI vendors increasingly turn to custom silicon and purpose-built hardware to run their models more efficiently.",
+        "expected_topics": ["artificial-intelligence", "semiconductors"],
+        "forbidden_topics": []
+      }
+    ],
+    "expected_clusters": [["ai-custom-hardware-register"]],
+    "expected_member_kinds": {
+      "ai-custom-hardware-register": "primary"
+    },
+    "expected_distinct_sources": 1,
+    "notes": "Expected: article_topics has both artificial-intelligence AND semiconductors assigned=true (score >= threshold for both)."
+  },
+  {
+    "case_id": "hard_negative_keyword",
+    "scenario_number": 7,
+    "description": "An article containing the substring 'Air' (inside 'AirTags'), which would falsely match the keyword 'AI' under naive substring matching; the article has nothing to do with artificial intelligence.",
+    "source_note": "Excerpted from a real raw_articles row (theverge.com), audited 2026-08-26.",
+    "articles": [
+      {
+        "key": "airtags-discount-hardneg",
+        "source": "theverge.com",
+        "published_at": "2026-08-24T14:04:00Z",
+        "title": "Apple's four-pack of second-gen AirTags is $20 off",
+        "text": "A four-pack of Apple's second-generation AirTags is discounted by $20 for a limited time, making it a good moment to pick up a set for tracking luggage, keys, or a bag. No AI features are involved -- this is a straightforward accessory deal.",
+        "expected_topics": ["consumer-hardware"],
+        "forbidden_topics": ["artificial-intelligence"]
+      }
+    ],
+    "expected_clusters": [["airtags-discount-hardneg"]],
+    "expected_member_kinds": {
+      "airtags-discount-hardneg": "primary"
+    },
+    "expected_distinct_sources": 1,
+    "notes": "Expected: the artificial-intelligence topic is NOT assigned. This tests the token-boundary keyword matching called out in plan Sec 3.4/5.1 ('AI' must not match inside 'said'/'AirTags')."
+  },
+  {
+    "case_id": "outside_taxonomy",
+    "scenario_number": 8,
+    "description": "An article entirely outside the tech taxonomy: a biomedical study on peppermint oil.",
+    "source_note": "Excerpted from a real raw_articles row (journals.plos.org), audited 2026-08-26.",
+    "articles": [
+      {
+        "key": "peppermint-study-plos",
+        "source": "journals.plos.org",
+        "published_at": "2026-08-24T14:44:55Z",
+        "title": "Effects of peppermint (Mentha x piperita L.) oil on cardiometabolic outcomes",
+        "text": "This study examines the effects of peppermint oil supplementation on cardiometabolic outcomes in patients, reporting on blood pressure, lipid profile, and related biomarkers over the trial period.",
+        "expected_topics": [],
+        "forbidden_topics": ["artificial-intelligence", "consumer-hardware", "semiconductors", "privacy-security", "programming-languages", "science-research"]
+      }
+    ],
+    "expected_clusters": [["peppermint-study-plos"]],
+    "expected_member_kinds": {
+      "peppermint-study-plos": "primary"
+    },
+    "expected_distinct_sources": 1,
+    "notes": "Expected: no topic in the current taxonomy is assigned (assigned_count=0 / uncategorized). Do not force this article into science-research -- this corpus is tech-focused, not biomedical."
+  },
+  {
+    "case_id": "similar_but_beyond_window",
+    "scenario_number": 9,
+    "description": "Two articles about the same broad Apple Mac news line (semantically similar) but with published_at reassigned SYNTHETICALLY to be more than 72h apart -- tests the cluster_window invariant.",
+    "source_note": "REUSES the real text from case 1 (theverge.com, cnet.com) but with the timestamps deliberately changed: see the 'Fixture note' in docs/measurements.md Sec T0. The real corpus only spans ~5 days, so there is no naturally occurring pair that is semantically similar, from a different event, and more than 72h apart; this is a deliberate choice, not a live timestamp reference.",
+    "articles": [
+      {
+        "key": "mac-launch-theverge-early",
+        "source": "theverge.com",
+        "published_at": "2026-08-20T13:00:00Z",
+        "title": "Apple launches new Mac Studios with its most powerful chip ever, the M5 Ultra",
+        "text": "Apple is announcing new models of the Mac Studio, now using the existing M5 Max and a new M5 Ultra chip. The company says the M5 Ultra is its most powerful chip yet, aimed at professional workloads and AI compute on the desktop.",
+        "expected_topics": ["consumer-hardware"],
+        "forbidden_topics": []
+      },
+      {
+        "key": "mac-launch-cnet-late",
+        "source": "cnet.com",
+        "published_at": "2026-08-25T13:00:00Z",
+        "title": "New M6 Mac Mini and Mac Studio With M5 Ultra Promise Needed Boost for AI and Graphics",
+        "text": "Apple refreshed its desktop computer lineup with a new M6 Mac mini and an updated Mac Studio built around the M5 Ultra chip, promising a meaningful performance boost for AI workloads and graphics-heavy tasks.",
+        "expected_topics": ["consumer-hardware"],
+        "forbidden_topics": []
+      }
+    ],
+    "expected_clusters": [["mac-launch-theverge-early"], ["mac-launch-cnet-late"]],
+    "expected_member_kinds": {
+      "mac-launch-theverge-early": "primary",
+      "mac-launch-cnet-late": "primary"
+    },
+    "expected_distinct_sources": null,
+    "notes": "Timestamps are 5 days apart (>72h cluster_window). Expected: NOT the same cluster despite high cosine similarity, because ClusterWorker only considers candidates 'still active within 72h'. This is a dedicated time-window test, distinct from case 1 (same event, same time window)."
+  },
+  {
+    "case_id": "arrival_order_invariance",
+    "scenario_number": 10,
+    "description": "Same input as case 1 (Apple Mac Studio/mini M6, two publishers), but the runner must process it in at least two different orders and then compare the canonical member sets.",
+    "source_note": "Reuses the exact text and timestamps from case 1; the only difference is the processing order, controlled by the T9 runner.",
+    "articles": [
+      {
+        "key": "mac-launch-cnet-order",
+        "source": "cnet.com",
+        "published_at": "2026-08-25T13:00:00Z",
+        "title": "New M6 Mac Mini and Mac Studio With M5 Ultra Promise Needed Boost for AI and Graphics",
+        "text": "Apple refreshed its desktop computer lineup with a new M6 Mac mini and an updated Mac Studio built around the M5 Ultra chip, promising a meaningful performance boost for AI workloads and graphics-heavy tasks.",
+        "expected_topics": ["consumer-hardware"],
+        "forbidden_topics": []
+      },
+      {
+        "key": "mac-launch-theverge-order",
+        "source": "theverge.com",
+        "published_at": "2026-08-25T13:00:00Z",
+        "title": "Apple launches new Mac Studios with its most powerful chip ever, the M5 Ultra",
+        "text": "Apple is announcing new models of the Mac Studio, now using the existing M5 Max and a new M5 Ultra chip. The company says the M5 Ultra is its most powerful chip yet, aimed at professional workloads and AI compute on the desktop.",
+        "expected_topics": ["consumer-hardware"],
+        "forbidden_topics": []
+      }
+    ],
+    "expected_clusters": [["mac-launch-cnet-order", "mac-launch-theverge-order"]],
+    "expected_member_kinds": {
+      "mac-launch-cnet-order": "primary",
+      "mac-launch-theverge-order": "primary"
+    },
+    "expected_distinct_sources": 2,
+    "notes": "The 'articles' list here is in REVERSED order relative to case 1 (cnet first, theverge second) to serve as input for the first run; T9 must also run at least one other permutation (e.g. case 1's original order) and assert both runs produce the same canonical member set (same cluster, same headline after tie-break, independent of arrival order)."
+  }
+]
