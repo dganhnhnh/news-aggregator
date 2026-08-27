@@ -47,6 +47,7 @@ export function FeedView({
         onQChange={setQ}
         range={range}
         onRangeChange={setRange}
+        since={since}
         selectedSources={selectedSources}
         onSelectedSourcesChange={setSelectedSources}
         lockedSourceName={lockedSource?.name}

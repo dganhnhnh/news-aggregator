@@ -5,11 +5,13 @@ import { buildSourcesKey, fetcher } from '@/lib/client-api'
 import { DEFAULT_START_TIME } from '@/lib/time'
 import type { Source } from '@/lib/types'
 
-export function useSources({ since = DEFAULT_START_TIME }: { since?: string } = {}) {
+export function useSources(
+  { since = DEFAULT_START_TIME, enabled = true }: { since?: string; enabled?: boolean } = {},
+) {
   const { data, error, isLoading, mutate } = useSWR<Source[]>(
-    buildSourcesKey({ since }),
+    enabled ? buildSourcesKey({ since }) : null,
     fetcher,
-    { revalidateOnFocus: false },
+    { keepPreviousData: true, revalidateOnFocus: false },
   )
 
   return {

@@ -55,6 +55,7 @@ export function StoryView() {
       <StoryFiltersBar
         range={range}
         onRangeChange={setRange}
+        since={since}
         selectedSources={selectedSources}
         onSelectedSourcesChange={setSelectedSources}
         minSources={minSources}

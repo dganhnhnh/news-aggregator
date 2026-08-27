@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Search, ChevronDown, Check, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -26,6 +26,7 @@ import {
   CommandList,
 } from '@/components/ui/command'
 import { Badge } from '@/components/ui/badge'
+import { useMinuteNow } from '@/hooks/use-minute-now'
 import { useSources } from '@/hooks/use-sources'
 import { sinceFromRange, TIME_RANGE_OPTIONS, type TimeRangeValue } from '@/lib/time'
 import { cn } from '@/lib/utils'
@@ -35,6 +36,7 @@ type FiltersBarProps = {
   onQChange: (q: string) => void
   range: TimeRangeValue
   onRangeChange: (range: TimeRangeValue) => void
+  since: string
   selectedSources: string[]
   onSelectedSourcesChange: (sources: string[]) => void
   lockedSourceName?: string
@@ -46,13 +48,21 @@ export function FiltersBar({
   onQChange,
   range,
   onRangeChange,
+  since,
   selectedSources,
   onSelectedSourcesChange,
   lockedSourceName,
   resultLabel,
 }: FiltersBarProps) {
-  const since = sinceFromRange(range)
-  const { sources, error: sourcesError } = useSources({ since })
+  const sourceNow = useMinuteNow()
+  const sourceSince = useMemo(
+    () => (range === 'all' ? since : sinceFromRange(range, sourceNow)),
+    [range, since, sourceNow],
+  )
+  const { sources, error: sourcesError } = useSources({
+    since: sourceSince,
+    enabled: !lockedSourceName,
+  })
   const [sourcePopoverOpen, setSourcePopoverOpen] = useState(false)
 
   function toggleSource(slug: string) {
