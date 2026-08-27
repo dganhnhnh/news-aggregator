@@ -59,6 +59,10 @@ from models.storage_models import (
     SourceItem,
     StoredCrawlFailure,
     StorageWriteSummary,
+    StoryDetailItem,
+    StoryFeedItem,
+    StoryMember,
+    StorySourceRef,
     WorkerTrigger,
 )
 from services.raw_storage import build_excerpt, source_slug
@@ -70,6 +74,9 @@ class StorageError(RuntimeError):
 
 
 MAX_FAILURE_ATTEMPTS = 5
+# How many representative sources a story summary carries for its avatar
+# strip; the full distinct-source count is a separate, already-cached field.
+STORY_SOURCE_LIMIT = 3
 
 
 def _vector_list(value: Any) -> list[float]:
@@ -1479,6 +1486,190 @@ class PostgresRawStorage:
             )
             row = result.first()
             return ArticleDetailItem(**dict(row._mapping)) if row is not None else None
+
+    @staticmethod
+    async def _top_story_sources(
+        connection: AsyncConnection, cluster_ids: Sequence[int]
+    ) -> dict[int, list[StorySourceRef]]:
+        """Up to `STORY_SOURCE_LIMIT` sources per cluster, ranked by article
+        count. One query for the whole page, not one per story."""
+        counts = (
+            select(
+                cluster_members.c.cluster_id,
+                sources.c.slug,
+                sources.c.name,
+                func.count().label("article_count"),
+            )
+            .select_from(
+                cluster_members.join(
+                    raw_articles, cluster_members.c.article_id == raw_articles.c.id
+                ).join(sources, raw_articles.c.source_id == sources.c.id)
+            )
+            .where(cluster_members.c.cluster_id.in_(cluster_ids))
+            .group_by(cluster_members.c.cluster_id, sources.c.slug, sources.c.name)
+            .subquery()
+        )
+        ranked = (
+            select(
+                counts.c.cluster_id,
+                counts.c.slug,
+                counts.c.name,
+                func.row_number()
+                .over(
+                    partition_by=counts.c.cluster_id,
+                    order_by=(counts.c.article_count.desc(), counts.c.name),
+                )
+                .label("rn"),
+            )
+        ).subquery()
+        rows = await connection.execute(
+            select(ranked.c.cluster_id, ranked.c.slug, ranked.c.name)
+            .where(ranked.c.rn <= STORY_SOURCE_LIMIT)
+            .order_by(ranked.c.cluster_id, ranked.c.rn)
+        )
+        result: dict[int, list[StorySourceRef]] = {}
+        for row in rows:
+            result.setdefault(int(row.cluster_id), []).append(
+                StorySourceRef(slug=row.slug, name=row.name)
+            )
+        return result
+
+    async def list_stories(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+        cursor: tuple[datetime, int] | None = None,
+        source_slugs: Sequence[str] | None = None,
+        min_sources: int = 1,
+        min_articles: int = 1,
+    ) -> list[StoryFeedItem]:
+        """List canonical stories (open or closed, never a merge loser),
+        newest by `last_seen_at` first. `source_slugs` filters to stories with
+        at least one member article from any of those sources, done with an
+        `EXISTS` so filtering can never surface duplicate rows."""
+        filters: list[Any] = [
+            clusters.c.status != "merged",
+            clusters.c.last_seen_at >= since,
+            clusters.c.last_seen_at < until,
+            clusters.c.n_distinct_sources >= min_sources,
+            clusters.c.n_articles >= min_articles,
+        ]
+        if cursor is not None:
+            filters.append(
+                tuple_(clusters.c.last_seen_at, clusters.c.id) < tuple_(*cursor)
+            )
+        if source_slugs:
+            filters.append(
+                select(1)
+                .select_from(
+                    cluster_members.join(
+                        raw_articles,
+                        cluster_members.c.article_id == raw_articles.c.id,
+                    ).join(sources, raw_articles.c.source_id == sources.c.id)
+                )
+                .where(
+                    cluster_members.c.cluster_id == clusters.c.id,
+                    sources.c.slug.in_(source_slugs),
+                )
+                .exists()
+            )
+
+        stmt = (
+            select(
+                clusters.c.id,
+                clusters.c.headline,
+                clusters.c.first_seen_at,
+                clusters.c.last_seen_at,
+                clusters.c.n_articles,
+                clusters.c.n_distinct_sources,
+            )
+            .where(*filters)
+            .order_by(clusters.c.last_seen_at.desc(), clusters.c.id.desc())
+            .limit(limit)
+        )
+
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(stmt)).all()
+            if not rows:
+                return []
+            sources_by_cluster = await self._top_story_sources(
+                connection, [row.id for row in rows]
+            )
+            return [
+                StoryFeedItem(
+                    id=row.id,
+                    headline=row.headline,
+                    first_seen_at=row.first_seen_at,
+                    last_seen_at=row.last_seen_at,
+                    article_count=row.n_articles,
+                    source_count=row.n_distinct_sources,
+                    sources=sources_by_cluster.get(row.id, []),
+                )
+                for row in rows
+            ]
+
+    async def get_story(self, story_id: int) -> StoryDetailItem | None:
+        """A story's members, resolving a merge loser to its canonical
+        cluster. Merges are always a single hop -- only an `open` cluster can
+        become a merge loser, so a `merged_into_id` never chains."""
+        async with self._engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    select(clusters).where(clusters.c.id == story_id)
+                )
+            ).first()
+            if row is None:
+                return None
+            if row.merged_into_id is not None:
+                row = (
+                    await connection.execute(
+                        select(clusters).where(clusters.c.id == row.merged_into_id)
+                    )
+                ).first()
+                if row is None:
+                    return None
+
+            member_rows = await connection.execute(
+                select(
+                    raw_articles.c.id,
+                    raw_articles.c.title,
+                    raw_articles.c.url,
+                    raw_articles.c.published_at,
+                    raw_articles.c.event_at,
+                    sources.c.slug.label("source_slug"),
+                    sources.c.name.label("source_name"),
+                )
+                .select_from(
+                    cluster_members.join(
+                        raw_articles,
+                        cluster_members.c.article_id == raw_articles.c.id,
+                    ).outerjoin(sources, raw_articles.c.source_id == sources.c.id)
+                )
+                .where(cluster_members.c.cluster_id == row.id)
+                .order_by(raw_articles.c.event_at.desc(), raw_articles.c.id.desc())
+            )
+            return StoryDetailItem(
+                id=int(row.id),
+                headline=row.headline,
+                first_seen_at=row.first_seen_at,
+                last_seen_at=row.last_seen_at,
+                article_count=row.n_articles,
+                source_count=row.n_distinct_sources,
+                members=[
+                    StoryMember(
+                        article_id=member.id,
+                        title=member.title,
+                        url=member.url,
+                        source_slug=member.source_slug,
+                        source_name=member.source_name,
+                        published_at=member.published_at,
+                        event_at=member.event_at,
+                    )
+                    for member in member_rows
+                ],
+            )
 
     async def due_failures(self, limit: int) -> list[StoredCrawlFailure]:
         now = datetime.now(timezone.utc)

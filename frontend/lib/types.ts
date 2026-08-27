@@ -40,3 +40,41 @@ export type ArticlePage = {
     until: string
   }
 }
+
+export type StorySummary = {
+  id: number
+  headline: string | null
+  first_seen_at: string
+  last_seen_at: string
+  article_count: number
+  source_count: number
+  sources: SourceRef[]
+}
+
+export type StoryMember = {
+  article_id: number
+  title: string | null
+  url: string
+  source: SourceRef | null
+  published_at: string | null
+  event_at: string
+}
+
+export type StoryDetail = {
+  id: number
+  headline: string | null
+  first_seen_at: string
+  last_seen_at: string
+  article_count: number
+  source_count: number
+  members: StoryMember[]
+}
+
+export type StoryPage = {
+  items: StorySummary[]
+  next_cursor: string | null
+  window: {
+    since: string
+    until: string
+  }
+}

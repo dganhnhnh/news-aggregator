@@ -20,8 +20,8 @@ const NAV_ITEMS = [
     key: 'stories',
     label: 'Stories',
     icon: BookOpen,
-    href: null,
-    available: false,
+    href: '/stories',
+    available: true,
   },
   {
     key: 'trends',
@@ -36,6 +36,7 @@ export function NavRail() {
   const pathname = usePathname()
   const isArticlesActive =
     pathname === '/' || pathname.startsWith('/sources') || pathname.startsWith('/articles')
+  const isStoriesActive = pathname.startsWith('/stories')
 
   return (
     <nav
@@ -53,7 +54,9 @@ export function NavRail() {
 
         <div className="flex flex-col items-center gap-1">
           {NAV_ITEMS.map((item) => {
-            const isActive = item.key === 'articles' && isArticlesActive
+            const isActive =
+              (item.key === 'articles' && isArticlesActive) ||
+              (item.key === 'stories' && isStoriesActive)
             const Icon = item.icon
 
             const button = (

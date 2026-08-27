@@ -7,7 +7,7 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
-from models.storage_models import ArticleFeedItem
+from models.storage_models import ArticleFeedItem, StoryFeedItem
 
 T = TypeVar("T")
 
@@ -56,6 +56,47 @@ class ArticleDetail(BaseModel):
     published_at: datetime | None
     crawled_at: datetime
     event_at: datetime
+
+
+class StorySummary(BaseModel):
+    id: int
+    headline: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    article_count: int
+    source_count: int
+    sources: list[SourceRef]
+
+    @classmethod
+    def from_feed_item(cls, item: StoryFeedItem) -> "StorySummary":
+        return cls(
+            id=item.id,
+            headline=item.headline,
+            first_seen_at=item.first_seen_at,
+            last_seen_at=item.last_seen_at,
+            article_count=item.article_count,
+            source_count=item.source_count,
+            sources=[SourceRef(slug=s.slug, name=s.name) for s in item.sources],
+        )
+
+
+class StoryMember(BaseModel):
+    article_id: int
+    title: str | None
+    url: str
+    source: SourceRef | None
+    published_at: datetime | None
+    event_at: datetime
+
+
+class StoryDetail(BaseModel):
+    id: int
+    headline: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    article_count: int
+    source_count: int
+    members: list[StoryMember]
 
 
 class SourceItem(BaseModel):

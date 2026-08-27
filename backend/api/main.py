@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.deps import get_settings, lifespan
-from api.routers import articles, health, sources
+from api.routers import articles, health, sources, stories
 from core.logger import setup_logging
 
 
@@ -24,6 +24,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(articles.router)
     app.include_router(sources.router)
+    app.include_router(stories.router)
     return app
 
 

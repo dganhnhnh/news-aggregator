@@ -122,6 +122,45 @@ class ArticleDetailItem:
 
 
 @dataclass(frozen=True)
+class StorySourceRef:
+    slug: str
+    name: str
+
+
+@dataclass(frozen=True)
+class StoryFeedItem:
+    id: int
+    headline: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    article_count: int
+    source_count: int
+    sources: list[StorySourceRef]
+
+
+@dataclass(frozen=True)
+class StoryMember:
+    article_id: int
+    title: str | None
+    url: str
+    source_slug: str | None
+    source_name: str | None
+    published_at: datetime | None
+    event_at: datetime
+
+
+@dataclass(frozen=True)
+class StoryDetailItem:
+    id: int
+    headline: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    article_count: int
+    source_count: int
+    members: list[StoryMember]
+
+
+@dataclass(frozen=True)
 class HistoricalBlockPage:
     """A summary-only article whose title came from an old block page."""
 
