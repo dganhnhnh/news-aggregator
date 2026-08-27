@@ -1,6 +1,6 @@
 """`JobQueue` port over `processing_jobs`, so a Redis-backed queue can
-implement the same interface later (spec.md §4, week4) without touching
-`EmbedWorker`.
+implement the same interface later (spec.md §4, week4) without touching the
+stage workers.
 """
 
 from __future__ import annotations

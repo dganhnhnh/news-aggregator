@@ -118,6 +118,12 @@ class EmbedWorker(Worker):
                     and candidate.existing_content_hash == text_hash
                 ):
                     stats.skipped_unchanged += 1
+                    # A prior process may have stored the vector before the
+                    # downstream queues existed. Ensure missing jobs even on
+                    # the unchanged fast path, without replaying done jobs.
+                    await storage.ensure_processing_jobs(
+                        [job.article_id], ("classify", "cluster")
+                    )
                     await queue.complete(job.article_id, STAGE)
                     continue
                 to_embed.append(

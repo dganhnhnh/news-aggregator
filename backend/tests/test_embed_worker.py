@@ -99,6 +99,7 @@ class FakeStorage:
         self.upserted: list[EmbeddingRecord] = []
         self.reenqueue_calls: list[dict[str, Any]] = []
         self.reenqueue_result = 0
+        self.ensure_calls: list[tuple[list[int], tuple[str, ...]]] = []
 
     async def embeddable_articles(
         self, article_ids: Sequence[int]
@@ -107,6 +108,11 @@ class FakeStorage:
 
     async def upsert_embeddings(self, records: Sequence[EmbeddingRecord]) -> None:
         self.upserted.extend(records)
+
+    async def ensure_processing_jobs(
+        self, article_ids: Sequence[int], stages: Sequence[str]
+    ) -> None:
+        self.ensure_calls.append((list(article_ids), tuple(stages)))
 
     async def update_run(self, run_id: int, stats: Any) -> None:
         pass
@@ -184,6 +190,7 @@ def test_unchanged_content_is_skipped_without_calling_the_embedder() -> None:
     assert outcome.stats.embedded == 0
     assert embedder.batches == []
     assert storage.upserted == []
+    assert storage.ensure_calls == [([1], ("classify", "cluster"))]
     assert queue.completed == [1]
 
 

@@ -26,6 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 
 from adapters.storage.schema import (
     article_embeddings,
+    cluster_members,
+    clusters,
     crawl_failures,
     feed_state,
     processing_jobs,
@@ -38,6 +40,9 @@ from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
     CrawlFailureOccurrence,
+    ClusterArticle,
+    ClusterAttachResult,
+    ClusterCandidate,
     EmbeddingCandidate,
     EmbeddingRecord,
     FailureKind,
@@ -54,6 +59,7 @@ from models.storage_models import (
     WorkerTrigger,
 )
 from services.raw_storage import build_excerpt, source_slug
+from services.clustering import running_centroid
 
 
 class StorageError(RuntimeError):
@@ -61,6 +67,46 @@ class StorageError(RuntimeError):
 
 
 MAX_FAILURE_ATTEMPTS = 5
+
+
+def _vector_list(value: Any) -> list[float]:
+    """Convert pgvector/numpy return values into domain-owned plain lists."""
+    converted = value.tolist() if hasattr(value, "tolist") else value
+    return [float(item) for item in converted]
+
+
+async def _lock_article(connection: AsyncConnection, article_id: int) -> None:
+    """Serialize competing create/attach decisions for one article."""
+    await connection.execute(
+        text("SELECT pg_advisory_xact_lock(CAST(:article_id AS BIGINT))"),
+        {"article_id": article_id},
+    )
+
+
+async def _representative_headline(
+    connection: AsyncConnection, cluster_id: int, centroid: Sequence[float]
+) -> str | None:
+    distance = article_embeddings.c.embedding.cosine_distance(list(centroid))
+    return await connection.scalar(
+        select(raw_articles.c.title)
+        .select_from(
+            cluster_members.join(
+                raw_articles, cluster_members.c.article_id == raw_articles.c.id
+            )
+            .join(
+                article_embeddings,
+                cluster_members.c.article_id == article_embeddings.c.article_id,
+            )
+            .outerjoin(sources, raw_articles.c.source_id == sources.c.id)
+        )
+        .where(
+            cluster_members.c.cluster_id == cluster_id,
+            raw_articles.c.title.is_not(None),
+            raw_articles.c.title != "",
+        )
+        .order_by(distance, sources.c.slug.nulls_last(), raw_articles.c.id)
+        .limit(1)
+    )
 
 
 def retry_delay(
@@ -107,7 +153,9 @@ class PostgresRawStorage:
                         "to_regclass('public.sources'), "
                         "to_regclass('public.feed_state'), "
                         "to_regclass('public.processing_jobs'), "
-                        "to_regclass('public.article_embeddings')"
+                        "to_regclass('public.article_embeddings'), "
+                        "to_regclass('public.clusters'), "
+                        "to_regclass('public.cluster_members')"
                     )
                 )
                 if any(value is None for value in tables.one()):
@@ -469,27 +517,60 @@ class PostgresRawStorage:
         write in the same run must not be disturbed.
         """
         now = datetime.now(timezone.utc)
+        await PostgresRawStorage._enqueue_processing_jobs(
+            connection,
+            article_ids,
+            ("embed",),
+            reset_completed=True,
+            now=now,
+        )
+
+    @staticmethod
+    async def _enqueue_processing_jobs(
+        connection: AsyncConnection,
+        article_ids: Sequence[int],
+        stages: Sequence[str],
+        *,
+        reset_completed: bool,
+        now: datetime | None = None,
+    ) -> None:
+        if not article_ids or not stages:
+            return
+        timestamp = now or datetime.now(timezone.utc)
         stmt = pg_insert(processing_jobs).values(
             [
-                {"article_id": article_id, "stage": "embed"}
+                {"article_id": article_id, "stage": stage}
                 for article_id in article_ids
+                for stage in stages
             ]
         )
+        if not reset_completed:
+            await connection.execute(stmt.on_conflict_do_nothing())
+            return
         await connection.execute(
             stmt.on_conflict_do_update(
                 index_elements=[processing_jobs.c.article_id, processing_jobs.c.stage],
                 set_={
                     "state": "pending",
                     "attempts": 0,
-                    "available_at": now,
+                    "available_at": timestamp,
                     "lease_until": None,
                     "locked_by": None,
                     "last_error": None,
-                    "updated_at": now,
+                    "updated_at": timestamp,
                 },
                 where=processing_jobs.c.state.in_(("done", "dead_letter")),
             )
         )
+
+    async def ensure_processing_jobs(
+        self, article_ids: Sequence[int], stages: Sequence[str]
+    ) -> None:
+        """Create missing downstream jobs without replaying completed work."""
+        async with self._engine.begin() as connection:
+            await self._enqueue_processing_jobs(
+                connection, article_ids, stages, reset_completed=False
+            )
 
     async def embeddable_articles(
         self, article_ids: Sequence[int]
@@ -565,6 +646,265 @@ class PostgresRawStorage:
                     },
                 )
             )
+            # This transaction closes the crash gap between storing a vector
+            # and making it visible to downstream stages. A changed embedding
+            # deliberately replays completed cluster/classify jobs.
+            await self._enqueue_processing_jobs(
+                connection,
+                [record.article_id for record in records],
+                ("classify", "cluster"),
+                reset_completed=True,
+            )
+
+    async def clusterable_articles(
+        self, article_ids: Sequence[int]
+    ) -> dict[int, ClusterArticle]:
+        if not article_ids:
+            return {}
+        async with self._engine.connect() as connection:
+            rows = await connection.execute(
+                select(
+                    raw_articles.c.id,
+                    raw_articles.c.source_id,
+                    raw_articles.c.title,
+                    raw_articles.c.event_at,
+                    article_embeddings.c.model,
+                    article_embeddings.c.dim,
+                    article_embeddings.c.embedding,
+                )
+                .select_from(
+                    raw_articles.join(
+                        article_embeddings,
+                        raw_articles.c.id == article_embeddings.c.article_id,
+                    )
+                )
+                .where(raw_articles.c.id.in_(article_ids))
+            )
+            return {
+                row.id: ClusterArticle(
+                    article_id=row.id,
+                    source_id=row.source_id,
+                    title=row.title,
+                    event_at=row.event_at,
+                    model=row.model,
+                    dim=row.dim,
+                    embedding=_vector_list(row.embedding),
+                )
+                for row in rows
+            }
+
+    async def cluster_membership(self, article_id: int) -> int | None:
+        async with self._engine.connect() as connection:
+            value = await connection.scalar(
+                select(cluster_members.c.cluster_id).where(
+                    cluster_members.c.article_id == article_id
+                )
+            )
+            return int(value) if value is not None else None
+
+    async def active_cluster_candidates(
+        self,
+        article: ClusterArticle,
+        *,
+        window: timedelta,
+        limit: int,
+    ) -> list[ClusterCandidate]:
+        if limit <= 0:
+            return []
+        distance = clusters.c.centroid.cosine_distance(article.embedding)
+        async with self._engine.connect() as connection:
+            rows = await connection.execute(
+                select(
+                    clusters.c.id,
+                    clusters.c.centroid,
+                    clusters.c.centroid_count,
+                    clusters.c.first_seen_at,
+                    clusters.c.last_seen_at,
+                    (1 - distance).label("similarity"),
+                )
+                .where(
+                    clusters.c.status == "open",
+                    clusters.c.last_seen_at >= article.event_at - window,
+                    clusters.c.first_seen_at <= article.event_at + window,
+                )
+                .order_by(
+                    distance,
+                    func.abs(
+                        func.extract(
+                            "epoch", clusters.c.last_seen_at - article.event_at
+                        )
+                    ),
+                    clusters.c.id,
+                )
+                .limit(limit)
+            )
+            return [
+                ClusterCandidate(
+                    cluster_id=row.id,
+                    centroid=_vector_list(row.centroid),
+                    centroid_count=row.centroid_count,
+                    first_seen_at=row.first_seen_at,
+                    last_seen_at=row.last_seen_at,
+                    similarity=float(row.similarity),
+                )
+                for row in rows
+            ]
+
+    async def create_cluster(self, article: ClusterArticle) -> ClusterAttachResult:
+        """Create a one-member cluster, idempotently per article."""
+        async with self._engine.begin() as connection:
+            await _lock_article(connection, article.article_id)
+            existing = await connection.scalar(
+                select(cluster_members.c.cluster_id).where(
+                    cluster_members.c.article_id == article.article_id
+                )
+            )
+            if existing is not None:
+                count = await connection.scalar(
+                    select(clusters.c.centroid_count).where(clusters.c.id == existing)
+                )
+                return ClusterAttachResult(int(existing), False, int(count or 0))
+
+            cluster_id = int(
+                (
+                    await connection.execute(
+                        clusters.insert()
+                        .values(
+                            centroid=article.embedding,
+                            centroid_count=1,
+                            first_seen_at=article.event_at,
+                            last_seen_at=article.event_at,
+                            n_articles=1,
+                            n_distinct_sources=1 if article.source_id is not None else 0,
+                            headline=article.title,
+                            status="open",
+                        )
+                        .returning(clusters.c.id)
+                    )
+                ).scalar_one()
+            )
+            await connection.execute(
+                cluster_members.insert().values(
+                    cluster_id=cluster_id,
+                    article_id=article.article_id,
+                    similarity=1.0,
+                )
+            )
+            return ClusterAttachResult(cluster_id, True, 1)
+
+    async def attach_cluster_member(
+        self,
+        cluster_id: int,
+        article: ClusterArticle,
+        *,
+        similarity: float,
+    ) -> ClusterAttachResult:
+        """Attach once and update the exact running arithmetic mean atomically."""
+        async with self._engine.begin() as connection:
+            await _lock_article(connection, article.article_id)
+            existing = await connection.scalar(
+                select(cluster_members.c.cluster_id).where(
+                    cluster_members.c.article_id == article.article_id
+                )
+            )
+            if existing is not None:
+                count = await connection.scalar(
+                    select(clusters.c.centroid_count).where(clusters.c.id == existing)
+                )
+                return ClusterAttachResult(int(existing), False, int(count or 0))
+
+            row = (
+                await connection.execute(
+                    select(
+                        clusters.c.centroid,
+                        clusters.c.centroid_count,
+                        clusters.c.first_seen_at,
+                        clusters.c.last_seen_at,
+                    )
+                    .where(clusters.c.id == cluster_id, clusters.c.status == "open")
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if row is None:
+                raise StorageError(f"open cluster {cluster_id} not found")
+
+            new_centroid = running_centroid(
+                _vector_list(row.centroid), row.centroid_count, article.embedding
+            )
+            new_count = row.centroid_count + 1
+            await connection.execute(
+                cluster_members.insert().values(
+                    cluster_id=cluster_id,
+                    article_id=article.article_id,
+                    similarity=similarity,
+                )
+            )
+            source_count = int(
+                await connection.scalar(
+                    select(func.count(func.distinct(raw_articles.c.source_id)))
+                    .select_from(
+                        cluster_members.join(
+                            raw_articles,
+                            cluster_members.c.article_id == raw_articles.c.id,
+                        )
+                    )
+                    .where(cluster_members.c.cluster_id == cluster_id)
+                )
+                or 0
+            )
+            headline = await _representative_headline(
+                connection, cluster_id, new_centroid
+            )
+            await connection.execute(
+                update(clusters)
+                .where(clusters.c.id == cluster_id)
+                .values(
+                    centroid=new_centroid,
+                    centroid_count=new_count,
+                    first_seen_at=min(row.first_seen_at, article.event_at),
+                    last_seen_at=max(row.last_seen_at, article.event_at),
+                    n_articles=new_count,
+                    n_distinct_sources=source_count,
+                    headline=headline,
+                )
+            )
+            return ClusterAttachResult(cluster_id, True, new_count)
+
+    async def close_stale_clusters(self, *, before: datetime) -> int:
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                update(clusters)
+                .where(clusters.c.status == "open", clusters.c.last_seen_at < before)
+                .values(status="closed")
+            )
+            return int(result.rowcount or 0)
+
+    async def reenqueue_clusters(self, *, since: datetime, until: datetime) -> int:
+        """Queue embedded articles in a window that have no cluster membership."""
+        async with self._engine.begin() as connection:
+            ids = [
+                int(row.article_id)
+                for row in await connection.execute(
+                    select(article_embeddings.c.article_id)
+                    .join(
+                        raw_articles,
+                        raw_articles.c.id == article_embeddings.c.article_id,
+                    )
+                    .outerjoin(
+                        cluster_members,
+                        cluster_members.c.article_id == article_embeddings.c.article_id,
+                    )
+                    .where(
+                        raw_articles.c.event_at >= since,
+                        raw_articles.c.event_at < until,
+                        cluster_members.c.article_id.is_(None),
+                    )
+                )
+            ]
+            await self._enqueue_processing_jobs(
+                connection, ids, ("cluster",), reset_completed=True
+            )
+            return len(ids)
 
     async def reenqueue_embeddings(
         self,

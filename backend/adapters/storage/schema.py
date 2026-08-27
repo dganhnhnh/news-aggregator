@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     Computed,
     DateTime,
+    Float,
     ForeignKey,
     Identity,
     Index,
@@ -257,3 +258,59 @@ article_embeddings = Table(
 # The HNSW index is created by hand in the migration with `op.execute` --
 # autogenerate cannot render pgvector's access method or operator class, see
 # week1-foundation.md §4.6.
+
+clusters = Table(
+    "clusters",
+    metadata,
+    Column("id", BigInteger, Identity(), primary_key=True),
+    # Store the exact arithmetic mean, not an L2-normalized running vector.
+    # pgvector's cosine operator normalizes at comparison time, while keeping
+    # the mean unnormalized lets `(centroid * n + article) / (n + 1)` remain
+    # exact and independent of article arrival order.
+    Column("centroid", Vector(384), nullable=False),
+    Column("centroid_count", Integer, nullable=False),
+    Column("first_seen_at", DateTime(timezone=True), nullable=False),
+    Column("last_seen_at", DateTime(timezone=True), nullable=False),
+    Column("n_articles", Integer, nullable=False),
+    Column("n_distinct_sources", Integer, nullable=False),
+    Column("headline", Text),
+    Column("status", Text, nullable=False, server_default="open"),
+    Column(
+        "merged_into_id",
+        BigInteger,
+        ForeignKey("clusters.id", name="fk_clusters_merged_into_id_clusters"),
+    ),
+)
+Index(
+    "ix_clusters_open_last_seen",
+    clusters.c.last_seen_at,
+    postgresql_where=text("status = 'open'"),
+)
+
+cluster_members = Table(
+    "cluster_members",
+    metadata,
+    Column(
+        "cluster_id",
+        BigInteger,
+        ForeignKey("clusters.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "article_id",
+        BigInteger,
+        ForeignKey("raw_articles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    # Similarity at assignment time. The cluster centroid may move later, so
+    # this is audit data rather than a promise of current similarity.
+    Column("similarity", Float, nullable=False),
+    Column(
+        "added_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    PrimaryKeyConstraint("cluster_id", "article_id"),
+    UniqueConstraint("article_id", name="uq_cluster_members_article"),
+)

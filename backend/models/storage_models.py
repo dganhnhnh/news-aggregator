@@ -257,3 +257,44 @@ class EmbedRunStats:
     embedded: int = 0
     skipped_unchanged: int = 0
     failed: int = 0
+
+
+@dataclass(frozen=True)
+class ClusterArticle:
+    article_id: int
+    source_id: int | None
+    title: str | None
+    event_at: datetime
+    model: str
+    dim: int
+    embedding: list[float]
+
+
+@dataclass(frozen=True)
+class ClusterCandidate:
+    cluster_id: int
+    centroid: list[float]
+    centroid_count: int
+    first_seen_at: datetime
+    last_seen_at: datetime
+    similarity: float
+
+
+@dataclass(frozen=True)
+class ClusterAttachResult:
+    cluster_id: int
+    attached: bool
+    centroid_count: int
+
+
+@dataclass
+class ClusterRunStats:
+    reclaimed: int = 0
+    requeued: int = 0
+    claimed: int = 0
+    created: int = 0
+    attached: int = 0
+    already_member: int = 0
+    missing_embedding: int = 0
+    closed: int = 0
+    failed: int = 0

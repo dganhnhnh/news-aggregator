@@ -11,6 +11,7 @@ from core.config import Settings
 from core.logger import get_logger, setup_logging
 from workers.base import EXIT_FAILED, EXIT_OK, Worker, stale_after_for
 from workers.crawl import CrawlWorker
+from workers.cluster import ClusterWorker
 from workers.embed import EmbedWorker
 from workers.window import RunWindow, build_window
 
@@ -20,6 +21,7 @@ logger = get_logger(__name__)
 WORKERS: dict[str, type[Worker]] = {
     CrawlWorker.name: CrawlWorker,
     EmbedWorker.name: EmbedWorker,
+    ClusterWorker.name: ClusterWorker,
 }
 
 
@@ -197,6 +199,46 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         "different model than the one configured now",
     )
 
+    cluster = subparsers.add_parser(
+        "cluster",
+        help="Cluster articles queued in processing_jobs(stage='cluster')",
+    )
+    _add_common_arguments(cluster)
+    cluster.add_argument(
+        "--batch-size",
+        type=int,
+        default=settings.cluster_batch_size,
+        help="Articles claimed per checkpoint chunk",
+    )
+    cluster.add_argument(
+        "--candidate-limit",
+        type=int,
+        default=settings.cluster_candidate_limit,
+        help="Maximum active cluster centroids compared per article",
+    )
+    cluster.add_argument(
+        "--cluster-threshold",
+        type=float,
+        default=settings.cluster_threshold,
+        help="Minimum cosine similarity for attaching to an existing cluster",
+    )
+    cluster.add_argument(
+        "--cluster-window-hours",
+        type=int,
+        default=settings.cluster_window_hours,
+        help="Only compare clusters whose event window overlaps this many hours",
+    )
+    cluster.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Maximum articles to process this run; 0 means unbounded",
+    )
+    cluster.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="Queue embedded articles in the window that have no cluster membership",
+    )
     replay = subparsers.add_parser(
         "replay", help="Requeue dead-lettered crawl_failures or processing_jobs rows"
     )
@@ -304,6 +346,19 @@ def _validate_embed(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         parser.error("--limit must not be negative")
 
 
+def _validate_cluster(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.candidate_limit <= 0:
+        parser.error("--candidate-limit must be positive")
+    if not 0 <= args.cluster_threshold <= 1:
+        parser.error("--cluster-threshold must be between 0 and 1")
+    if args.cluster_window_hours <= 0:
+        parser.error("--cluster-window-hours must be positive")
+    if args.limit < 0:
+        parser.error("--limit must not be negative")
+
+
 def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.command in WORKERS:
         if args.interval is not None and args.interval <= 0:
@@ -314,6 +369,8 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             _validate_crawl(args, parser)
         elif args.command == "embed":
             _validate_embed(args, parser)
+        elif args.command == "cluster":
+            _validate_cluster(args, parser)
     elif args.command in {"replay", "cleanup-block-pages"}:
         if args.limit <= 0:
             parser.error("--limit must be positive")

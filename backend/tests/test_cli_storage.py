@@ -63,6 +63,18 @@ def test_block_page_cleanup_is_dry_run_by_default() -> None:
     assert applied.apply is True
 
 
+def test_cluster_command_exposes_mvp_matching_defaults() -> None:
+    parser = worker_cli.build_parser(_settings())
+
+    args = parser.parse_args(["cluster", "--once", "--reprocess"])
+
+    assert args.batch_size == 50
+    assert args.candidate_limit == 20
+    assert args.cluster_threshold == 0.75
+    assert args.cluster_window_hours == 72
+    assert args.reprocess is True
+
+
 def test_rss_command_accepts_direct_feed_urls() -> None:
     args = pipeline_cli.build_parser(_settings()).parse_args(
         [

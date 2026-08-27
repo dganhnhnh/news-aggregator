@@ -71,6 +71,10 @@ class Settings:
     # contact URL if a publisher needs to reach you about crawl volume.
     feed_user_agent: str = DEFAULT_USER_AGENT
     embed_batch_size: int = 32
+    cluster_batch_size: int = 50
+    cluster_window_hours: int = 72
+    cluster_candidate_limit: int = 20
+    cluster_threshold: float = 0.75
     # A run checkpoints (and so heartbeats) after every chunk, so this measures
     # silence between chunks rather than total run length.
     worker_heartbeat_timeout_seconds: int = 900
@@ -116,6 +120,10 @@ class Settings:
                 os.getenv("FEED_USER_AGENT", "").strip() or DEFAULT_USER_AGENT
             ),
             embed_batch_size=_env_int("EMBED_BATCH_SIZE", 32),
+            cluster_batch_size=_env_int("CLUSTER_BATCH_SIZE", 50),
+            cluster_window_hours=_env_int("CLUSTER_WINDOW_HOURS", 72),
+            cluster_candidate_limit=_env_int("CLUSTER_CANDIDATE_LIMIT", 20),
+            cluster_threshold=_env_float("CLUSTER_THRESHOLD", 0.75),
             worker_heartbeat_timeout_seconds=_env_int(
                 "WORKER_HEARTBEAT_TIMEOUT_SECONDS", 900
             ),
