@@ -73,3 +73,35 @@ def choose_cluster(
             item.cluster_id,
         ),
     )
+
+
+def recompute_centroid(embeddings: Sequence[Sequence[float]]) -> list[float]:
+    """Exact unnormalized arithmetic mean of every member's current embedding.
+
+    Used to rebuild a cluster from `cluster_members` as source of truth,
+    independent of the running-mean history that produced the prior centroid.
+    """
+    if not embeddings:
+        raise ValueError("embeddings must not be empty")
+    dim = len(embeddings[0])
+    if dim == 0 or any(len(vector) != dim for vector in embeddings):
+        raise ValueError("vectors must share a common, non-zero dimension")
+    count = len(embeddings)
+    return [math.fsum(values) / count for values in zip(*embeddings)]
+
+
+def choose_canonical(
+    cluster_a_id: int,
+    cluster_a_first_seen: datetime,
+    cluster_b_id: int,
+    cluster_b_first_seen: datetime,
+) -> tuple[int, int]:
+    """Return (canonical_id, loser_id) for a merge: older cluster wins, ties
+    break toward the lower id."""
+    ranked = sorted(
+        (
+            (cluster_a_first_seen, cluster_a_id),
+            (cluster_b_first_seen, cluster_b_id),
+        )
+    )
+    return ranked[0][1], ranked[1][1]

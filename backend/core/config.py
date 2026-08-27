@@ -75,6 +75,7 @@ class Settings:
     cluster_window_hours: int = 72
     cluster_candidate_limit: int = 20
     cluster_threshold: float = 0.75
+    cluster_merge_threshold: float = 0.85
     # A run checkpoints (and so heartbeats) after every chunk, so this measures
     # silence between chunks rather than total run length.
     worker_heartbeat_timeout_seconds: int = 900
@@ -124,6 +125,7 @@ class Settings:
             cluster_window_hours=_env_int("CLUSTER_WINDOW_HOURS", 72),
             cluster_candidate_limit=_env_int("CLUSTER_CANDIDATE_LIMIT", 20),
             cluster_threshold=_env_float("CLUSTER_THRESHOLD", 0.75),
+            cluster_merge_threshold=_env_float("CLUSTER_MERGE_THRESHOLD", 0.85),
             worker_heartbeat_timeout_seconds=_env_int(
                 "WORKER_HEARTBEAT_TIMEOUT_SECONDS", 900
             ),

@@ -3,7 +3,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from models.storage_models import ClusterCandidate
-from services.clustering import choose_cluster, cosine_similarity, running_centroid
+from services.clustering import (
+    choose_canonical,
+    choose_cluster,
+    cosine_similarity,
+    recompute_centroid,
+    running_centroid,
+)
 
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
@@ -54,4 +60,37 @@ def test_choose_cluster_applies_threshold_and_deterministic_tie_breaks() -> None
 
     assert choose_cluster(candidates, article_at=NOW, threshold=0.75).cluster_id == 1
     assert choose_cluster(candidates, article_at=NOW, threshold=0.81) is None
+
+
+def test_recompute_centroid_is_the_exact_arithmetic_mean() -> None:
+    result = recompute_centroid([[1.0, 0.0], [0.0, 1.0], [-0.5, 0.5]])
+
+    assert result == pytest.approx([1 / 6, 0.5])
+
+
+def test_recompute_centroid_matches_running_centroid_for_the_same_members() -> None:
+    vectors = [[1.0, 0.0], [0.0, 1.0], [-0.5, 0.5]]
+
+    running = running_centroid(running_centroid(vectors[0], 1, vectors[1]), 2, vectors[2])
+    exact = recompute_centroid(vectors)
+
+    assert exact == pytest.approx(running)
+
+
+def test_recompute_centroid_validates_input() -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        recompute_centroid([])
+    with pytest.raises(ValueError, match="common, non-zero dimension"):
+        recompute_centroid([[1.0, 0.0], [1.0]])
+    with pytest.raises(ValueError, match="common, non-zero dimension"):
+        recompute_centroid([[], []])
+
+
+def test_choose_canonical_prefers_older_first_seen_then_lower_id() -> None:
+    older = NOW - timedelta(hours=1)
+
+    assert choose_canonical(1, NOW, 2, older) == (2, 1)
+    assert choose_canonical(2, older, 1, NOW) == (2, 1)
+    # Tie on first_seen_at breaks toward the lower id.
+    assert choose_canonical(5, NOW, 3, NOW) == (3, 5)
 

@@ -239,6 +239,24 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         action="store_true",
         help="Queue embedded articles in the window that have no cluster membership",
     )
+    cluster.add_argument(
+        "--merge-threshold",
+        type=float,
+        default=settings.cluster_merge_threshold,
+        help="Minimum cosine similarity between two open clusters to merge them",
+    )
+    cluster_mode = cluster.add_mutually_exclusive_group()
+    cluster_mode.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Pair-scan and merge open clusters instead of matching new articles",
+    )
+    cluster_mode.add_argument(
+        "--repair",
+        action="store_true",
+        help="Detect and fix drift between cluster aggregates and cluster_members "
+        "instead of matching new articles",
+    )
     replay = subparsers.add_parser(
         "replay", help="Requeue dead-lettered crawl_failures or processing_jobs rows"
     )
@@ -355,6 +373,8 @@ def _validate_cluster(args: argparse.Namespace, parser: argparse.ArgumentParser)
         parser.error("--cluster-threshold must be between 0 and 1")
     if args.cluster_window_hours <= 0:
         parser.error("--cluster-window-hours must be positive")
+    if not 0 <= args.merge_threshold <= 1:
+        parser.error("--merge-threshold must be between 0 and 1")
     if args.limit < 0:
         parser.error("--limit must not be negative")
 

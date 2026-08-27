@@ -43,6 +43,9 @@ from models.storage_models import (
     ClusterArticle,
     ClusterAttachResult,
     ClusterCandidate,
+    ClusterMembership,
+    ClusterMergeResult,
+    ClusterRebuildResult,
     EmbeddingCandidate,
     EmbeddingRecord,
     FailureKind,
@@ -59,7 +62,7 @@ from models.storage_models import (
     WorkerTrigger,
 )
 from services.raw_storage import build_excerpt, source_slug
-from services.clustering import running_centroid
+from services.clustering import choose_canonical, recompute_centroid, running_centroid
 
 
 class StorageError(RuntimeError):
@@ -107,6 +110,89 @@ async def _representative_headline(
         .order_by(distance, sources.c.slug.nulls_last(), raw_articles.c.id)
         .limit(1)
     )
+
+
+async def _rebuild_cluster_locked(
+    connection: AsyncConnection, cluster_id: int
+) -> ClusterRebuildResult:
+    """Recompute one cluster's aggregate from `cluster_members`, the source of
+    truth, independent of whatever running-mean history produced the prior
+    row. Caller must already be inside a transaction; this takes its own row
+    lock so it is safe to call after only locking the membership rows.
+
+    A merged cluster is a redirect with no aggregate of its own, so it is
+    left untouched. A cluster left with no members is closed rather than
+    deleted, to keep `merged_into_id` references and job history intact; its
+    counters and headline are cleared so no stale aggregate survives.
+    """
+    status = await connection.scalar(
+        select(clusters.c.status).where(clusters.c.id == cluster_id).with_for_update()
+    )
+    if status is None:
+        raise StorageError(f"cluster {cluster_id} not found")
+    if status == "merged":
+        n_articles = int(
+            await connection.scalar(
+                select(func.count())
+                .select_from(cluster_members)
+                .where(cluster_members.c.cluster_id == cluster_id)
+            )
+            or 0
+        )
+        return ClusterRebuildResult(cluster_id, n_articles, False)
+
+    members = (
+        await connection.execute(
+            select(
+                article_embeddings.c.embedding,
+                raw_articles.c.source_id,
+                raw_articles.c.event_at,
+            )
+            .select_from(
+                cluster_members.join(
+                    article_embeddings,
+                    cluster_members.c.article_id == article_embeddings.c.article_id,
+                ).join(
+                    raw_articles,
+                    cluster_members.c.article_id == raw_articles.c.id,
+                )
+            )
+            .where(cluster_members.c.cluster_id == cluster_id)
+        )
+    ).all()
+
+    if not members:
+        await connection.execute(
+            update(clusters)
+            .where(clusters.c.id == cluster_id)
+            .values(
+                centroid_count=0,
+                n_articles=0,
+                n_distinct_sources=0,
+                headline=None,
+                status="closed",
+            )
+        )
+        return ClusterRebuildResult(cluster_id, 0, True)
+
+    new_centroid = recompute_centroid([_vector_list(row.embedding) for row in members])
+    source_ids = {row.source_id for row in members if row.source_id is not None}
+    event_times = [row.event_at for row in members]
+    headline = await _representative_headline(connection, cluster_id, new_centroid)
+    await connection.execute(
+        update(clusters)
+        .where(clusters.c.id == cluster_id)
+        .values(
+            centroid=new_centroid,
+            centroid_count=len(members),
+            n_articles=len(members),
+            n_distinct_sources=len(source_ids),
+            first_seen_at=min(event_times),
+            last_seen_at=max(event_times),
+            headline=headline,
+        )
+    )
+    return ClusterRebuildResult(cluster_id, len(members), False)
 
 
 def retry_delay(
@@ -693,14 +779,38 @@ class PostgresRawStorage:
                 for row in rows
             }
 
-    async def cluster_membership(self, article_id: int) -> int | None:
+    async def cluster_membership(self, article_id: int) -> ClusterMembership | None:
+        """Look up an article's current cluster, flagging staleness.
+
+        `stale=True` means the embedding was rewritten (article_embeddings.
+        created_at bumped by a genuine re-embed) after this membership was
+        recorded, so the centroid this article contributed to no longer
+        reflects its current vector.
+        """
         async with self._engine.connect() as connection:
-            value = await connection.scalar(
-                select(cluster_members.c.cluster_id).where(
-                    cluster_members.c.article_id == article_id
+            row = (
+                await connection.execute(
+                    select(
+                        cluster_members.c.cluster_id,
+                        cluster_members.c.added_at,
+                        article_embeddings.c.created_at,
+                    )
+                    .select_from(
+                        cluster_members.join(
+                            article_embeddings,
+                            cluster_members.c.article_id
+                            == article_embeddings.c.article_id,
+                        )
+                    )
+                    .where(cluster_members.c.article_id == article_id)
                 )
+            ).one_or_none()
+            if row is None:
+                return None
+            return ClusterMembership(
+                cluster_id=int(row.cluster_id),
+                stale=row.created_at > row.added_at,
             )
-            return int(value) if value is not None else None
 
     async def active_cluster_candidates(
         self,
@@ -905,6 +1015,181 @@ class PostgresRawStorage:
                 connection, ids, ("cluster",), reset_completed=True
             )
             return len(ids)
+
+    async def rebuild_cluster(self, cluster_id: int) -> ClusterRebuildResult:
+        """Recompute a cluster's aggregate from `cluster_members`, atomically."""
+        async with self._engine.begin() as connection:
+            return await _rebuild_cluster_locked(connection, cluster_id)
+
+    async def remove_cluster_member(self, article_id: int) -> int | None:
+        """Detach an article from its cluster and rebuild that cluster.
+
+        The primitive every delete/re-evaluation path must use instead of
+        relying on `ON DELETE CASCADE`, so the cluster's aggregate never goes
+        stale silently. Returns the rebuilt cluster's id, or None if the
+        article had no membership.
+        """
+        async with self._engine.begin() as connection:
+            cluster_id = await connection.scalar(
+                select(cluster_members.c.cluster_id)
+                .where(cluster_members.c.article_id == article_id)
+                .with_for_update()
+            )
+            if cluster_id is None:
+                return None
+            await connection.execute(
+                delete(cluster_members).where(
+                    cluster_members.c.article_id == article_id
+                )
+            )
+            await _rebuild_cluster_locked(connection, int(cluster_id))
+            return int(cluster_id)
+
+    async def merge_candidates(
+        self, *, threshold: float, limit: int
+    ) -> list[tuple[int, int]]:
+        """Pair-scan open clusters by time-window overlap and centroid
+        similarity, returning (lower_id, higher_id) pairs to merge."""
+        if limit <= 0:
+            return []
+        a = clusters.alias("cluster_a")
+        b = clusters.alias("cluster_b")
+        distance = a.c.centroid.cosine_distance(b.c.centroid)
+        async with self._engine.connect() as connection:
+            rows = await connection.execute(
+                select(a.c.id, b.c.id)
+                .select_from(a.join(b, a.c.id < b.c.id))
+                .where(
+                    a.c.status == "open",
+                    b.c.status == "open",
+                    a.c.first_seen_at <= b.c.last_seen_at,
+                    b.c.first_seen_at <= a.c.last_seen_at,
+                    (1 - distance) >= threshold,
+                )
+                .order_by(distance)
+                .limit(limit)
+            )
+            return [(int(row[0]), int(row[1])) for row in rows]
+
+    async def merge_clusters(
+        self, cluster_a_id: int, cluster_b_id: int
+    ) -> ClusterMergeResult:
+        """Merge two open clusters into one, transactionally and idempotently.
+
+        Locks both cluster rows in ascending-id order (never `WHERE id IN
+        (a, b)`, whose lock-acquisition order is not guaranteed to follow
+        `ORDER BY`) so a concurrent merge over an overlapping pair cannot
+        deadlock. Rerunning with the same pair after a successful merge is a
+        no-op: the loser is no longer `open`, so the precondition check below
+        returns early.
+        """
+        lower_id, higher_id = sorted((cluster_a_id, cluster_b_id))
+        async with self._engine.begin() as connection:
+            lower = (
+                await connection.execute(
+                    select(
+                        clusters.c.id, clusters.c.status, clusters.c.first_seen_at
+                    )
+                    .where(clusters.c.id == lower_id)
+                    .with_for_update()
+                )
+            ).one_or_none()
+            higher = (
+                await connection.execute(
+                    select(
+                        clusters.c.id, clusters.c.status, clusters.c.first_seen_at
+                    )
+                    .where(clusters.c.id == higher_id)
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if (
+                lower is None
+                or higher is None
+                or lower.status != "open"
+                or higher.status != "open"
+            ):
+                return ClusterMergeResult(cluster_a_id, cluster_b_id, False)
+
+            canonical_id, loser_id = choose_canonical(
+                lower.id, lower.first_seen_at, higher.id, higher.first_seen_at
+            )
+            await connection.execute(
+                update(cluster_members)
+                .where(cluster_members.c.cluster_id == loser_id)
+                .values(cluster_id=canonical_id)
+            )
+            await connection.execute(
+                update(clusters)
+                .where(clusters.c.id == loser_id)
+                .values(status="merged", merged_into_id=canonical_id)
+            )
+            await _rebuild_cluster_locked(connection, canonical_id)
+            return ClusterMergeResult(canonical_id, loser_id, True)
+
+    async def repair_clusters(self, *, limit: int) -> int:
+        """Detect and fix drift between cached aggregates and the
+        `cluster_members` source of truth, then rebuild affected clusters.
+
+        Catches membership rows orphaned by something that deleted an
+        article's embedding without going through `remove_cluster_member`
+        (e.g. `quarantine_historical_block_pages`), and cached counters that
+        no longer match a live `COUNT(cluster_members)`. Running this twice
+        with no further drift in between is a no-op.
+        """
+        if limit <= 0:
+            return 0
+        async with self._engine.begin() as connection:
+            orphan_rows = (
+                await connection.execute(
+                    select(cluster_members.c.article_id, cluster_members.c.cluster_id)
+                    .select_from(
+                        cluster_members.outerjoin(
+                            article_embeddings,
+                            cluster_members.c.article_id
+                            == article_embeddings.c.article_id,
+                        )
+                    )
+                    .where(article_embeddings.c.article_id.is_(None))
+                )
+            ).all()
+            orphan_cluster_ids = {int(row.cluster_id) for row in orphan_rows}
+            if orphan_rows:
+                await connection.execute(
+                    delete(cluster_members).where(
+                        cluster_members.c.article_id.in_(
+                            [row.article_id for row in orphan_rows]
+                        )
+                    )
+                )
+
+            member_counts = (
+                select(
+                    cluster_members.c.cluster_id,
+                    func.count().label("live_count"),
+                )
+                .group_by(cluster_members.c.cluster_id)
+                .subquery()
+            )
+            drifted_rows = await connection.execute(
+                select(clusters.c.id)
+                .select_from(
+                    clusters.outerjoin(
+                        member_counts, clusters.c.id == member_counts.c.cluster_id
+                    )
+                )
+                .where(
+                    clusters.c.status != "merged",
+                    func.coalesce(member_counts.c.live_count, 0)
+                    != clusters.c.centroid_count,
+                )
+            )
+            drifted_ids = {int(row.id) for row in drifted_rows}
+
+            affected = list(orphan_cluster_ids | drifted_ids)[:limit]
+            for cluster_id in affected:
+                await _rebuild_cluster_locked(connection, cluster_id)
+            return len(affected)
 
     async def reenqueue_embeddings(
         self,

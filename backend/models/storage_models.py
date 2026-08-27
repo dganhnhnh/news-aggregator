@@ -287,6 +287,29 @@ class ClusterAttachResult:
     centroid_count: int
 
 
+@dataclass(frozen=True)
+class ClusterMembership:
+    cluster_id: int
+    # True when the article's embedding was rewritten after this membership
+    # was recorded (article_embeddings.created_at > cluster_members.added_at),
+    # so the centroid this article contributed to no longer reflects it.
+    stale: bool
+
+
+@dataclass(frozen=True)
+class ClusterRebuildResult:
+    cluster_id: int
+    n_articles: int
+    closed: bool
+
+
+@dataclass(frozen=True)
+class ClusterMergeResult:
+    canonical_id: int
+    loser_id: int
+    merged: bool
+
+
 @dataclass
 class ClusterRunStats:
     reclaimed: int = 0
@@ -295,6 +318,9 @@ class ClusterRunStats:
     created: int = 0
     attached: int = 0
     already_member: int = 0
+    reevaluated: int = 0
     missing_embedding: int = 0
+    merged: int = 0
+    repaired: int = 0
     closed: int = 0
     failed: int = 0
