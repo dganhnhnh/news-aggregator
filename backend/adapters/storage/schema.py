@@ -322,7 +322,10 @@ topics = Table(
     Column("slug", Text, nullable=False),
     Column("display_name", Text, nullable=False),
     Column("description", Text),
-    Column("threshold", Float, nullable=False, server_default="0.55"),
+    # 0.40, not the 0.55 this started at: measured against the 1015-article
+    # corpus on 2026-08-28, 0.55 labelled 1.0% of articles while the highest
+    # score any topic reached was 0.615. See docs/measurements.md "T6".
+    Column("threshold", Float, nullable=False, server_default="0.40"),
     # Only exemplar/keyword/weight/threshold changes bump this; it is what
     # marks every existing article_topics/article_classifications row using
     # the old scoring inputs as stale. Presentation-only edits (display_name,
@@ -446,4 +449,97 @@ taxonomy_node_topics = Table(
         nullable=False,
     ),
     PrimaryKeyConstraint("node_id", "topic_id"),
+)
+
+article_classifications = Table(
+    "article_classifications",
+    metadata,
+    Column(
+        "article_id",
+        BigInteger,
+        ForeignKey("raw_articles.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("model", Text, nullable=False),
+    # Fingerprint of the whole active classifier set (each topic's slug,
+    # threshold, revision and prototype provenance). A row whose hash differs
+    # from the current set was scored against a classifier that no longer
+    # exists, which is exactly the stale-detection predicate `--stale` uses.
+    Column("classifier_set_hash", LargeBinary, nullable=False),
+    Column("max_score", Float, nullable=False),
+    Column("assigned_count", Integer, nullable=False),
+    Column(
+        "classified_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+)
+
+article_topics = Table(
+    "article_topics",
+    metadata,
+    Column(
+        "article_id",
+        BigInteger,
+        ForeignKey("raw_articles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "topic_id",
+        BigInteger,
+        ForeignKey("topics.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("score", Float, nullable=False),
+    Column("prototype_score", Float, nullable=False),
+    Column("keyword_score", Float, nullable=False),
+    # Reserved for week 3+. Week 2 never learns a source prior -- training one
+    # on the classifier's own predictions is self-reinforcing -- so the column
+    # stays NULL and carries weight 0 in the score.
+    Column("source_prior", Float),
+    Column("assigned", Boolean, nullable=False),
+    Column("classifier_revision", Integer, nullable=False),
+    PrimaryKeyConstraint("article_id", "topic_id"),
+)
+# Week 2 stores a row per active topic, not just the ones over threshold, so
+# aggregation and evaluation can see near-misses. Only assigned rows are ever
+# queried by topic, so the index stays partial.
+Index(
+    "ix_article_topics_assigned",
+    article_topics.c.topic_id,
+    article_topics.c.article_id,
+    postgresql_where=text("assigned"),
+)
+
+cluster_topics = Table(
+    "cluster_topics",
+    metadata,
+    Column(
+        "cluster_id",
+        BigInteger,
+        ForeignKey("clusters.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "topic_id",
+        BigInteger,
+        ForeignKey("topics.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("score", Float, nullable=False),
+    Column("assigned", Boolean, nullable=False),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    PrimaryKeyConstraint("cluster_id", "topic_id"),
+)
+Index(
+    "ix_cluster_topics_assigned",
+    cluster_topics.c.topic_id,
+    cluster_topics.c.cluster_id,
+    postgresql_where=text("assigned"),
 )

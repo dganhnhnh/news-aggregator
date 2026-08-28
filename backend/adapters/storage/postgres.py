@@ -26,8 +26,11 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from adapters.storage.schema import (
+    article_classifications,
     article_embeddings,
+    article_topics,
     cluster_members,
+    cluster_topics,
     clusters,
     crawl_failures,
     feed_state,
@@ -46,6 +49,7 @@ from core.content_quality import historical_summary_title_reason
 from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
+    ClassifiableArticle,
     CrawlFailureOccurrence,
     ClusterArticle,
     ClusterAttachResult,
@@ -81,6 +85,15 @@ from models.storage_models import (
     WorkerTrigger,
 )
 from services.raw_storage import build_excerpt, source_slug
+from services.classification import (
+    ArticleClassification,
+    ClassifierSnapshot,
+    MemberTopicScores,
+    TopicClassifier,
+    TopicKeyword,
+    aggregate_cluster_topics,
+    classifier_set_hash,
+)
 from services.clustering import choose_canonical, recompute_centroid, running_centroid
 from services.taxonomy import SeedTaxonomyNode, TaxonomySeed, build_node_tree, next_classifier_revision
 
@@ -133,6 +146,89 @@ async def _representative_headline(
         .order_by(distance, sources.c.slug.nulls_last(), raw_articles.c.id)
         .limit(1)
     )
+
+
+async def _refresh_cluster_topics_locked(
+    connection: AsyncConnection, cluster_id: int
+) -> int:
+    """Recompute one cluster's labels from its members' `article_topics`.
+
+    The single aggregate path (spec §8, T6.4): the classify worker, cluster
+    attach, merge and repair all land here, so a story's label can never
+    depend on which worker touched it last. `cluster_topics` is a
+    materialized view of `article_topics` and is always fully replaced, never
+    incrementally patched -- that is what makes it rebuildable (spec §2.7).
+    """
+    member_rows = (
+        await connection.execute(
+            select(cluster_members.c.article_id, raw_articles.c.source_id)
+            .select_from(
+                cluster_members.join(
+                    raw_articles, cluster_members.c.article_id == raw_articles.c.id
+                )
+            )
+            .where(cluster_members.c.cluster_id == cluster_id)
+        )
+    ).all()
+    if not member_rows:
+        await connection.execute(
+            delete(cluster_topics).where(cluster_topics.c.cluster_id == cluster_id)
+        )
+        return 0
+
+    article_ids = [int(row.article_id) for row in member_rows]
+    score_rows = (
+        await connection.execute(
+            select(
+                article_topics.c.article_id,
+                article_topics.c.topic_id,
+                article_topics.c.score,
+            ).where(article_topics.c.article_id.in_(article_ids))
+        )
+    ).all()
+    scores_by_article: dict[int, dict[int, float]] = defaultdict(dict)
+    for row in score_rows:
+        scores_by_article[int(row.article_id)][int(row.topic_id)] = float(row.score)
+
+    members = [
+        MemberTopicScores(
+            article_id=int(row.article_id),
+            source_id=int(row.source_id) if row.source_id is not None else None,
+            scores=scores_by_article.get(int(row.article_id), {}),
+        )
+        for row in member_rows
+    ]
+    topic_ids = {topic_id for member in members for topic_id in member.scores}
+    thresholds = {
+        int(row.id): float(row.threshold)
+        for row in (
+            await connection.execute(
+                select(topics.c.id, topics.c.threshold).where(topics.c.id.in_(topic_ids))
+            )
+        ).all()
+    } if topic_ids else {}
+
+    aggregated = aggregate_cluster_topics(members, thresholds)
+    await connection.execute(
+        delete(cluster_topics).where(cluster_topics.c.cluster_id == cluster_id)
+    )
+    if aggregated:
+        now = datetime.now(timezone.utc)
+        await connection.execute(
+            cluster_topics.insert().values(
+                [
+                    {
+                        "cluster_id": cluster_id,
+                        "topic_id": item.topic_id,
+                        "score": item.score,
+                        "assigned": item.assigned,
+                        "updated_at": now,
+                    }
+                    for item in aggregated
+                ]
+            )
+        )
+    return len(aggregated)
 
 
 async def _rebuild_cluster_locked(
@@ -196,6 +292,7 @@ async def _rebuild_cluster_locked(
                 status="closed",
             )
         )
+        await _refresh_cluster_topics_locked(connection, cluster_id)
         return ClusterRebuildResult(cluster_id, 0, True)
 
     new_centroid = recompute_centroid([_vector_list(row.embedding) for row in members])
@@ -215,6 +312,7 @@ async def _rebuild_cluster_locked(
             headline=headline,
         )
     )
+    await _refresh_cluster_topics_locked(connection, cluster_id)
     return ClusterRebuildResult(cluster_id, len(members), False)
 
 
@@ -270,7 +368,10 @@ class PostgresRawStorage:
                         "to_regclass('public.topic_prototypes'), "
                         "to_regclass('public.taxonomies'), "
                         "to_regclass('public.taxonomy_nodes'), "
-                        "to_regclass('public.taxonomy_node_topics')"
+                        "to_regclass('public.taxonomy_node_topics'), "
+                        "to_regclass('public.article_classifications'), "
+                        "to_regclass('public.article_topics'), "
+                        "to_regclass('public.cluster_topics')"
                     )
                 )
                 if any(value is None for value in tables.one()):
@@ -929,6 +1030,10 @@ class PostgresRawStorage:
                     similarity=1.0,
                 )
             )
+            # A brand-new cluster inherits whatever labels this article
+            # already has: if classify ran first, the story is labelled the
+            # moment it exists rather than waiting for the next refresh.
+            await _refresh_cluster_topics_locked(connection, cluster_id)
             return ClusterAttachResult(cluster_id, True, 1)
 
     async def attach_cluster_member(
@@ -1007,6 +1112,7 @@ class PostgresRawStorage:
                     headline=headline,
                 )
             )
+            await _refresh_cluster_topics_locked(connection, cluster_id)
             return ClusterAttachResult(cluster_id, True, new_count)
 
     async def close_stale_clusters(self, *, before: datetime) -> int:
@@ -2572,3 +2678,272 @@ class PostgresRawStorage:
                     },
                 )
             )
+
+    async def classifier_snapshot(self) -> ClassifierSnapshot:
+        """Load the active classifier set once per run.
+
+        Only active topics with a compiled prototype can score anything; an
+        active topic still missing one is returned separately so the worker
+        can tell the operator to run `taxonomy-rebuild` instead of silently
+        producing classifications that topic could never win.
+        """
+        async with self._engine.connect() as connection:
+            topic_rows = (
+                await connection.execute(
+                    select(topics)
+                    .where(topics.c.active.is_(True))
+                    .order_by(topics.c.slug)
+                )
+            ).all()
+            if not topic_rows:
+                return ClassifierSnapshot(
+                    classifiers=(), set_hash=classifier_set_hash([])
+                )
+            topic_ids = [row.id for row in topic_rows]
+            prototypes = {
+                int(row.topic_id): row
+                for row in (
+                    await connection.execute(
+                        select(topic_prototypes).where(
+                            topic_prototypes.c.topic_id.in_(topic_ids)
+                        )
+                    )
+                ).all()
+            }
+            keyword_rows = (
+                await connection.execute(
+                    select(
+                        topic_signals.c.topic_id,
+                        topic_signals.c.value,
+                        topic_signals.c.weight,
+                    ).where(
+                        topic_signals.c.topic_id.in_(topic_ids),
+                        topic_signals.c.kind == "keyword",
+                        topic_signals.c.active.is_(True),
+                    )
+                )
+            ).all()
+            keywords_by_topic: dict[int, list[TopicKeyword]] = defaultdict(list)
+            for row in keyword_rows:
+                keywords_by_topic[int(row.topic_id)].append(
+                    TopicKeyword(value=row.value, weight=float(row.weight))
+                )
+
+            classifiers: list[TopicClassifier] = []
+            missing: list[str] = []
+            for row in topic_rows:
+                prototype = prototypes.get(int(row.id))
+                if prototype is None:
+                    missing.append(row.slug)
+                    continue
+                classifiers.append(
+                    TopicClassifier(
+                        topic_id=int(row.id),
+                        slug=row.slug,
+                        threshold=float(row.threshold),
+                        classifier_revision=int(row.classifier_revision),
+                        model=prototype.model,
+                        dim=int(prototype.dim),
+                        prototype=tuple(_vector_list(prototype.embedding)),
+                        definition_hash=prototype.definition_hash,
+                        keywords=tuple(
+                            sorted(
+                                keywords_by_topic.get(int(row.id), []),
+                                key=lambda item: item.value,
+                            )
+                        ),
+                    )
+                )
+            return ClassifierSnapshot(
+                classifiers=tuple(classifiers),
+                set_hash=classifier_set_hash(classifiers),
+                topics_without_prototype=tuple(missing),
+            )
+
+    async def classifiable_articles(
+        self, article_ids: Sequence[int]
+    ) -> dict[int, ClassifiableArticle]:
+        """Load claimed articles with their embedding and keyword-match texts.
+
+        An article with no embedding yet is simply absent from the result:
+        classification is defined against the vector, so the worker completes
+        that job rather than failing it and waits for embed to catch up.
+        """
+        if not article_ids:
+            return {}
+        async with self._engine.connect() as connection:
+            result = await connection.execute(
+                select(
+                    raw_articles.c.id,
+                    raw_articles.c.source_id,
+                    raw_articles.c.title,
+                    raw_articles.c.content,
+                    raw_articles.c.feed_summary,
+                    raw_articles.c.content_source,
+                    article_embeddings.c.model,
+                    article_embeddings.c.dim,
+                    article_embeddings.c.embedding,
+                )
+                .select_from(
+                    raw_articles.join(
+                        article_embeddings,
+                        raw_articles.c.id == article_embeddings.c.article_id,
+                    )
+                )
+                .where(raw_articles.c.id.in_(article_ids))
+            )
+            return {
+                row.id: ClassifiableArticle(
+                    article_id=row.id,
+                    source_id=row.source_id,
+                    title=row.title,
+                    content=row.content,
+                    feed_summary=row.feed_summary,
+                    content_source=row.content_source,
+                    model=row.model,
+                    dim=int(row.dim),
+                    embedding=_vector_list(row.embedding),
+                )
+                for row in result
+            }
+
+    async def replace_article_classification(
+        self,
+        article_id: int,
+        classification: ArticleClassification,
+        *,
+        model: str,
+        set_hash: bytes,
+    ) -> int | None:
+        """Replace one article's scores and refresh its cluster, atomically.
+
+        The whole score set is replaced rather than upserted per topic, so a
+        topic that has since been deactivated cannot leave a stale row behind.
+        Returns the cluster id that was refreshed, if the article is already a
+        member of one -- when clustering has not run yet, the cluster picks
+        these scores up through `_refresh_cluster_topics_locked` at attach
+        time, which is what makes the two worker orders converge.
+        """
+        async with self._engine.begin() as connection:
+            await connection.execute(
+                delete(article_topics).where(article_topics.c.article_id == article_id)
+            )
+            if classification.scores:
+                await connection.execute(
+                    article_topics.insert().values(
+                        [
+                            {
+                                "article_id": article_id,
+                                "topic_id": score.topic_id,
+                                "score": score.score,
+                                "prototype_score": score.prototype_score,
+                                "keyword_score": score.keyword_score,
+                                "source_prior": None,
+                                "assigned": score.assigned,
+                                "classifier_revision": score.classifier_revision,
+                            }
+                            for score in classification.scores
+                        ]
+                    )
+                )
+            stmt = pg_insert(article_classifications).values(
+                article_id=article_id,
+                model=model,
+                classifier_set_hash=set_hash,
+                max_score=classification.max_score,
+                assigned_count=classification.assigned_count,
+            )
+            await connection.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[article_classifications.c.article_id],
+                    set_={
+                        "model": stmt.excluded.model,
+                        "classifier_set_hash": stmt.excluded.classifier_set_hash,
+                        "max_score": stmt.excluded.max_score,
+                        "assigned_count": stmt.excluded.assigned_count,
+                        "classified_at": func.now(),
+                    },
+                )
+            )
+            cluster_id = await connection.scalar(
+                select(cluster_members.c.cluster_id).where(
+                    cluster_members.c.article_id == article_id
+                )
+            )
+            if cluster_id is None:
+                return None
+            await _refresh_cluster_topics_locked(connection, int(cluster_id))
+            return int(cluster_id)
+
+    async def refresh_cluster_topics(self, cluster_id: int) -> int:
+        """Rebuild one cluster's labels from `article_topics` on demand."""
+        async with self._engine.begin() as connection:
+            return await _refresh_cluster_topics_locked(connection, cluster_id)
+
+    async def reenqueue_classifications(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        set_hash: bytes | None = None,
+    ) -> int:
+        """Queue embedded articles in a window for (re)classification.
+
+        With `set_hash`, only *stale* articles are queued: those never
+        classified, or classified against a different classifier set. That is
+        the cheap path after a `taxonomy-import` bumps one topic's revision --
+        it re-scores the window without disturbing articles already scored
+        against the current set.
+        """
+        async with self._engine.begin() as connection:
+            stmt = (
+                select(article_embeddings.c.article_id)
+                .join(
+                    raw_articles, raw_articles.c.id == article_embeddings.c.article_id
+                )
+                .outerjoin(
+                    article_classifications,
+                    article_classifications.c.article_id
+                    == article_embeddings.c.article_id,
+                )
+                .where(
+                    raw_articles.c.event_at >= since,
+                    raw_articles.c.event_at < until,
+                )
+            )
+            if set_hash is not None:
+                stmt = stmt.where(
+                    or_(
+                        article_classifications.c.article_id.is_(None),
+                        article_classifications.c.classifier_set_hash != set_hash,
+                    )
+                )
+            ids = [int(row.article_id) for row in await connection.execute(stmt)]
+            await self._enqueue_processing_jobs(
+                connection, ids, ("classify",), reset_completed=True
+            )
+            return len(ids)
+
+    async def reenqueue_cluster_topic_refresh(
+        self, *, since: datetime, until: datetime
+    ) -> int:
+        """Rebuild `cluster_topics` for every cluster active in a window.
+
+        `cluster_topics` is derived data with no source of truth of its own
+        (spec §2.7), so it must be reconstructible without touching
+        `article_topics`; this is the command that proves it.
+        """
+        async with self._engine.begin() as connection:
+            cluster_ids = [
+                int(row.id)
+                for row in await connection.execute(
+                    select(clusters.c.id).where(
+                        clusters.c.status != "merged",
+                        clusters.c.last_seen_at >= since,
+                        clusters.c.last_seen_at < until,
+                    )
+                )
+            ]
+            for cluster_id in cluster_ids:
+                await _refresh_cluster_topics_locked(connection, cluster_id)
+            return len(cluster_ids)

@@ -37,11 +37,26 @@ future Next.js UI.
 - `frontend/`: empty placeholder for a future Next.js app; see
   `frontend/README.md` for the scaffold command.
 - `deployments/`: `docker-compose.yml` (PostgreSQL only) and `Dockerfile.api`.
-- PostgreSQL has four tables: `raw_articles` (latest version only), `sources`,
-  `crawl_failures` (current durable retry queue), and `worker_runs` (one
-  operational log for every worker, with JSONB `params`/`stats` so a new worker
-  needs no migration). Raw HTML and historical article versions are
-  intentionally not stored.
+- PostgreSQL groups its tables in four layers: ingestion (`raw_articles`,
+  latest version only; `sources`; `crawl_failures`, the current durable retry
+  queue; `worker_runs`, one operational log for every worker with JSONB
+  `params`/`stats` so a new worker needs no migration), embedding/clustering
+  (`article_embeddings`, `processing_jobs`, `clusters`, `cluster_members`),
+  the topic registry (`topics`, `topic_signals`, `topic_prototypes`,
+  `taxonomies`, `taxonomy_nodes`, `taxonomy_node_topics`) and classification
+  (`article_classifications`, `article_topics`, `cluster_topics`). Raw HTML
+  and historical article versions are intentionally not stored.
+- `cluster_topics` is derived data with no source of truth of its own: it is
+  always fully replaced from `article_topics` by
+  `_refresh_cluster_topics_locked`, which classify, cluster attach, merge and
+  repair all route through so a story's label cannot depend on which worker
+  touched it last. `news-worker classify --refresh-clusters` rebuilds it.
+- The week-2 classification weights (`0.80` prototype / `0.20` keyword) go into
+  `worker_runs.params` every run and have not been retuned. The default
+  threshold has: `0.55` → `0.40` on 2026-08-28, because 0.55 labelled 1.0% of
+  the corpus while no topic ever scored above 0.615. Any further change needs
+  the same treatment — a sweep and a snapshot in `docs/measurements.md`, not a
+  nudge to make a golden case pass. The full sweep belongs to week 4.
 - PostgreSQL 16 runs through `deployments/docker-compose.yml` with named volume
   `news_radar_postgres_data`; host-side CLI jobs run Alembic explicitly. Always
   pass `--env-file .env` since the compose file no longer sits next to it.

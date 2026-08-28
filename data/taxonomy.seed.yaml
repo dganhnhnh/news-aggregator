@@ -4,7 +4,7 @@ topics:
   - slug: consumer-hardware
     name: Consumer Hardware
     description: Phones, laptops, wearables and other gadgets reviewed or launched.
-    threshold: 0.55
+    threshold: 0.40
     exemplars:
       - the new smartphone features an improved camera and longer battery life
       - hands-on review of the latest laptop with a faster processor
@@ -24,7 +24,7 @@ topics:
   - slug: artificial-intelligence
     name: Artificial Intelligence
     description: AI models, research, tools and products.
-    threshold: 0.55
+    threshold: 0.40
     exemplars:
       - a new large language model outperforms previous benchmarks
       - researchers publish a paper on training more efficient neural networks
@@ -44,7 +44,7 @@ topics:
   - slug: software-engineering
     name: Software Engineering
     description: Engineering practices, architecture, testing and developer tooling.
-    threshold: 0.55
+    threshold: 0.40
     exemplars:
       - a team shares lessons learned from migrating a monolith to microservices
       - the blog post explains a pattern for handling database migrations safely
@@ -64,7 +64,7 @@ topics:
   - slug: programming-languages
     name: Programming Languages
     description: Language releases, compilers, runtimes and language-specific tooling.
-    threshold: 0.55
+    threshold: 0.40
     exemplars:
       - the language releases a new version with improved performance
       - a proposal to add pattern matching to the language is under discussion
@@ -84,7 +84,7 @@ topics:
   - slug: cloud-infrastructure
     name: Cloud & Infrastructure
     description: Cloud platforms, containers, orchestration and infrastructure tooling.
-    threshold: 0.55
+    threshold: 0.40
     exemplars:
       - the cloud provider announces a new region and lower storage pricing
       - a guide to running stateful workloads on Kubernetes
@@ -104,7 +104,7 @@ topics:
   - slug: cybersecurity
     name: Cybersecurity
     description: Vulnerabilities, breaches, exploits and security tooling.
-    threshold: 0.55
+    threshold: 0.40
     exemplars:
       - researchers disclose a critical vulnerability affecting millions of devices
       - a company confirms a data breach exposing customer information
@@ -124,7 +124,7 @@ topics:
   - slug: open-source
     name: Open Source
     description: Open-source projects, releases, licensing and community governance.
-    threshold: 0.55
+    threshold: 0.40
     exemplars:
       - the open-source project reaches a major version milestone
       - maintainers discuss a change to the project's license
@@ -144,7 +144,7 @@ topics:
   - slug: big-tech-business
     name: Big Tech Business
     description: Corporate strategy, funding, layoffs, acquisitions and leadership moves at major tech companies.
-    threshold: 0.55
+    threshold: 0.40
     exemplars:
       - the company reports quarterly earnings that beat analyst expectations
       - the tech giant announces layoffs affecting thousands of employees

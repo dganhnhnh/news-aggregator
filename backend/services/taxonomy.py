@@ -21,6 +21,10 @@ from models.storage_models import FlatTaxonomyNode, TaxonomyNodeSnapshot, Taxono
 # have a prototype compiled: there is nothing meaningful to average.
 MIN_EXEMPLARS_TO_ACTIVATE = 3
 
+# Score a topic must reach before an article is assigned to it, when the seed
+# does not state one. Measured, not assumed -- see docs/measurements.md "T6".
+DEFAULT_THRESHOLD = 0.40
+
 
 class TaxonomyValidationError(ValueError):
     def __init__(self, errors: Sequence[str]) -> None:
@@ -98,7 +102,7 @@ def _parse_topic(raw: Mapping[str, object]) -> SeedTopic:
         slug=str(raw["slug"]),
         name=str(raw["name"]),
         description=(str(raw["description"]) if raw.get("description") else None),
-        threshold=float(raw.get("threshold", 0.55)),
+        threshold=float(raw.get("threshold", DEFAULT_THRESHOLD)),
         exemplars=exemplars,
         keywords=keywords,
         active=bool(raw.get("active", True)),

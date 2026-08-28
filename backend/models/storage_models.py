@@ -464,3 +464,37 @@ class PrototypeRebuildStats:
     rebuilt: int = 0
     skipped_unchanged: int = 0
     skipped_insufficient_exemplars: int = 0
+
+
+@dataclass(frozen=True)
+class ClassifiableArticle:
+    """An article claimed for classification, with its embedding and the
+    texts keyword matching runs over.
+
+    Carries every candidate text for the same reason `EmbeddingCandidate`
+    does: which body represents the article is `services.text.article_text`'s
+    decision, so classify cannot drift from what embed actually embedded.
+    """
+
+    article_id: int
+    source_id: int | None
+    title: str | None
+    content: str
+    feed_summary: str
+    content_source: ContentSource
+    model: str
+    dim: int
+    embedding: list[float]
+
+
+@dataclass
+class ClassifyRunStats:
+    reclaimed: int = 0
+    requeued: int = 0
+    claimed: int = 0
+    classified: int = 0
+    assigned: int = 0
+    uncategorized: int = 0
+    clusters_refreshed: int = 0
+    missing_embedding: int = 0
+    failed: int = 0

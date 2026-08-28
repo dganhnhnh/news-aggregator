@@ -25,6 +25,7 @@ from services.taxonomy import (
     validate_seed,
 )
 from workers.base import EXIT_FAILED, EXIT_OK, Worker, stale_after_for
+from workers.classify import ClassifyWorker
 from workers.crawl import CrawlWorker
 from workers.cluster import ClusterWorker
 from workers.embed import EmbedWorker
@@ -36,6 +37,7 @@ logger = get_logger(__name__)
 WORKERS: dict[str, type[Worker]] = {
     CrawlWorker.name: CrawlWorker,
     EmbedWorker.name: EmbedWorker,
+    ClassifyWorker.name: ClassifyWorker,
     ClusterWorker.name: ClusterWorker,
 }
 
@@ -212,6 +214,44 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         action="store_true",
         help="Re-queue articles in the window whose stored embedding used a "
         "different model than the one configured now",
+    )
+
+    classify = subparsers.add_parser(
+        "classify",
+        help="Score articles queued in processing_jobs(stage='classify') "
+        "against the active topic set",
+    )
+    _add_common_arguments(classify)
+    classify.add_argument(
+        "--batch-size",
+        type=int,
+        default=settings.classify_batch_size,
+        help="Articles claimed per checkpoint chunk",
+    )
+    classify.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Maximum articles to process this run; 0 means unbounded",
+    )
+    classify_mode = classify.add_mutually_exclusive_group()
+    classify_mode.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="Re-queue every embedded article in the window, even if its "
+        "classification is already current",
+    )
+    classify_mode.add_argument(
+        "--stale",
+        action="store_true",
+        help="Re-queue only articles in the window never classified or scored "
+        "against a different classifier set (e.g. after a topic changed)",
+    )
+    classify_mode.add_argument(
+        "--refresh-clusters",
+        action="store_true",
+        help="Rebuild cluster_topics from article_topics for clusters in the "
+        "window, without reclassifying any article",
     )
 
     cluster = subparsers.add_parser(
@@ -427,7 +467,7 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             parser.error("--once and --interval are mutually exclusive")
         if args.command == "crawl":
             _validate_crawl(args, parser)
-        elif args.command == "embed":
+        elif args.command in {"embed", "classify"}:
             _validate_embed(args, parser)
         elif args.command == "cluster":
             _validate_cluster(args, parser)

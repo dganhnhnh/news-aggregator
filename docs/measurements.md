@@ -224,6 +224,104 @@ tham chiếu timestamp live.
 
 ---
 
+## T6 — Classifier coverage và hạ threshold `0.55 → 0.40` (2026-08-28)
+
+Đo trên snapshot `news-radar-db-1`: **1015** article đã embed, **8** active topic,
+mỗi topic có prototype compile từ 5 exemplar. Công thức không đổi:
+`0.80 * prototype_similarity + 0.20 * keyword_score`.
+
+### Phân bố score theo topic (ở threshold cũ `0.55`)
+
+| topic | n | mean | p50 | p90 | p99 | max |
+| --- | --- | --- | --- | --- | --- | --- |
+| `artificial-intelligence` | 1015 | 0.166 | 0.132 | 0.385 | 0.492 | **0.613** |
+| `consumer-hardware` | 1015 | 0.143 | 0.129 | 0.273 | 0.403 | 0.538 |
+| `cybersecurity` | 1015 | 0.136 | 0.123 | 0.244 | 0.452 | **0.615** |
+| `cloud-infrastructure` | 1015 | 0.124 | 0.114 | 0.228 | 0.393 | 0.569 |
+| `open-source` | 1015 | 0.108 | 0.093 | 0.211 | 0.374 | 0.573 |
+| `big-tech-business` | 1015 | 0.107 | 0.101 | 0.203 | 0.293 | 0.426 |
+| `programming-languages` | 1015 | 0.103 | 0.091 | 0.217 | 0.330 | 0.567 |
+| `software-engineering` | 1015 | 0.092 | 0.083 | 0.190 | 0.314 | 0.483 |
+
+```sql
+SELECT t.slug, count(*) n,
+       round(avg(at.score)::numeric,3) mean,
+       round(percentile_cont(0.50) WITHIN GROUP (ORDER BY at.score)::numeric,3) p50,
+       round(percentile_cont(0.90) WITHIN GROUP (ORDER BY at.score)::numeric,3) p90,
+       round(percentile_cont(0.99) WITHIN GROUP (ORDER BY at.score)::numeric,3) p99,
+       round(max(at.score)::numeric,3) max
+FROM article_topics at JOIN topics t ON t.id = at.topic_id GROUP BY 1;
+```
+
+**Phát hiện chính:** score cao nhất toàn corpus là `0.615`, còn p99 của topic mạnh nhất
+mới là `0.492`. Với trọng số `0.80`, threshold `0.55` đòi hỏi cosine prototype ≥
+`0.6875` — MiniLM gần như không sinh ra giá trị đó giữa một article thật và prototype
+trung bình hoá từ 5 exemplar. Ngưỡng cũ nằm ngoài dải mà công thức có thể đạt tới, nên
+nó không phải "ngưỡng chặt" mà là ngưỡng tắt classifier.
+
+### Sweep
+
+| threshold | article có nhãn | coverage | nhãn/article đã gán |
+| --- | --- | --- | --- |
+| 0.55 | 10 | 1.0% | 1.00 |
+| 0.50 | 23 | 2.3% | 1.00 |
+| 0.45 | 59 | 5.8% | 1.00 |
+| **0.40** | **129** | **12.7%** | **1.07** |
+| 0.35 | 220 | 21.7% | 1.12 |
+| 0.30 | 336 | 33.1% | 1.22 |
+
+```sql
+WITH best AS (SELECT article_id, max(score) top_score FROM article_topics GROUP BY 1),
+     th AS (SELECT generate_series(30,55,1)/100.0 t)
+SELECT th.t, count(*) FILTER (WHERE b.top_score >= th.t)
+FROM th CROSS JOIN best b GROUP BY th.t ORDER BY th.t;
+```
+
+### Kiểm tra title bằng tay
+
+Không có ground-truth label nên precision được ước lượng bằng cách đọc title theo từng
+dải score (~150 title, các topic `artificial-intelligence`, `cybersecurity`,
+`consumer-hardware`, `open-source`, `cloud-infrastructure`):
+
+| dải score | quan sát |
+| --- | --- |
+| `≥ 0.45` | gần như không thấy false positive |
+| `0.40–0.45` | vẫn đúng beat; vài case biên (bài deal "5TB cloud storage" vào `cloud-infrastructure`) |
+| `0.35–0.40` | bắt đầu lẫn: "Compose Multiplatform 1.12.0", "CLion Roadmap", "Fitbit Air Pokémon Sleep" rơi vào `artificial-intelligence` |
+| `0.30–0.35` | lẫn rõ: repo GitHub không liên quan, "Google Search cho trang trí nhà", "Google Play tại Gamescom" |
+
+`0.40` là điểm cuối cùng trước khi nhiễu xuất hiện đều, đồng thời là điểm thấp nhất mà
+**mọi** topic đều còn ít nhất một bài — không beat nào chết.
+
+### Kết quả sau khi đổi
+
+`news-worker taxonomy-import` phát hiện threshold đổi và tăng `classifier_revision`
+`1 → 2` cho cả 8 topic (prototype không rebuild vì exemplar không đổi), nên
+`--stale` requeue đúng toàn bộ 1015 article.
+
+```bash
+uv run news-worker taxonomy-import --file data/taxonomy.seed.yaml
+uv run news-worker classify --last 30d --stale --once
+```
+
+| số đo | trước (`0.55`) | sau (`0.40`) |
+| --- | --- | --- |
+| article có nhãn | 10 (1.0%) | 129 (12.7%) |
+| uncategorized | 1005 | 886 |
+| cluster có nhãn | 10 | 105 |
+| topic có ≥1 bài | 5/8 | 8/8 |
+| throughput | 1015 article / 9.2s (~110 article/s) | như trước |
+
+Phân bố theo topic sau khi đổi: `artificial-intelligence` 83, `cybersecurity` 20,
+`consumer-hardware` 12, `cloud-infrastructure` 10, `open-source` 6,
+`programming-languages` 3, `software-engineering` 3, `big-tech-business` 1.
+
+**Chưa tính:** precision/recall/F1 có số. Ước lượng ở trên là đọc title thủ công trên
+sample không cố định, không phải metric — frozen test split 100–150 bài và sweep đầy đủ
+vẫn thuộc Tuần 4 theo §12.6. `0.80/0.20` giữ nguyên; chỉ threshold đổi.
+
+---
+
 ## Chỗ trống cho các task sau (T2–T9)
 
 Các bảng dưới đây được tạo trước theo §12.6 của kế hoạch; điền số liệu khi
@@ -232,7 +330,7 @@ task tương ứng hoàn thành. Không điền trước khi có code thật ch�
 | Hạng mục | Số đo cần ghi | Task | Trạng thái |
 | --- | --- | --- | --- |
 | Cluster | p50/p95 candidate query, articles/s, size distribution | T3–T4 | chưa đo |
-| Classifier | articles/s, confidence histogram, uncategorized rate | T6 | chưa đo |
+| Classifier | articles/s, confidence histogram, uncategorized rate | T6 | đã đo (mục T6) |
 | Taxonomy | prototype rebuild time/topic, reclassify time/1k articles | T5 | chưa đo |
 | API | stories p50/p95, query plan cho topic/source filter | T7 | chưa đo |
 | Golden | N/10 case pass, `case_id` fail + reason | T9 | chưa đo |
