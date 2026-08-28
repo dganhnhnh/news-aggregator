@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
@@ -33,6 +34,12 @@ from adapters.storage.schema import (
     processing_jobs,
     raw_articles,
     sources,
+    taxonomies,
+    taxonomy_node_topics,
+    taxonomy_nodes,
+    topic_prototypes,
+    topic_signals,
+    topics,
     worker_runs,
 )
 from core.content_quality import historical_summary_title_reason
@@ -53,6 +60,7 @@ from models.storage_models import (
     FeedFailureOutcome,
     FeedPollTarget,
     FeedSeed,
+    FlatTaxonomyNode,
     HistoricalBlockPage,
     RawArticle,
     RunStatus,
@@ -63,10 +71,18 @@ from models.storage_models import (
     StoryFeedItem,
     StoryMember,
     StorySourceRef,
+    TaxonomyImportSummary,
+    TaxonomySnapshot,
+    TopicExemplarSet,
+    TopicImportOutcome,
+    TopicPrototypeRecord,
+    TopicSignalSnapshot,
+    TopicSnapshot,
     WorkerTrigger,
 )
 from services.raw_storage import build_excerpt, source_slug
 from services.clustering import choose_canonical, recompute_centroid, running_centroid
+from services.taxonomy import SeedTaxonomyNode, TaxonomySeed, build_node_tree, next_classifier_revision
 
 
 class StorageError(RuntimeError):
@@ -248,7 +264,13 @@ class PostgresRawStorage:
                         "to_regclass('public.processing_jobs'), "
                         "to_regclass('public.article_embeddings'), "
                         "to_regclass('public.clusters'), "
-                        "to_regclass('public.cluster_members')"
+                        "to_regclass('public.cluster_members'), "
+                        "to_regclass('public.topics'), "
+                        "to_regclass('public.topic_signals'), "
+                        "to_regclass('public.topic_prototypes'), "
+                        "to_regclass('public.taxonomies'), "
+                        "to_regclass('public.taxonomy_nodes'), "
+                        "to_regclass('public.taxonomy_node_topics')"
                     )
                 )
                 if any(value is None for value in tables.one()):
@@ -2081,3 +2103,472 @@ class PostgresRawStorage:
         async with self._engine.connect() as connection:
             result = await connection.execute(stmt)
             return {row[0] for row in result if row[0] is not None}
+
+    async def import_taxonomy(
+        self, seed: TaxonomySeed, *, prune: bool = False
+    ) -> TaxonomyImportSummary:
+        """Import topics and taxonomy trees, idempotently.
+
+        Runs as one transaction so a partially-applied seed can never be
+        observed: either every topic/node lands, or none does. `prune=False`
+        (the default) only ever adds or updates -- nothing is ever removed by
+        a seed simply omitting it, matching the spec's opt-in deletion rule.
+        """
+        async with self._engine.begin() as connection:
+            existing_topic_rows = (await connection.execute(select(topics))).all()
+            existing_topics_by_slug = {row.slug: row for row in existing_topic_rows}
+            existing_signal_rows = (await connection.execute(select(topic_signals))).all()
+            signals_by_topic_id: dict[int, list] = defaultdict(list)
+            for row in existing_signal_rows:
+                signals_by_topic_id[row.topic_id].append(row)
+
+            topic_outcomes: list[TopicImportOutcome] = []
+            topic_ids_by_slug: dict[str, int] = {}
+            seed_topic_slugs = {topic.slug for topic in seed.topics}
+
+            for seed_topic in seed.topics:
+                existing_row = existing_topics_by_slug.get(seed_topic.slug)
+                existing_snapshot: TopicSnapshot | None = None
+                if existing_row is not None:
+                    existing_snapshot = TopicSnapshot(
+                        id=existing_row.id,
+                        slug=existing_row.slug,
+                        display_name=existing_row.display_name,
+                        description=existing_row.description,
+                        threshold=existing_row.threshold,
+                        classifier_revision=existing_row.classifier_revision,
+                        active=existing_row.active,
+                        signals=[
+                            TopicSignalSnapshot(
+                                kind=s.kind, value=s.value, weight=s.weight, active=s.active
+                            )
+                            for s in signals_by_topic_id.get(existing_row.id, [])
+                        ],
+                    )
+                old_revision = existing_snapshot.classifier_revision if existing_snapshot else 0
+                new_revision = next_classifier_revision(existing_snapshot, seed_topic)
+
+                stmt = pg_insert(topics).values(
+                    slug=seed_topic.slug,
+                    display_name=seed_topic.name,
+                    description=seed_topic.description,
+                    threshold=seed_topic.threshold,
+                    classifier_revision=new_revision,
+                    active=seed_topic.active,
+                )
+                result = await connection.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=[topics.c.slug],
+                        set_={
+                            "display_name": stmt.excluded.display_name,
+                            "description": stmt.excluded.description,
+                            "threshold": stmt.excluded.threshold,
+                            "classifier_revision": new_revision,
+                            "active": stmt.excluded.active,
+                            "updated_at": func.now(),
+                        },
+                    ).returning(topics.c.id)
+                )
+                topic_id = int(result.scalar_one())
+                topic_ids_by_slug[seed_topic.slug] = topic_id
+
+                desired_signals = [
+                    {
+                        "topic_id": topic_id,
+                        "kind": "exemplar",
+                        "value": exemplar,
+                        "weight": 1.0,
+                        "language": None,
+                        "active": True,
+                    }
+                    for exemplar in seed_topic.exemplars
+                ] + [
+                    {
+                        "topic_id": topic_id,
+                        "kind": "keyword",
+                        "value": keyword.value,
+                        "weight": keyword.weight,
+                        "language": None,
+                        "active": True,
+                    }
+                    for keyword in seed_topic.keywords
+                ]
+                if desired_signals:
+                    signal_stmt = pg_insert(topic_signals).values(desired_signals)
+                    await connection.execute(
+                        signal_stmt.on_conflict_do_update(
+                            index_elements=[
+                                topic_signals.c.topic_id,
+                                topic_signals.c.kind,
+                                topic_signals.c.value,
+                            ],
+                            set_={
+                                "weight": signal_stmt.excluded.weight,
+                                "language": signal_stmt.excluded.language,
+                                "active": True,
+                            },
+                        )
+                    )
+                desired_keys = {(s["kind"], s["value"]) for s in desired_signals}
+                stale_keys = [
+                    (s.kind, s.value)
+                    for s in signals_by_topic_id.get(topic_id, [])
+                    if s.active and (s.kind, s.value) not in desired_keys
+                ]
+                if stale_keys:
+                    await connection.execute(
+                        update(topic_signals)
+                        .where(
+                            topic_signals.c.topic_id == topic_id,
+                            tuple_(topic_signals.c.kind, topic_signals.c.value).in_(
+                                stale_keys
+                            ),
+                        )
+                        .values(active=False)
+                    )
+
+                topic_outcomes.append(
+                    TopicImportOutcome(
+                        slug=seed_topic.slug,
+                        created=existing_row is None,
+                        revision_bumped=new_revision != old_revision,
+                        old_revision=old_revision,
+                        new_revision=new_revision,
+                    )
+                )
+
+            pruned_topics: list[str] = []
+            if prune:
+                stale_topic_rows = [
+                    row for row in existing_topic_rows if row.slug not in seed_topic_slugs
+                ]
+                if stale_topic_rows:
+                    await connection.execute(
+                        update(topics)
+                        .where(topics.c.id.in_([row.id for row in stale_topic_rows]))
+                        .values(active=False, updated_at=func.now())
+                    )
+                    pruned_topics = [row.slug for row in stale_topic_rows]
+
+            taxonomies_created: list[str] = []
+            taxonomies_updated: list[str] = []
+            nodes_created = 0
+            nodes_updated = 0
+            pruned_nodes: list[str] = []
+
+            for seed_taxonomy in seed.taxonomies:
+                existing_taxonomy_row = (
+                    await connection.execute(
+                        select(taxonomies).where(taxonomies.c.slug == seed_taxonomy.slug)
+                    )
+                ).first()
+                taxonomy_stmt = pg_insert(taxonomies).values(
+                    slug=seed_taxonomy.slug, display_name=seed_taxonomy.name, active=True
+                )
+                taxonomy_result = await connection.execute(
+                    taxonomy_stmt.on_conflict_do_update(
+                        index_elements=[taxonomies.c.slug],
+                        set_={"display_name": taxonomy_stmt.excluded.display_name},
+                    ).returning(taxonomies.c.id)
+                )
+                taxonomy_id = int(taxonomy_result.scalar_one())
+                if existing_taxonomy_row is None:
+                    taxonomies_created.append(seed_taxonomy.slug)
+                else:
+                    taxonomies_updated.append(seed_taxonomy.slug)
+
+                existing_node_rows = (
+                    await connection.execute(
+                        select(taxonomy_nodes).where(
+                            taxonomy_nodes.c.taxonomy_id == taxonomy_id
+                        )
+                    )
+                ).all()
+                existing_nodes_by_key = {
+                    (row.parent_id, row.slug): row for row in existing_node_rows
+                }
+
+                seen_node_ids: set[int] = set()
+                created_count, updated_count = await self._upsert_nodes(
+                    connection,
+                    taxonomy_id,
+                    None,
+                    seed_taxonomy.nodes,
+                    topic_ids_by_slug,
+                    existing_nodes_by_key,
+                    seen_node_ids,
+                )
+                nodes_created += created_count
+                nodes_updated += updated_count
+
+                if prune:
+                    stale_nodes = [
+                        row for row in existing_node_rows if row.id not in seen_node_ids
+                    ]
+                    if stale_nodes:
+                        await connection.execute(
+                            delete(taxonomy_nodes).where(
+                                taxonomy_nodes.c.id.in_([row.id for row in stale_nodes])
+                            )
+                        )
+                        pruned_nodes.extend(row.slug for row in stale_nodes)
+
+            return TaxonomyImportSummary(
+                topics=topic_outcomes,
+                taxonomies_created=taxonomies_created,
+                taxonomies_updated=taxonomies_updated,
+                nodes_created=nodes_created,
+                nodes_updated=nodes_updated,
+                pruned_topics=pruned_topics,
+                pruned_nodes=pruned_nodes,
+            )
+
+    @staticmethod
+    async def _upsert_nodes(
+        connection: AsyncConnection,
+        taxonomy_id: int,
+        parent_id: int | None,
+        nodes: Sequence[SeedTaxonomyNode],
+        topic_ids_by_slug: Mapping[str, int],
+        existing_nodes_by_key: Mapping[tuple[int | None, str], Any],
+        seen_node_ids: set[int],
+    ) -> tuple[int, int]:
+        """Recursively upsert one taxonomy level, reconciling node-topic links.
+
+        Two different ON CONFLICT targets are needed because Postgres treats
+        NULL parent_id values as distinct: root nodes conflict on the partial
+        unique index over (taxonomy_id, slug) WHERE parent_id IS NULL, and
+        non-root nodes conflict on the named (taxonomy_id, parent_id, slug)
+        constraint.
+        """
+        created = 0
+        updated = 0
+        for index, node in enumerate(nodes):
+            existing = existing_nodes_by_key.get((parent_id, node.slug))
+            stmt = pg_insert(taxonomy_nodes).values(
+                taxonomy_id=taxonomy_id,
+                parent_id=parent_id,
+                slug=node.slug,
+                display_name=node.name,
+                sort_order=index,
+            )
+            if parent_id is None:
+                conflict = stmt.on_conflict_do_update(
+                    index_elements=[taxonomy_nodes.c.taxonomy_id, taxonomy_nodes.c.slug],
+                    index_where=taxonomy_nodes.c.parent_id.is_(None),
+                    set_={
+                        "display_name": stmt.excluded.display_name,
+                        "sort_order": index,
+                    },
+                )
+            else:
+                conflict = stmt.on_conflict_do_update(
+                    constraint="uq_taxonomy_nodes_taxonomy_parent_slug",
+                    set_={
+                        "display_name": stmt.excluded.display_name,
+                        "sort_order": index,
+                    },
+                )
+            result = await connection.execute(conflict.returning(taxonomy_nodes.c.id))
+            node_id = int(result.scalar_one())
+            seen_node_ids.add(node_id)
+            if existing is None:
+                created += 1
+            else:
+                updated += 1
+
+            desired_topic_ids = {
+                topic_ids_by_slug[slug]
+                for slug in node.topics
+                if slug in topic_ids_by_slug
+            }
+            current_links = {
+                row.topic_id
+                for row in (
+                    await connection.execute(
+                        select(taxonomy_node_topics.c.topic_id).where(
+                            taxonomy_node_topics.c.node_id == node_id
+                        )
+                    )
+                ).all()
+            }
+            to_add = desired_topic_ids - current_links
+            to_remove = current_links - desired_topic_ids
+            if to_add:
+                await connection.execute(
+                    taxonomy_node_topics.insert().values(
+                        [{"node_id": node_id, "topic_id": tid} for tid in to_add]
+                    )
+                )
+            if to_remove:
+                await connection.execute(
+                    delete(taxonomy_node_topics).where(
+                        taxonomy_node_topics.c.node_id == node_id,
+                        taxonomy_node_topics.c.topic_id.in_(to_remove),
+                    )
+                )
+
+            child_created, child_updated = await PostgresRawStorage._upsert_nodes(
+                connection,
+                taxonomy_id,
+                node_id,
+                node.children,
+                topic_ids_by_slug,
+                existing_nodes_by_key,
+                seen_node_ids,
+            )
+            created += child_created
+            updated += child_updated
+        return created, updated
+
+    async def export_taxonomy(self) -> tuple[list[TopicSnapshot], list[TaxonomySnapshot]]:
+        """Read the full topic registry and taxonomy trees back out, in the
+        same shape `services.taxonomy.to_seed_dict` expects."""
+        async with self._engine.connect() as connection:
+            topic_rows = (
+                await connection.execute(select(topics).order_by(topics.c.slug))
+            ).all()
+            signal_rows = (await connection.execute(select(topic_signals))).all()
+            signals_by_topic: dict[int, list[TopicSignalSnapshot]] = defaultdict(list)
+            for row in signal_rows:
+                signals_by_topic[row.topic_id].append(
+                    TopicSignalSnapshot(
+                        kind=row.kind, value=row.value, weight=row.weight, active=row.active
+                    )
+                )
+            topic_snapshots = [
+                TopicSnapshot(
+                    id=row.id,
+                    slug=row.slug,
+                    display_name=row.display_name,
+                    description=row.description,
+                    threshold=row.threshold,
+                    classifier_revision=row.classifier_revision,
+                    active=row.active,
+                    signals=signals_by_topic.get(row.id, []),
+                )
+                for row in topic_rows
+            ]
+            topic_slug_by_id = {row.id: row.slug for row in topic_rows}
+
+            taxonomy_rows = (
+                await connection.execute(select(taxonomies).order_by(taxonomies.c.slug))
+            ).all()
+            node_rows = (await connection.execute(select(taxonomy_nodes))).all()
+            link_rows = (await connection.execute(select(taxonomy_node_topics))).all()
+            topic_slugs_by_node: dict[int, list[str]] = defaultdict(list)
+            for row in link_rows:
+                slug = topic_slug_by_id.get(row.topic_id)
+                if slug:
+                    topic_slugs_by_node[row.node_id].append(slug)
+            nodes_by_taxonomy: dict[int, list] = defaultdict(list)
+            for row in node_rows:
+                nodes_by_taxonomy[row.taxonomy_id].append(row)
+
+            taxonomy_snapshots = []
+            for row in taxonomy_rows:
+                flat_nodes = [
+                    FlatTaxonomyNode(
+                        id=node.id,
+                        parent_id=node.parent_id,
+                        slug=node.slug,
+                        display_name=node.display_name,
+                        sort_order=node.sort_order,
+                        topic_slugs=tuple(sorted(topic_slugs_by_node.get(node.id, []))),
+                    )
+                    for node in nodes_by_taxonomy.get(row.id, [])
+                ]
+                taxonomy_snapshots.append(
+                    TaxonomySnapshot(
+                        slug=row.slug,
+                        display_name=row.display_name,
+                        revision=row.revision,
+                        active=row.active,
+                        nodes=build_node_tree(flat_nodes),
+                    )
+                )
+            return topic_snapshots, taxonomy_snapshots
+
+    async def topics_for_prototype_rebuild(
+        self, slug: str | None = None
+    ) -> list[TopicExemplarSet]:
+        """Active topics' current exemplars, plus their prototype's
+        provenance so the caller can skip a topic whose exemplars haven't
+        changed since the last compile."""
+        async with self._engine.connect() as connection:
+            stmt = select(topics).where(topics.c.active.is_(True))
+            if slug is not None:
+                stmt = stmt.where(topics.c.slug == slug)
+            topic_rows = (await connection.execute(stmt)).all()
+            if not topic_rows:
+                return []
+            topic_ids = [row.id for row in topic_rows]
+            signal_rows = (
+                await connection.execute(
+                    select(topic_signals.c.topic_id, topic_signals.c.value).where(
+                        topic_signals.c.topic_id.in_(topic_ids),
+                        topic_signals.c.kind == "exemplar",
+                        topic_signals.c.active.is_(True),
+                    )
+                )
+            ).all()
+            exemplars_by_topic: dict[int, list[str]] = defaultdict(list)
+            for row in signal_rows:
+                exemplars_by_topic[row.topic_id].append(row.value)
+            prototype_rows = (
+                await connection.execute(
+                    select(topic_prototypes).where(
+                        topic_prototypes.c.topic_id.in_(topic_ids)
+                    )
+                )
+            ).all()
+            prototypes_by_topic = {row.topic_id: row for row in prototype_rows}
+
+            results: list[TopicExemplarSet] = []
+            for row in topic_rows:
+                prototype = prototypes_by_topic.get(row.id)
+                results.append(
+                    TopicExemplarSet(
+                        topic_id=row.id,
+                        slug=row.slug,
+                        active=row.active,
+                        exemplars=exemplars_by_topic.get(row.id, []),
+                        current_definition_hash=(
+                            prototype.definition_hash if prototype else None
+                        ),
+                        current_model=prototype.model if prototype else None,
+                        current_dim=prototype.dim if prototype else None,
+                    )
+                )
+            return results
+
+    async def upsert_topic_prototypes(
+        self, records: Sequence[TopicPrototypeRecord]
+    ) -> None:
+        if not records:
+            return
+        stmt = pg_insert(topic_prototypes).values(
+            [
+                {
+                    "topic_id": record.topic_id,
+                    "model": record.model,
+                    "dim": record.dim,
+                    "definition_hash": record.definition_hash,
+                    "embedding": record.embedding,
+                }
+                for record in records
+            ]
+        )
+        async with self._engine.begin() as connection:
+            await connection.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[topic_prototypes.c.topic_id],
+                    set_={
+                        "model": stmt.excluded.model,
+                        "dim": stmt.excluded.dim,
+                        "definition_hash": stmt.excluded.definition_hash,
+                        "embedding": stmt.excluded.embedding,
+                        "generated_at": func.now(),
+                    },
+                )
+            )

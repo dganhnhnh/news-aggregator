@@ -1,0 +1,200 @@
+version: 1
+
+topics:
+  - slug: consumer-hardware
+    name: Consumer Hardware
+    description: Phones, laptops, wearables and other gadgets reviewed or launched.
+    threshold: 0.55
+    exemplars:
+      - the new smartphone features an improved camera and longer battery life
+      - hands-on review of the latest laptop with a faster processor
+      - the smartwatch adds new health tracking sensors
+      - unboxing and first impressions of the newest tablet
+      - benchmark comparison of the latest flagship phones
+    keywords:
+      - value: smartphone
+        weight: 1.0
+      - value: laptop
+        weight: 0.8
+      - value: review
+        weight: 0.5
+      - value: wearable
+        weight: 0.6
+
+  - slug: artificial-intelligence
+    name: Artificial Intelligence
+    description: AI models, research, tools and products.
+    threshold: 0.55
+    exemplars:
+      - a new large language model outperforms previous benchmarks
+      - researchers publish a paper on training more efficient neural networks
+      - the company launches an AI assistant for coding tasks
+      - generative AI tools are being adopted across the industry
+      - the model was fine-tuned to reduce hallucinations
+    keywords:
+      - value: AI
+        weight: 1.0
+      - value: LLM
+        weight: 0.9
+      - value: machine learning
+        weight: 0.8
+      - value: neural network
+        weight: 0.7
+
+  - slug: software-engineering
+    name: Software Engineering
+    description: Engineering practices, architecture, testing and developer tooling.
+    threshold: 0.55
+    exemplars:
+      - a team shares lessons learned from migrating a monolith to microservices
+      - the blog post explains a pattern for handling database migrations safely
+      - engineers discuss trade-offs between different testing strategies
+      - a postmortem describes what caused a production outage
+      - the article walks through debugging a tricky concurrency bug
+    keywords:
+      - value: engineering
+        weight: 0.8
+      - value: architecture
+        weight: 0.7
+      - value: testing
+        weight: 0.6
+      - value: debugging
+        weight: 0.6
+
+  - slug: programming-languages
+    name: Programming Languages
+    description: Language releases, compilers, runtimes and language-specific tooling.
+    threshold: 0.55
+    exemplars:
+      - the language releases a new version with improved performance
+      - a proposal to add pattern matching to the language is under discussion
+      - the compiler now produces smaller binaries
+      - developers compare the ergonomics of two competing languages
+      - the runtime gets a faster garbage collector
+    keywords:
+      - value: programming language
+        weight: 1.0
+      - value: compiler
+        weight: 0.8
+      - value: runtime
+        weight: 0.6
+      - value: syntax
+        weight: 0.4
+
+  - slug: cloud-infrastructure
+    name: Cloud & Infrastructure
+    description: Cloud platforms, containers, orchestration and infrastructure tooling.
+    threshold: 0.55
+    exemplars:
+      - the cloud provider announces a new region and lower storage pricing
+      - a guide to running stateful workloads on Kubernetes
+      - the team describes how they scaled their infrastructure to handle more traffic
+      - a comparison of serverless platforms for backend workloads
+      - the outage was traced to a misconfigured load balancer
+    keywords:
+      - value: cloud
+        weight: 0.9
+      - value: Kubernetes
+        weight: 0.8
+      - value: infrastructure
+        weight: 0.7
+      - value: serverless
+        weight: 0.5
+
+  - slug: cybersecurity
+    name: Cybersecurity
+    description: Vulnerabilities, breaches, exploits and security tooling.
+    threshold: 0.55
+    exemplars:
+      - researchers disclose a critical vulnerability affecting millions of devices
+      - a company confirms a data breach exposing customer information
+      - attackers exploited a zero-day flaw before a patch was available
+      - the security team published a report on a new phishing campaign
+      - a patch was released to fix a remote code execution bug
+    keywords:
+      - value: vulnerability
+        weight: 1.0
+      - value: breach
+        weight: 0.9
+      - value: exploit
+        weight: 0.8
+      - value: security
+        weight: 0.6
+
+  - slug: open-source
+    name: Open Source
+    description: Open-source projects, releases, licensing and community governance.
+    threshold: 0.55
+    exemplars:
+      - the open-source project reaches a major version milestone
+      - maintainers discuss a change to the project's license
+      - a community-driven fork gains traction after the license change
+      - the foundation announces new funding for the open-source project
+      - contributors debate the governance model for the project
+    keywords:
+      - value: open source
+        weight: 1.0
+      - value: license
+        weight: 0.7
+      - value: maintainer
+        weight: 0.6
+      - value: GitHub
+        weight: 0.5
+
+  - slug: big-tech-business
+    name: Big Tech Business
+    description: Corporate strategy, funding, layoffs, acquisitions and leadership moves at major tech companies.
+    threshold: 0.55
+    exemplars:
+      - the company reports quarterly earnings that beat analyst expectations
+      - the tech giant announces layoffs affecting thousands of employees
+      - the startup raises a new funding round led by a major investor
+      - the acquisition is expected to close by the end of the year
+      - the CEO announced a new strategic direction for the company
+    keywords:
+      - value: earnings
+        weight: 0.8
+      - value: layoffs
+        weight: 0.9
+      - value: acquisition
+        weight: 0.8
+      - value: funding
+        weight: 0.7
+
+taxonomies:
+  - slug: default
+    name: Default
+    nodes:
+      - slug: technology
+        name: Technology
+        children:
+          - slug: hardware
+            name: Hardware
+            topics: [consumer-hardware]
+          - slug: ai
+            name: Artificial Intelligence
+            topics: [artificial-intelligence]
+          - slug: security
+            name: Security
+            topics: [cybersecurity]
+          - slug: cloud
+            name: Cloud & Infrastructure
+            topics: [cloud-infrastructure]
+      - slug: software
+        name: Software Engineering
+        children:
+          - slug: practices
+            name: Practices
+            topics: [software-engineering]
+          - slug: languages
+            name: Languages
+            topics: [programming-languages]
+          - slug: oss
+            name: Open Source
+            topics: [open-source]
+      - slug: business
+        name: Business
+        children:
+          - slug: big-tech
+            name: Big Tech
+            topics: [big-tech-business]

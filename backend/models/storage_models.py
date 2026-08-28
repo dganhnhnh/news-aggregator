@@ -363,3 +363,104 @@ class ClusterRunStats:
     repaired: int = 0
     closed: int = 0
     failed: int = 0
+
+
+@dataclass(frozen=True)
+class TopicSignalSnapshot:
+    kind: str  # exemplar | keyword
+    value: str
+    weight: float
+    active: bool
+
+
+@dataclass(frozen=True)
+class TopicSnapshot:
+    id: int
+    slug: str
+    display_name: str
+    description: str | None
+    threshold: float
+    classifier_revision: int
+    active: bool
+    signals: list[TopicSignalSnapshot]
+
+
+@dataclass(frozen=True)
+class TaxonomyNodeSnapshot:
+    slug: str
+    display_name: str
+    sort_order: int
+    topic_slugs: list[str]
+    children: list["TaxonomyNodeSnapshot"]
+
+
+@dataclass(frozen=True)
+class TaxonomySnapshot:
+    slug: str
+    display_name: str
+    revision: int
+    active: bool
+    nodes: list[TaxonomyNodeSnapshot]
+
+
+@dataclass(frozen=True)
+class FlatTaxonomyNode:
+    """One `taxonomy_nodes` row, flattened for pure tree-building."""
+
+    id: int
+    parent_id: int | None
+    slug: str
+    display_name: str
+    sort_order: int
+    topic_slugs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TopicImportOutcome:
+    slug: str
+    created: bool
+    revision_bumped: bool
+    old_revision: int
+    new_revision: int
+
+
+@dataclass(frozen=True)
+class TaxonomyImportSummary:
+    topics: list[TopicImportOutcome]
+    taxonomies_created: list[str]
+    taxonomies_updated: list[str]
+    nodes_created: int
+    nodes_updated: int
+    pruned_topics: list[str]
+    pruned_nodes: list[str]
+
+
+@dataclass(frozen=True)
+class TopicExemplarSet:
+    """What the prototype compiler needs for one topic, plus its current
+    prototype's provenance so an unchanged topic can be skipped."""
+
+    topic_id: int
+    slug: str
+    active: bool
+    exemplars: list[str]
+    current_definition_hash: bytes | None
+    current_model: str | None
+    current_dim: int | None
+
+
+@dataclass(frozen=True)
+class TopicPrototypeRecord:
+    topic_id: int
+    model: str
+    dim: int
+    definition_hash: bytes
+    embedding: list[float]
+
+
+@dataclass
+class PrototypeRebuildStats:
+    considered: int = 0
+    rebuilt: int = 0
+    skipped_unchanged: int = 0
+    skipped_insufficient_exemplars: int = 0

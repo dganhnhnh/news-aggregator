@@ -4,11 +4,26 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from asyncio import to_thread
 from pathlib import Path
+from typing import Any
 
+import yaml
+
+from adapters.embedding.fastembed_embedder import FastEmbedEmbedder
 from adapters.storage import PostgresRawStorage, StorageError
 from core.config import Settings
 from core.logger import get_logger, setup_logging
+from models.storage_models import PrototypeRebuildStats, TopicPrototypeRecord
+from services.taxonomy import (
+    MIN_EXEMPLARS_TO_ACTIVATE,
+    TaxonomyValidationError,
+    compile_prototype,
+    definition_hash,
+    parse_seed,
+    to_seed_dict,
+    validate_seed,
+)
 from workers.base import EXIT_FAILED, EXIT_OK, Worker, stale_after_for
 from workers.crawl import CrawlWorker
 from workers.cluster import ClusterWorker
@@ -299,6 +314,31 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Apply the cleanup; without this flag the command is a dry run",
     )
 
+    taxonomy_import = subparsers.add_parser(
+        "taxonomy-import", help="Import topics and taxonomy trees from a YAML seed file"
+    )
+    taxonomy_import.add_argument("--file", type=Path, required=True, help="Seed YAML path")
+    taxonomy_import.add_argument(
+        "--prune",
+        action="store_true",
+        help="Deactivate topics and remove taxonomy nodes absent from the file",
+    )
+
+    taxonomy_export = subparsers.add_parser(
+        "taxonomy-export", help="Export the current topic registry and taxonomy trees"
+    )
+    taxonomy_export.add_argument(
+        "--file", type=Path, required=True, help="Where to write the seed YAML"
+    )
+
+    taxonomy_rebuild = subparsers.add_parser(
+        "taxonomy-rebuild",
+        help="Recompile topic prototypes from their active exemplars",
+    )
+    taxonomy_rebuild.add_argument(
+        "--topic", metavar="SLUG", help="Rebuild only this topic; default is every active topic"
+    )
+
     enable_feed = subparsers.add_parser(
         "enable-feed", help="Clear a feed's disabled_at"
     )
@@ -394,6 +434,9 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     elif args.command in {"replay", "cleanup-block-pages"}:
         if args.limit <= 0:
             parser.error("--limit must be positive")
+    elif args.command in {"taxonomy-import", "taxonomy-export"}:
+        if args.command == "taxonomy-import" and not args.file.is_file():
+            parser.error(f"Taxonomy seed file not found: {args.file}")
 
 
 async def _dispatch(
@@ -487,7 +530,160 @@ async def _dispatch_admin(
             return EXIT_FAILED
         logger.info("Disabled feed: %s", args.url)
         return EXIT_OK
+
+    if args.command == "taxonomy-import":
+        raw = yaml.safe_load(args.file.read_text()) or {}
+        try:
+            seed = parse_seed(raw)
+            validate_seed(seed)
+        except TaxonomyValidationError as exc:
+            logger.error("Taxonomy seed is invalid:")
+            for message in exc.errors:
+                logger.error("  - %s", message)
+            return EXIT_FAILED
+
+        if args.prune:
+            # Print what --prune is about to affect before the write commits,
+            # per the spec's "log before ghi" rule; a short read/write race
+            # with a concurrent import is acceptable for a single-operator CLI.
+            current_topics, _ = await storage.export_taxonomy()
+            seed_slugs = {topic.slug for topic in seed.topics}
+            at_risk = sorted(
+                topic.slug
+                for topic in current_topics
+                if topic.active and topic.slug not in seed_slugs
+            )
+            if at_risk:
+                logger.info(
+                    "--prune will deactivate %d topic(s): %s",
+                    len(at_risk),
+                    ", ".join(at_risk),
+                )
+
+        summary = await storage.import_taxonomy(seed, prune=args.prune)
+        for outcome in summary.topics:
+            if outcome.created:
+                logger.info(
+                    "Created topic %s (revision %d)", outcome.slug, outcome.new_revision
+                )
+            elif outcome.revision_bumped:
+                logger.info(
+                    "Updated topic %s: classifier_revision %d -> %d",
+                    outcome.slug,
+                    outcome.old_revision,
+                    outcome.new_revision,
+                )
+        logger.info(
+            "Imported taxonomy: %d topic(s); taxonomies created=%s updated=%s; "
+            "nodes created=%d updated=%d; pruned topics=%s pruned nodes=%s",
+            len(summary.topics),
+            summary.taxonomies_created,
+            summary.taxonomies_updated,
+            summary.nodes_created,
+            summary.nodes_updated,
+            summary.pruned_topics,
+            summary.pruned_nodes,
+        )
+        return EXIT_OK
+
+    if args.command == "taxonomy-export":
+        topic_snapshots, taxonomy_snapshots = await storage.export_taxonomy()
+        payload = to_seed_dict(topic_snapshots, taxonomy_snapshots)
+        args.file.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
+        logger.info(
+            "Exported %d topic(s) and %d taxonomy(ies) to %s",
+            len(topic_snapshots),
+            len(taxonomy_snapshots),
+            args.file,
+        )
+        return EXIT_OK
+
+    if args.command == "taxonomy-rebuild":
+        async with storage.worker_lock("taxonomy-rebuild") as acquired:
+            if not acquired:
+                logger.info(
+                    "Another taxonomy-rebuild run holds the lock; exiting without doing work"
+                )
+                return EXIT_OK
+            run_id = await storage.start_run(
+                worker="taxonomy-rebuild",
+                trigger="manual",
+                params={"topic": args.topic},
+            )
+            try:
+                stats = await _rebuild_taxonomy_prototypes(storage, topic_slug=args.topic)
+            except Exception as exc:
+                logger.exception("taxonomy-rebuild run %d failed", run_id)
+                await storage.finish_run(run_id, "failed", None, str(exc))
+                return EXIT_FAILED
+            await storage.finish_run(run_id, "succeeded", stats)
+        logger.info(
+            "Prototype rebuild: considered=%d rebuilt=%d skipped_unchanged=%d "
+            "skipped_insufficient_exemplars=%d",
+            stats.considered,
+            stats.rebuilt,
+            stats.skipped_unchanged,
+            stats.skipped_insufficient_exemplars,
+        )
+        return EXIT_OK
+
     raise AssertionError(f"unhandled admin command: {args.command}")
+
+
+async def _rebuild_taxonomy_prototypes(
+    storage: PostgresRawStorage, *, topic_slug: str | None
+) -> PrototypeRebuildStats:
+    """Recompile prototypes for active topics whose exemplars changed.
+
+    One embed call for every exemplar across every topic being rebuilt,
+    rather than one call per topic: the workload here is a handful of topics
+    with a few dozen exemplars total, so poison-pill isolation (see
+    `EmbedWorker._embed_and_store`) is not worth the extra code.
+    """
+    embedder = FastEmbedEmbedder()
+    stats = PrototypeRebuildStats()
+    exemplar_sets = await storage.topics_for_prototype_rebuild(topic_slug)
+
+    to_compile: list[tuple[Any, bytes]] = []
+    for item in exemplar_sets:
+        stats.considered += 1
+        if len(item.exemplars) < MIN_EXEMPLARS_TO_ACTIVATE:
+            stats.skipped_insufficient_exemplars += 1
+            continue
+        new_hash = definition_hash(item.exemplars)
+        if (
+            item.current_definition_hash == new_hash
+            and item.current_model == embedder.model_name
+            and item.current_dim == embedder.dim
+        ):
+            stats.skipped_unchanged += 1
+            continue
+        to_compile.append((item, new_hash))
+
+    if not to_compile:
+        return stats
+
+    flat_texts = [exemplar for item, _ in to_compile for exemplar in item.exemplars]
+    vectors = await to_thread(embedder.embed, flat_texts)
+
+    records: list[TopicPrototypeRecord] = []
+    offset = 0
+    for item, new_hash in to_compile:
+        n = len(item.exemplars)
+        prototype = compile_prototype(vectors[offset : offset + n])
+        offset += n
+        records.append(
+            TopicPrototypeRecord(
+                topic_id=item.topic_id,
+                model=embedder.model_name,
+                dim=embedder.dim,
+                definition_hash=new_hash,
+                embedding=prototype,
+            )
+        )
+    await storage.upsert_topic_prototypes(records)
+    stats.rebuilt = len(records)
+    return stats
 
 
 def main(argv: list[str] | None = None) -> None:

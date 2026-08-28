@@ -314,3 +314,136 @@ cluster_members = Table(
     PrimaryKeyConstraint("cluster_id", "article_id"),
     UniqueConstraint("article_id", name="uq_cluster_members_article"),
 )
+
+topics = Table(
+    "topics",
+    metadata,
+    Column("id", BigInteger, Identity(), primary_key=True),
+    Column("slug", Text, nullable=False),
+    Column("display_name", Text, nullable=False),
+    Column("description", Text),
+    Column("threshold", Float, nullable=False, server_default="0.55"),
+    # Only exemplar/keyword/weight/threshold changes bump this; it is what
+    # marks every existing article_topics/article_classifications row using
+    # the old scoring inputs as stale. Presentation-only edits (display_name,
+    # taxonomy placement) never touch it.
+    Column("classifier_revision", Integer, nullable=False, server_default="1"),
+    # A topic without at least three active exemplars cannot be activated --
+    # there is nothing to average into a usable prototype.
+    Column("active", Boolean, nullable=False, server_default="false"),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    UniqueConstraint("slug", name="uq_topics_slug"),
+)
+
+topic_signals = Table(
+    "topic_signals",
+    metadata,
+    Column("id", BigInteger, Identity(), primary_key=True),
+    Column(
+        "topic_id",
+        BigInteger,
+        ForeignKey("topics.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("kind", Text, nullable=False),  # exemplar | keyword
+    Column("value", Text, nullable=False),
+    Column("weight", Float, nullable=False, server_default="1"),
+    Column("language", Text),
+    Column("active", Boolean, nullable=False, server_default="true"),
+    UniqueConstraint(
+        "topic_id", "kind", "value", name="uq_topic_signals_topic_kind_value"
+    ),
+)
+
+topic_prototypes = Table(
+    "topic_prototypes",
+    metadata,
+    Column(
+        "topic_id",
+        BigInteger,
+        ForeignKey("topics.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("model", Text, nullable=False),
+    Column("dim", Integer, nullable=False),
+    # Hash of the active exemplar set this vector was built from. A prototype
+    # is only valid when this matches the topic's current exemplars; a
+    # mismatch means `taxonomy-rebuild` has not caught up with the last edit.
+    Column("definition_hash", LargeBinary, nullable=False),
+    Column("embedding", Vector(384), nullable=False),
+    Column(
+        "generated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+)
+
+taxonomies = Table(
+    "taxonomies",
+    metadata,
+    Column("id", BigInteger, Identity(), primary_key=True),
+    Column("slug", Text, nullable=False),
+    Column("display_name", Text, nullable=False),
+    Column("revision", Integer, nullable=False, server_default="1"),
+    Column("active", Boolean, nullable=False, server_default="true"),
+    UniqueConstraint("slug", name="uq_taxonomies_slug"),
+)
+
+taxonomy_nodes = Table(
+    "taxonomy_nodes",
+    metadata,
+    Column("id", BigInteger, Identity(), primary_key=True),
+    Column(
+        "taxonomy_id",
+        BigInteger,
+        ForeignKey("taxonomies.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "parent_id",
+        BigInteger,
+        ForeignKey("taxonomy_nodes.id", name="fk_taxonomy_nodes_parent_id_taxonomy_nodes"),
+    ),
+    Column("slug", Text, nullable=False),
+    Column("display_name", Text, nullable=False),
+    Column("sort_order", Integer, nullable=False, server_default="0"),
+    UniqueConstraint(
+        "taxonomy_id",
+        "parent_id",
+        "slug",
+        name="uq_taxonomy_nodes_taxonomy_parent_slug",
+    ),
+)
+# UniqueConstraint above cannot enforce root-level sibling uniqueness because
+# Postgres treats NULL parent_id values as distinct from one another.
+Index(
+    "uq_taxonomy_nodes_root_slug",
+    taxonomy_nodes.c.taxonomy_id,
+    taxonomy_nodes.c.slug,
+    unique=True,
+    postgresql_where=taxonomy_nodes.c.parent_id.is_(None),
+)
+
+taxonomy_node_topics = Table(
+    "taxonomy_node_topics",
+    metadata,
+    Column(
+        "node_id",
+        BigInteger,
+        ForeignKey("taxonomy_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "topic_id",
+        BigInteger,
+        ForeignKey("topics.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    PrimaryKeyConstraint("node_id", "topic_id"),
+)
