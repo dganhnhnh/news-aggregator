@@ -115,6 +115,10 @@ class Worker(ABC):
                 if shutdown.is_set():
                     logger.info("Shutdown requested; not starting another run")
                     return EXIT_OK
+                # Relative windows such as the default --last 3d describe
+                # every scheduled run, not only the instant when this process
+                # started. Explicit backfill bounds deliberately stay fixed.
+                window = window.refreshed()
 
     async def run_once(
         self,

@@ -198,22 +198,46 @@ def test_shutdown_between_chunks_keeps_the_first_checkpoint() -> None:
     assert ("finish", 1, "partial", "Stopped on a shutdown signal") in storage.calls
 
 
-def test_interval_loops_until_shutdown_is_requested() -> None:
+def test_interval_loops_with_a_refreshed_implicit_window_until_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     storage = FakeStorage()
+    initial_window = _window()
+    refreshed_window = RunWindow(
+        start=initial_window.start + timedelta(hours=1),
+        end=initial_window.end + timedelta(hours=1),
+        explicit=False,
+    )
+    monkeypatch.setattr(
+        RunWindow,
+        "refreshed",
+        lambda self: refreshed_window,
+    )
 
     class LoopingWorker(Worker):
         name = "crawl"
         runs = 0
+        windows: list[RunWindow] = []
 
         async def execute(self, ctx: RunContext) -> RunOutcome:
             self.runs += 1
+            self.windows.append(ctx.window)
             if self.runs == 2:
                 ctx.shutdown.set()
             return RunOutcome("succeeded", IngestRunStats())
 
-    exit_code = _run(LoopingWorker(), storage, _args(once=False, interval=1))
+    worker = LoopingWorker()
+    exit_code = asyncio.run(
+        worker.run(
+            storage,
+            _args(once=False, interval=1),
+            initial_window,
+            stale_after=STALE_AFTER,
+        )
+    )
 
     assert exit_code == EXIT_OK
+    assert worker.windows == [initial_window, refreshed_window]
     assert [call for call in storage.calls if call[0] == "start"] == [
         ("start", 1, "crawl", "scheduled"),
         ("start", 2, "crawl", "scheduled"),

@@ -78,6 +78,27 @@ def test_last_shifts_only_the_start() -> None:
     assert window.explicit is False
 
 
+def test_refresh_moves_an_implicit_window_without_changing_its_duration() -> None:
+    window = build_window(last="12h", now=NOW)
+    later = NOW + timedelta(hours=11)
+
+    refreshed = window.refreshed(now=later)
+
+    assert refreshed.start == later - timedelta(hours=12)
+    assert refreshed.end == later
+    assert refreshed.explicit is False
+
+
+def test_refresh_preserves_an_explicit_backfill_window() -> None:
+    window = build_window(
+        since="2026-08-01",
+        until="2026-08-10",
+        now=NOW,
+    )
+
+    assert window.refreshed(now=NOW + timedelta(days=30)) is window
+
+
 def test_since_without_until_runs_up_to_now() -> None:
     window = build_window(since="2026-08-16", now=NOW)
 

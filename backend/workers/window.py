@@ -43,6 +43,17 @@ class RunWindow:
             moment = moment.replace(tzinfo=timezone.utc)
         return self.start <= moment <= self.end
 
+    def refreshed(self, *, now: datetime | None = None) -> RunWindow:
+        """Move an implicit relative window to now; preserve explicit bounds."""
+        if self.explicit:
+            return self
+        end = now or datetime.now(timezone.utc)
+        return RunWindow(
+            start=end - (self.end - self.start),
+            end=end,
+            explicit=False,
+        )
+
 
 def parse_duration(value: str) -> timedelta:
     """Parse a relative duration such as `30m`, `12h`, `3d` or `2w`."""
