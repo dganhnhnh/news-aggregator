@@ -9,6 +9,33 @@ export type SourceRef = {
   name: string
 }
 
+export type TopicRef = {
+  id: number
+  slug: string
+  name: string
+}
+
+export type Topic = TopicRef & {
+  description: string | null
+}
+
+export type TaxonomyNode = {
+  slug: string
+  name: string
+  topic_slugs: string[]
+  children: TaxonomyNode[]
+}
+
+export type TopicCatalog = {
+  taxonomy: {
+    slug: string
+    name: string
+    revision: number
+  }
+  topics: Topic[]
+  nodes: TaxonomyNode[]
+}
+
 export type ArticleSummary = {
   id: number
   url: string
@@ -18,6 +45,7 @@ export type ArticleSummary = {
   published_at: string | null
   crawled_at: string
   event_at: string
+  topics: TopicRef[]
 }
 
 export type ArticleDetail = {
@@ -30,6 +58,7 @@ export type ArticleDetail = {
   published_at: string | null
   crawled_at: string
   event_at: string
+  topics: TopicRef[]
 }
 
 export type ArticlePage = {
@@ -49,6 +78,7 @@ export type StorySummary = {
   article_count: number
   source_count: number
   sources: SourceRef[]
+  topics: TopicRef[]
 }
 
 export type StoryMember = {
@@ -67,6 +97,7 @@ export type StoryDetail = {
   last_seen_at: string
   article_count: number
   source_count: number
+  topics: TopicRef[]
   members: StoryMember[]
 }
 

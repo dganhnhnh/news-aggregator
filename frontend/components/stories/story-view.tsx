@@ -19,6 +19,7 @@ export function StoryView() {
 
   const [range, setRange] = useState<TimeRangeValue>('all')
   const [selectedSources, setSelectedSources] = useState<string[]>([])
+  const selectedTopics = searchParams.getAll('topic')
   const [minSources, setMinSources] = useState(2)
   const [minArticles, setMinArticles] = useState(2)
 
@@ -27,9 +28,17 @@ export function StoryView() {
   const { stories, isLoading, isLoadingMore, hasMore, error, loadMore, mutate } = useStories({
     since,
     sources: selectedSources,
+    topics: selectedTopics,
     minSources,
     minArticles,
   })
+
+  function changeSelectedTopics(topics: string[]) {
+    const sp = new URLSearchParams(searchParams.toString())
+    sp.delete('topic')
+    for (const topic of topics) sp.append('topic', topic)
+    router.replace(`?${sp.toString()}`, { scroll: false })
+  }
 
   function selectStory(id: number) {
     const sp = new URLSearchParams(searchParams.toString())
@@ -58,6 +67,8 @@ export function StoryView() {
         since={since}
         selectedSources={selectedSources}
         onSelectedSourcesChange={setSelectedSources}
+        selectedTopics={selectedTopics}
+        onSelectedTopicsChange={changeSelectedTopics}
         minSources={minSources}
         onMinSourcesChange={setMinSources}
         minArticles={minArticles}

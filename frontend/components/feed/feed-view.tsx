@@ -20,6 +20,7 @@ export function FeedView({
   const [q, setQ] = useState('')
   const [range, setRange] = useState<TimeRangeValue>('all')
   const [selectedSources, setSelectedSources] = useState<string[]>([])
+  const selectedTopics = searchParams.getAll('topic')
 
   const since = useMemo(() => sinceFromRange(range), [range])
   const base = lockedSource
@@ -31,8 +32,16 @@ export function FeedView({
     base,
     since,
     sources,
+    topics: selectedTopics,
     q: q || undefined,
   })
+
+  function changeSelectedTopics(topics: string[]) {
+    const sp = new URLSearchParams(searchParams.toString())
+    sp.delete('topic')
+    for (const topic of topics) sp.append('topic', topic)
+    router.replace(`?${sp.toString()}`, { scroll: false })
+  }
 
   function selectArticle(id: number) {
     const sp = new URLSearchParams(searchParams.toString())
@@ -50,6 +59,8 @@ export function FeedView({
         since={since}
         selectedSources={selectedSources}
         onSelectedSourcesChange={setSelectedSources}
+        selectedTopics={selectedTopics}
+        onSelectedTopicsChange={changeSelectedTopics}
         lockedSourceName={lockedSource?.name}
         resultLabel={
           isLoading ? undefined : `${articles.length} article${articles.length === 1 ? '' : 's'}`

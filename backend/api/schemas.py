@@ -7,7 +7,7 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
-from models.storage_models import ArticleFeedItem, StoryFeedItem
+from models.storage_models import ArticleFeedItem, StoryFeedItem, TopicRefItem
 
 T = TypeVar("T")
 
@@ -15,6 +15,16 @@ T = TypeVar("T")
 class SourceRef(BaseModel):
     slug: str
     name: str
+
+
+class TopicRef(BaseModel):
+    id: int
+    slug: str
+    name: str
+
+    @classmethod
+    def from_storage(cls, item: TopicRefItem) -> "TopicRef":
+        return cls(id=item.id, slug=item.slug, name=item.display_name)
 
 
 class ArticleSummary(BaseModel):
@@ -26,6 +36,7 @@ class ArticleSummary(BaseModel):
     published_at: datetime | None
     crawled_at: datetime
     event_at: datetime
+    topics: list[TopicRef]
 
     @classmethod
     def from_feed_item(cls, item: ArticleFeedItem) -> "ArticleSummary":
@@ -43,6 +54,7 @@ class ArticleSummary(BaseModel):
             published_at=item.published_at,
             crawled_at=item.crawled_at,
             event_at=item.event_at,
+            topics=[TopicRef.from_storage(topic) for topic in item.topics],
         )
 
 
@@ -56,6 +68,7 @@ class ArticleDetail(BaseModel):
     published_at: datetime | None
     crawled_at: datetime
     event_at: datetime
+    topics: list[TopicRef]
 
 
 class StorySummary(BaseModel):
@@ -66,6 +79,7 @@ class StorySummary(BaseModel):
     article_count: int
     source_count: int
     sources: list[SourceRef]
+    topics: list[TopicRef]
 
     @classmethod
     def from_feed_item(cls, item: StoryFeedItem) -> "StorySummary":
@@ -77,6 +91,7 @@ class StorySummary(BaseModel):
             article_count=item.article_count,
             source_count=item.source_count,
             sources=[SourceRef(slug=s.slug, name=s.name) for s in item.sources],
+            topics=[TopicRef.from_storage(topic) for topic in item.topics],
         )
 
 
@@ -96,7 +111,31 @@ class StoryDetail(BaseModel):
     last_seen_at: datetime
     article_count: int
     source_count: int
+    topics: list[TopicRef]
     members: list[StoryMember]
+
+
+class TopicItem(TopicRef):
+    description: str | None
+
+
+class TaxonomyNode(BaseModel):
+    slug: str
+    name: str
+    topic_slugs: list[str]
+    children: list["TaxonomyNode"]
+
+
+class TaxonomyInfo(BaseModel):
+    slug: str
+    name: str
+    revision: int
+
+
+class TopicCatalog(BaseModel):
+    taxonomy: TaxonomyInfo
+    topics: list[TopicItem]
+    nodes: list[TaxonomyNode]
 
 
 class SourceItem(BaseModel):

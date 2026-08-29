@@ -75,11 +75,14 @@ from models.storage_models import (
     StoryFeedItem,
     StoryMember,
     StorySourceRef,
+    TaxonomyCatalogItem,
     TaxonomyImportSummary,
     TaxonomySnapshot,
+    TopicCatalogItem,
     TopicExemplarSet,
     TopicImportOutcome,
     TopicPrototypeRecord,
+    TopicRefItem,
     TopicSignalSnapshot,
     TopicSnapshot,
     WorkerTrigger,
@@ -1439,6 +1442,7 @@ class PostgresRawStorage:
         until: datetime,
         cursor: tuple[datetime, int] | None,
         query: str | None,
+        topic_slugs: Sequence[str] | None = None,
     ) -> list[Any]:
         filters = [
             raw_articles.c.event_at >= since,
@@ -1454,7 +1458,77 @@ class PostgresRawStorage:
                     func.websearch_to_tsquery("english", query)
                 )
             )
+        if topic_slugs:
+            filters.append(
+                select(1)
+                .select_from(
+                    article_topics.join(topics, article_topics.c.topic_id == topics.c.id)
+                )
+                .where(
+                    article_topics.c.article_id == raw_articles.c.id,
+                    article_topics.c.assigned.is_(True),
+                    topics.c.active.is_(True),
+                    topics.c.slug.in_(topic_slugs),
+                )
+                .exists()
+            )
         return filters
+
+    @staticmethod
+    async def _assigned_article_topics(
+        connection: AsyncConnection, article_ids: Sequence[int]
+    ) -> dict[int, tuple[TopicRefItem, ...]]:
+        if not article_ids:
+            return {}
+        rows = await connection.execute(
+            select(
+                article_topics.c.article_id,
+                topics.c.id,
+                topics.c.slug,
+                topics.c.display_name,
+            )
+            .select_from(article_topics.join(topics, article_topics.c.topic_id == topics.c.id))
+            .where(
+                article_topics.c.article_id.in_(article_ids),
+                article_topics.c.assigned.is_(True),
+                topics.c.active.is_(True),
+            )
+            .order_by(article_topics.c.article_id, article_topics.c.score.desc(), topics.c.slug)
+        )
+        grouped: dict[int, list[TopicRefItem]] = defaultdict(list)
+        for row in rows:
+            grouped[int(row.article_id)].append(
+                TopicRefItem(id=int(row.id), slug=row.slug, display_name=row.display_name)
+            )
+        return {article_id: tuple(items) for article_id, items in grouped.items()}
+
+    @staticmethod
+    async def _assigned_cluster_topics(
+        connection: AsyncConnection, cluster_ids: Sequence[int]
+    ) -> dict[int, tuple[TopicRefItem, ...]]:
+        if not cluster_ids:
+            return {}
+        rows = await connection.execute(
+            select(
+                cluster_topics.c.cluster_id,
+                topics.c.id,
+                topics.c.slug,
+                topics.c.display_name,
+            )
+            .select_from(cluster_topics.join(topics, cluster_topics.c.topic_id == topics.c.id))
+            .where(
+                cluster_topics.c.cluster_id.in_(cluster_ids),
+                cluster_topics.c.assigned.is_(True),
+                topics.c.active.is_(True),
+            )
+            .order_by(cluster_topics.c.cluster_id, cluster_topics.c.score.desc(), topics.c.slug)
+        )
+        grouped: dict[int, list[TopicRefItem]] = defaultdict(list)
+        for row in rows:
+            grouped[int(row.cluster_id)].append(
+                TopicRefItem(id=int(row.id), slug=row.slug, display_name=row.display_name)
+            )
+        return {cluster_id: tuple(items) for cluster_id, items in grouped.items()}
 
     async def feed_articles(
         self,
@@ -1464,6 +1538,7 @@ class PostgresRawStorage:
         limit: int,
         cursor: tuple[datetime, int] | None = None,
         source_slugs: Sequence[str] | None = None,
+        topic_slugs: Sequence[str] | None = None,
         query: str | None = None,
         max_per_source: int = 3,
     ) -> list[ArticleFeedItem]:
@@ -1478,7 +1553,15 @@ class PostgresRawStorage:
                 raw_articles.c.event_at,
             )
             .where(raw_articles.c.source_id == sources.c.id)
-            .where(*self._feed_filters(since=since, until=until, cursor=cursor, query=query))
+            .where(
+                *self._feed_filters(
+                    since=since,
+                    until=until,
+                    cursor=cursor,
+                    query=query,
+                    topic_slugs=topic_slugs,
+                )
+            )
             .order_by(raw_articles.c.event_at.desc(), raw_articles.c.id.desc())
             .limit(max_per_source)
             .lateral("a")
@@ -1502,7 +1585,10 @@ class PostgresRawStorage:
         stmt = stmt.order_by(inner.c.event_at.desc(), inner.c.id.desc()).limit(limit)
 
         async with self._engine.connect() as connection:
-            result = await connection.execute(stmt)
+            rows = (await connection.execute(stmt)).all()
+            topics_by_article = await self._assigned_article_topics(
+                connection, [row.id for row in rows]
+            )
             return [
                 ArticleFeedItem(
                     id=row.id,
@@ -1514,8 +1600,9 @@ class PostgresRawStorage:
                     published_at=row.published_at,
                     crawled_at=row.crawled_at,
                     event_at=row.event_at,
+                    topics=topics_by_article.get(int(row.id), ()),
                 )
-                for row in result
+                for row in rows
             ]
 
     async def source_articles(
@@ -1526,6 +1613,7 @@ class PostgresRawStorage:
         until: datetime,
         limit: int,
         cursor: tuple[datetime, int] | None = None,
+        topic_slugs: Sequence[str] | None = None,
         query: str | None = None,
     ) -> list[ArticleFeedItem] | None:
         async with self._engine.connect() as connection:
@@ -1550,11 +1638,22 @@ class PostgresRawStorage:
                     raw_articles.c.event_at,
                 )
                 .where(raw_articles.c.source_id == source_row.id)
-                .where(*self._feed_filters(since=since, until=until, cursor=cursor, query=query))
+                .where(
+                    *self._feed_filters(
+                        since=since,
+                        until=until,
+                        cursor=cursor,
+                        query=query,
+                        topic_slugs=topic_slugs,
+                    )
+                )
                 .order_by(raw_articles.c.event_at.desc(), raw_articles.c.id.desc())
                 .limit(limit)
             )
-            result = await connection.execute(stmt)
+            rows = (await connection.execute(stmt)).all()
+            topics_by_article = await self._assigned_article_topics(
+                connection, [row.id for row in rows]
+            )
             return [
                 ArticleFeedItem(
                     id=row.id,
@@ -1566,8 +1665,9 @@ class PostgresRawStorage:
                     published_at=row.published_at,
                     crawled_at=row.crawled_at,
                     event_at=row.event_at,
+                    topics=topics_by_article.get(int(row.id), ()),
                 )
-                for row in result
+                for row in rows
             ]
 
     async def list_sources(
@@ -1593,6 +1693,94 @@ class PostgresRawStorage:
             result = await connection.execute(stmt)
             return [SourceItem(**dict(row._mapping)) for row in result]
 
+    async def get_taxonomy_catalog(
+        self, slug: str = "default"
+    ) -> TaxonomyCatalogItem | None:
+        """Return one active navigation tree plus its active topic registry.
+
+        This is deliberately narrower than ``export_taxonomy``: the public API
+        never needs classifier signals, thresholds, prototypes or inactive
+        definitions.
+        """
+        async with self._engine.connect() as connection:
+            taxonomy_row = (
+                await connection.execute(
+                    select(taxonomies).where(
+                        taxonomies.c.slug == slug, taxonomies.c.active.is_(True)
+                    )
+                )
+            ).first()
+            if taxonomy_row is None:
+                return None
+
+            topic_rows = (
+                await connection.execute(
+                    select(
+                        topics.c.id,
+                        topics.c.slug,
+                        topics.c.display_name,
+                        topics.c.description,
+                    )
+                    .where(topics.c.active.is_(True))
+                    .order_by(topics.c.display_name, topics.c.slug)
+                )
+            ).all()
+            active_slugs = {row.slug for row in topic_rows}
+
+            node_rows = (
+                await connection.execute(
+                    select(taxonomy_nodes)
+                    .where(taxonomy_nodes.c.taxonomy_id == taxonomy_row.id)
+                    .order_by(taxonomy_nodes.c.sort_order, taxonomy_nodes.c.slug)
+                )
+            ).all()
+            node_ids = [int(row.id) for row in node_rows]
+            links_by_node: dict[int, list[str]] = defaultdict(list)
+            if node_ids:
+                link_rows = await connection.execute(
+                    select(taxonomy_node_topics.c.node_id, topics.c.slug)
+                    .select_from(
+                        taxonomy_node_topics.join(
+                            topics, taxonomy_node_topics.c.topic_id == topics.c.id
+                        )
+                    )
+                    .where(
+                        taxonomy_node_topics.c.node_id.in_(node_ids),
+                        topics.c.active.is_(True),
+                    )
+                    .order_by(taxonomy_node_topics.c.node_id, topics.c.slug)
+                )
+                for row in link_rows:
+                    if row.slug in active_slugs:
+                        links_by_node[int(row.node_id)].append(row.slug)
+
+            flat_nodes = [
+                FlatTaxonomyNode(
+                    id=int(row.id),
+                    parent_id=int(row.parent_id) if row.parent_id is not None else None,
+                    slug=row.slug,
+                    display_name=row.display_name,
+                    sort_order=int(row.sort_order),
+                    topic_slugs=tuple(links_by_node.get(int(row.id), [])),
+                )
+                for row in node_rows
+            ]
+            return TaxonomyCatalogItem(
+                slug=taxonomy_row.slug,
+                display_name=taxonomy_row.display_name,
+                revision=int(taxonomy_row.revision),
+                topics=tuple(
+                    TopicCatalogItem(
+                        id=int(row.id),
+                        slug=row.slug,
+                        display_name=row.display_name,
+                        description=row.description,
+                    )
+                    for row in topic_rows
+                ),
+                nodes=tuple(build_node_tree(flat_nodes)),
+            )
+
     async def get_article(self, article_id: int) -> ArticleDetailItem | None:
         async with self._engine.connect() as connection:
             result = await connection.execute(
@@ -1613,7 +1801,12 @@ class PostgresRawStorage:
                 .where(raw_articles.c.id == article_id)
             )
             row = result.first()
-            return ArticleDetailItem(**dict(row._mapping)) if row is not None else None
+            if row is None:
+                return None
+            topics_by_article = await self._assigned_article_topics(connection, [article_id])
+            return ArticleDetailItem(
+                **dict(row._mapping), topics=topics_by_article.get(article_id, ())
+            )
 
     @staticmethod
     async def _top_story_sources(
@@ -1670,6 +1863,7 @@ class PostgresRawStorage:
         limit: int,
         cursor: tuple[datetime, int] | None = None,
         source_slugs: Sequence[str] | None = None,
+        topic_slugs: Sequence[str] | None = None,
         min_sources: int = 1,
         min_articles: int = 1,
     ) -> list[StoryFeedItem]:
@@ -1703,6 +1897,20 @@ class PostgresRawStorage:
                 )
                 .exists()
             )
+        if topic_slugs:
+            filters.append(
+                select(1)
+                .select_from(
+                    cluster_topics.join(topics, cluster_topics.c.topic_id == topics.c.id)
+                )
+                .where(
+                    cluster_topics.c.cluster_id == clusters.c.id,
+                    cluster_topics.c.assigned.is_(True),
+                    topics.c.active.is_(True),
+                    topics.c.slug.in_(topic_slugs),
+                )
+                .exists()
+            )
 
         stmt = (
             select(
@@ -1725,6 +1933,9 @@ class PostgresRawStorage:
             sources_by_cluster = await self._top_story_sources(
                 connection, [row.id for row in rows]
             )
+            topics_by_cluster = await self._assigned_cluster_topics(
+                connection, [row.id for row in rows]
+            )
             return [
                 StoryFeedItem(
                     id=row.id,
@@ -1734,6 +1945,7 @@ class PostgresRawStorage:
                     article_count=row.n_articles,
                     source_count=row.n_distinct_sources,
                     sources=sources_by_cluster.get(row.id, []),
+                    topics=topics_by_cluster.get(int(row.id), ()),
                 )
                 for row in rows
             ]
@@ -1778,6 +1990,7 @@ class PostgresRawStorage:
                 .where(cluster_members.c.cluster_id == row.id)
                 .order_by(raw_articles.c.event_at.desc(), raw_articles.c.id.desc())
             )
+            topics_by_cluster = await self._assigned_cluster_topics(connection, [int(row.id)])
             return StoryDetailItem(
                 id=int(row.id),
                 headline=row.headline,
@@ -1785,6 +1998,7 @@ class PostgresRawStorage:
                 last_seen_at=row.last_seen_at,
                 article_count=row.n_articles,
                 source_count=row.n_distinct_sources,
+                topics=topics_by_cluster.get(int(row.id), ()),
                 members=[
                     StoryMember(
                         article_id=member.id,

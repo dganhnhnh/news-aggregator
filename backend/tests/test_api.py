@@ -17,12 +17,17 @@ from models.storage_models import (
     StoryFeedItem,
     StoryMember,
     StorySourceRef,
+    TaxonomyCatalogItem,
+    TaxonomyNodeSnapshot,
+    TopicCatalogItem,
+    TopicRefItem,
 )
 
 
 class FakeStorage:
     def __init__(self) -> None:
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        topic = TopicRefItem(id=7, slug="artificial-intelligence", display_name="AI")
         self._feed_items = [
             ArticleFeedItem(
                 id=1,
@@ -34,6 +39,7 @@ class FakeStorage:
                 published_at=now,
                 crawled_at=now,
                 event_at=now,
+                topics=(topic,),
             )
         ]
         self._detail = ArticleDetailItem(
@@ -46,6 +52,7 @@ class FakeStorage:
             published_at=now,
             crawled_at=now,
             event_at=now,
+            topics=(topic,),
         )
         self._sources = [SourceItem(slug="example.com", name="Example", homepage=None)]
         self.listed_sources_since = None
@@ -59,6 +66,7 @@ class FakeStorage:
                 article_count=2,
                 source_count=1,
                 sources=[StorySourceRef(slug="example.com", name="Example")],
+                topics=(topic,),
             )
         ]
         self._story_detail = StoryDetailItem(
@@ -68,6 +76,7 @@ class FakeStorage:
             last_seen_at=now,
             article_count=2,
             source_count=1,
+            topics=(topic,),
             members=[
                 StoryMember(
                     article_id=1,
@@ -81,13 +90,49 @@ class FakeStorage:
             ],
         )
         self.list_stories_source_slugs = None
+        self.list_stories_topic_slugs = None
+        self.feed_article_topic_slugs = None
+        self._topic_catalog = TaxonomyCatalogItem(
+            slug="default",
+            display_name="Default",
+            revision=2,
+            topics=(
+                TopicCatalogItem(
+                    id=7,
+                    slug="artificial-intelligence",
+                    display_name="AI",
+                    description="Models and tools",
+                ),
+            ),
+            nodes=(
+                TaxonomyNodeSnapshot(
+                    slug="technology",
+                    display_name="Technology",
+                    sort_order=0,
+                    topic_slugs=["artificial-intelligence"],
+                    children=[],
+                ),
+            ),
+        )
 
     async def feed_articles(
-        self, *, since, until, limit, cursor=None, source_slugs=None, query=None, max_per_source=3
+        self,
+        *,
+        since,
+        until,
+        limit,
+        cursor=None,
+        source_slugs=None,
+        topic_slugs=None,
+        query=None,
+        max_per_source=3,
     ):
+        self.feed_article_topic_slugs = topic_slugs
         return self._feed_items[:limit]
 
-    async def source_articles(self, slug, *, since, until, limit, cursor=None, query=None):
+    async def source_articles(
+        self, slug, *, since, until, limit, cursor=None, topic_slugs=None, query=None
+    ):
         if slug != "example.com":
             return None
         return self._feed_items[:limit]
@@ -108,14 +153,19 @@ class FakeStorage:
         limit,
         cursor=None,
         source_slugs=None,
+        topic_slugs=None,
         min_sources=1,
         min_articles=1,
     ):
         self.list_stories_source_slugs = source_slugs
+        self.list_stories_topic_slugs = topic_slugs
         return self._story_items[:limit]
 
     async def get_story(self, story_id):
         return self._story_detail if story_id == 10 else None
+
+    async def get_taxonomy_catalog(self, slug="default"):
+        return self._topic_catalog if slug == "default" else None
 
 
 def _client() -> TestClient:
@@ -148,6 +198,7 @@ def test_list_articles() -> None:
             "published_at": "2026-01-01T00:00:00Z",
             "crawled_at": "2026-01-01T00:00:00Z",
             "event_at": "2026-01-01T00:00:00Z",
+            "topics": [{"id": 7, "slug": "artificial-intelligence", "name": "AI"}],
         }
     ]
 
@@ -163,6 +214,21 @@ def test_get_article_found() -> None:
     response = client.get("/api/articles/1")
     assert response.status_code == 200
     assert response.json()["content"] == "full markdown body"
+    assert response.json()["topics"] == [
+        {"id": 7, "slug": "artificial-intelligence", "name": "AI"}
+    ]
+
+
+def test_list_articles_passes_topic_filter() -> None:
+    app = create_app()
+    storage = FakeStorage()
+    app.dependency_overrides[get_storage] = lambda: storage
+    client = TestClient(app)
+
+    response = client.get("/api/articles?topic=artificial-intelligence&topic=open-source")
+
+    assert response.status_code == 200
+    assert storage.feed_article_topic_slugs == ["artificial-intelligence", "open-source"]
 
 
 def test_get_article_not_found() -> None:
@@ -214,6 +280,7 @@ def test_list_stories() -> None:
             "article_count": 2,
             "source_count": 1,
             "sources": [{"slug": "example.com", "name": "Example"}],
+            "topics": [{"id": 7, "slug": "artificial-intelligence", "name": "AI"}],
         }
     ]
 
@@ -230,6 +297,18 @@ def test_list_stories_passes_source_filter() -> None:
     assert storage.list_stories_source_slugs == ["example.com", "other.com"]
 
 
+def test_list_stories_passes_topic_filter() -> None:
+    app = create_app()
+    storage = FakeStorage()
+    app.dependency_overrides[get_storage] = lambda: storage
+    client = TestClient(app)
+
+    response = client.get("/api/stories?topic=artificial-intelligence&topic=open-source")
+
+    assert response.status_code == 200
+    assert storage.list_stories_topic_slugs == ["artificial-intelligence", "open-source"]
+
+
 def test_list_stories_invalid_cursor_is_400() -> None:
     client = _client()
     response = client.get("/api/stories?cursor=not-a-valid-cursor!!!")
@@ -242,6 +321,9 @@ def test_get_story_found() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["headline"] == "Story A"
+    assert body["topics"] == [
+        {"id": 7, "slug": "artificial-intelligence", "name": "AI"}
+    ]
     assert body["members"] == [
         {
             "article_id": 1,
@@ -257,6 +339,38 @@ def test_get_story_found() -> None:
 def test_get_story_not_found() -> None:
     client = _client()
     response = client.get("/api/stories/999")
+    assert response.status_code == 404
+
+
+def test_get_topics_returns_catalog_and_tree() -> None:
+    client = _client()
+    response = client.get("/api/topics?taxonomy=default")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "taxonomy": {"slug": "default", "name": "Default", "revision": 2},
+        "topics": [
+            {
+                "id": 7,
+                "slug": "artificial-intelligence",
+                "name": "AI",
+                "description": "Models and tools",
+            }
+        ],
+        "nodes": [
+            {
+                "slug": "technology",
+                "name": "Technology",
+                "topic_slugs": ["artificial-intelligence"],
+                "children": [],
+            }
+        ],
+    }
+
+
+def test_get_topics_unknown_taxonomy_is_404() -> None:
+    client = _client()
+    response = client.get("/api/topics?taxonomy=missing")
     assert response.status_code == 404
 
 

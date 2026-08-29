@@ -38,6 +38,7 @@ async def source_articles(
     until: datetime | None = None,
     limit: int = Query(20, ge=1, le=100),
     cursor: str | None = None,
+    topic: list[str] | None = Query(None),
     q: str | None = None,
     storage: PostgresRawStorage = Depends(get_storage),
     settings: Settings = Depends(get_settings),
@@ -52,6 +53,7 @@ async def source_articles(
         until=window_until,
         limit=limit,
         cursor=decoded_cursor,
+        topic_slugs=topic,
         query=q,
     )
     if items is None:

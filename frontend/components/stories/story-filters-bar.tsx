@@ -30,6 +30,7 @@ import { useMinuteNow } from '@/hooks/use-minute-now'
 import { useSources } from '@/hooks/use-sources'
 import { sinceFromRange, TIME_RANGE_OPTIONS, type TimeRangeValue } from '@/lib/time'
 import { cn } from '@/lib/utils'
+import { TopicFilter } from '@/components/topics/topic-filter'
 
 type StoryFiltersBarProps = {
   range: TimeRangeValue
@@ -37,6 +38,8 @@ type StoryFiltersBarProps = {
   since: string
   selectedSources: string[]
   onSelectedSourcesChange: (sources: string[]) => void
+  selectedTopics: string[]
+  onSelectedTopicsChange: (topics: string[]) => void
   minSources: number
   onMinSourcesChange: (count: number) => void
   minArticles: number
@@ -50,6 +53,8 @@ export function StoryFiltersBar({
   since,
   selectedSources,
   onSelectedSourcesChange,
+  selectedTopics,
+  onSelectedTopicsChange,
   minSources,
   onMinSourcesChange,
   minArticles,
@@ -216,6 +221,11 @@ export function StoryFiltersBar({
             )}
           </PopoverContent>
         </Popover>
+
+        <TopicFilter
+          selectedTopics={selectedTopics}
+          onSelectedTopicsChange={onSelectedTopicsChange}
+        />
       </div>
       {resultLabel && <p className="text-xs text-muted-foreground">{resultLabel}</p>}
     </div>

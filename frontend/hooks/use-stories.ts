@@ -8,13 +8,14 @@ export type UseStoriesOptions = {
   since?: string
   until?: string
   sources?: string[]
+  topics?: string[]
   minSources?: number
   minArticles?: number
   limit?: number
 }
 
 export function useStories(options: UseStoriesOptions) {
-  const { since, until, sources, minSources, minArticles, limit = 25 } = options
+  const { since, until, sources, topics, minSources, minArticles, limit = 25 } = options
 
   const getKey = (pageIndex: number, previousPage: StoryPage | null) => {
     if (previousPage && previousPage.next_cursor === null) return null
@@ -24,6 +25,7 @@ export function useStories(options: UseStoriesOptions) {
       since,
       until,
       sources,
+      topics,
       minSources,
       minArticles,
       limit,

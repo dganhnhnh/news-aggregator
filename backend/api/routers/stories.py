@@ -1,5 +1,4 @@
-"""Read-only endpoints over `clusters` ("stories"); topics are out of scope
-until classify/taxonomy exist."""
+"""Read-only endpoints over canonical story clusters and their topic labels."""
 
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ from api.schemas import (
     StoryDetail,
     StoryMember,
     StorySummary,
+    TopicRef,
 )
 from core.config import Settings
 
@@ -31,6 +31,7 @@ async def list_stories(
     limit: int = Query(20, ge=1, le=100),
     cursor: str | None = None,
     source: list[str] | None = Query(None),
+    topic: list[str] | None = Query(None),
     min_sources: int = Query(1, ge=1, le=100),
     min_articles: int = Query(1, ge=1, le=100),
     storage: PostgresRawStorage = Depends(get_storage),
@@ -46,6 +47,7 @@ async def list_stories(
         limit=limit,
         cursor=decoded_cursor,
         source_slugs=source,
+        topic_slugs=topic,
         min_sources=min_sources,
         min_articles=min_articles,
     )
@@ -74,6 +76,7 @@ async def get_story(
         last_seen_at=story.last_seen_at,
         article_count=story.article_count,
         source_count=story.source_count,
+        topics=[TopicRef.from_storage(topic) for topic in story.topics],
         members=[
             StoryMember(
                 article_id=member.article_id,

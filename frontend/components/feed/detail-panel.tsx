@@ -17,6 +17,7 @@ import { MarkdownContent } from './markdown-content'
 import { useArticle } from '@/hooks/use-article'
 import { ApiError } from '@/lib/client-api'
 import { formatAbsolute, relativeTime } from '@/lib/time'
+import { TopicBadgeGroup } from '@/components/topics/topic-badge'
 
 export function DetailPanel({ articleId }: { articleId: number | null }) {
   const { article, isLoading, error, retry } = useArticle(articleId)
@@ -118,6 +119,8 @@ export function DetailPanel({ articleId }: { articleId: number | null }) {
         <h1 className="mt-4 text-balance text-2xl font-semibold leading-tight tracking-tight">
           {article.title ?? article.url}
         </h1>
+
+        <TopicBadgeGroup topics={article.topics} className="mt-3" />
 
         <div className="mt-6">
           <MarkdownContent content={article.content} />

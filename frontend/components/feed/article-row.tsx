@@ -4,6 +4,7 @@ import { ExternalLink } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { relativeTime } from '@/lib/time'
 import type { ArticleSummary } from '@/lib/types'
+import { TopicBadgeGroup } from '@/components/topics/topic-badge'
 
 function initialsFor(name: string) {
   return name.slice(0, 1).toUpperCase()
@@ -64,6 +65,8 @@ export function ArticleRow({
           </span>
         )}
       </h3>
+
+      <TopicBadgeGroup topics={article.topics} maxVisible={2} />
 
       <p className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
         {article.excerpt}

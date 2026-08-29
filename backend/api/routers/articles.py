@@ -9,7 +9,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from adapters.storage import PostgresRawStorage
 from api.cursor import decode_cursor, encode_cursor
 from api.deps import get_settings, get_storage
-from api.schemas import ArticleDetail, ArticleSummary, CursorPage, FeedWindow, SourceRef
+from api.schemas import (
+    ArticleDetail,
+    ArticleSummary,
+    CursorPage,
+    FeedWindow,
+    SourceRef,
+    TopicRef,
+)
 from core.config import Settings
 
 
@@ -23,6 +30,7 @@ async def list_articles(
     limit: int = Query(20, ge=1, le=100),
     cursor: str | None = None,
     source: list[str] | None = Query(None),
+    topic: list[str] | None = Query(None),
     q: str | None = None,
     max_per_source: int = Query(3, ge=1, le=20),
     storage: PostgresRawStorage = Depends(get_storage),
@@ -38,6 +46,7 @@ async def list_articles(
         limit=limit,
         cursor=decoded_cursor,
         source_slugs=source,
+        topic_slugs=topic,
         query=q,
         max_per_source=max_per_source,
     )
@@ -74,4 +83,5 @@ async def get_article(
         published_at=article.published_at,
         crawled_at=article.crawled_at,
         event_at=article.event_at,
+        topics=[TopicRef.from_storage(topic) for topic in article.topics],
     )

@@ -96,6 +96,13 @@ class FeedFailureOutcome:
 
 
 @dataclass(frozen=True)
+class TopicRefItem:
+    id: int
+    slug: str
+    display_name: str
+
+
+@dataclass(frozen=True)
 class ArticleFeedItem:
     id: int
     url: str
@@ -106,6 +113,7 @@ class ArticleFeedItem:
     published_at: datetime | None
     crawled_at: datetime
     event_at: datetime
+    topics: tuple[TopicRefItem, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -119,6 +127,7 @@ class ArticleDetailItem:
     published_at: datetime | None
     crawled_at: datetime
     event_at: datetime
+    topics: tuple[TopicRefItem, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -136,6 +145,7 @@ class StoryFeedItem:
     article_count: int
     source_count: int
     sources: list[StorySourceRef]
+    topics: tuple[TopicRefItem, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,6 +168,7 @@ class StoryDetailItem:
     article_count: int
     source_count: int
     members: list[StoryMember]
+    topics: tuple[TopicRefItem, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -401,6 +412,23 @@ class TaxonomySnapshot:
     revision: int
     active: bool
     nodes: list[TaxonomyNodeSnapshot]
+
+
+@dataclass(frozen=True)
+class TopicCatalogItem:
+    id: int
+    slug: str
+    display_name: str
+    description: str | None
+
+
+@dataclass(frozen=True)
+class TaxonomyCatalogItem:
+    slug: str
+    display_name: str
+    revision: int
+    topics: tuple[TopicCatalogItem, ...]
+    nodes: tuple[TaxonomyNodeSnapshot, ...]
 
 
 @dataclass(frozen=True)

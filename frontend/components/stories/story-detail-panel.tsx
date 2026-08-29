@@ -18,6 +18,7 @@ import { useArticle } from '@/hooks/use-article'
 import { ApiError } from '@/lib/client-api'
 import { formatAbsolute, relativeTime } from '@/lib/time'
 import { MarkdownContent } from '@/components/feed/markdown-content'
+import { TopicBadgeGroup } from '@/components/topics/topic-badge'
 
 export function StoryDetailPanel({
   storyId,
@@ -93,6 +94,8 @@ export function StoryDetailPanel({
         <h1 className="mt-4 text-balance text-2xl font-semibold leading-tight tracking-tight">
           {story.headline ?? 'Untitled story'}
         </h1>
+
+        <TopicBadgeGroup topics={story.topics} className="mt-3" />
 
         <div className="mt-6 flex flex-col">
           {story.members.map((member) => (

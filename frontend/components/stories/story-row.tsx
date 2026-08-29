@@ -3,6 +3,7 @@
 import { cn } from '@/lib/utils'
 import { relativeTime } from '@/lib/time'
 import type { StorySummary } from '@/lib/types'
+import { TopicBadgeGroup } from '@/components/topics/topic-badge'
 
 function initialsFor(name: string) {
   return name.slice(0, 1).toUpperCase()
@@ -62,6 +63,8 @@ export function StoryRow({
       >
         {story.headline ?? 'Untitled story'}
       </h3>
+
+      <TopicBadgeGroup topics={story.topics} maxVisible={2} />
 
       <p className="text-xs leading-relaxed text-muted-foreground">
         {story.article_count} article{story.article_count === 1 ? '' : 's'} · {story.source_count}{' '}
