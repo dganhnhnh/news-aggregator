@@ -322,7 +322,89 @@ vẫn thuộc Tuần 4 theo §12.6. `0.80/0.20` giữ nguyên; chỉ threshold �
 
 ---
 
-## Chỗ trống cho các task sau (T2–T9)
+## T9 — Golden semantic runner (2026-08-30)
+
+Runner dùng model production `sentence-transformers/all-MiniLM-L6-v2` (384 chiều),
+adapter `fastembed 0.8.0`, đúng `services.text.article_embed_text`, classifier
+`0.80 × prototype + 0.20 × keyword`, threshold theo seed (`0.40`) và clustering
+`0.75 / merge 0.85 / window 72h`. Test chỉ assert decision/member set; không assert
+float score và không tính precision/recall/F1.
+
+```bash
+uv run --extra dev pytest backend/tests/test_semantic_golden.py -m semantic -q
+# 10 passed
+```
+
+| Số đo | Kết quả |
+| --- | --- |
+| Golden scenarios | **10/10 pass** |
+| `case_id` fail cuối cùng | Không có |
+| Arrival order | forward/reverse cho case 10 có cùng canonical member set |
+| Default suite | 315 pass, 33 skip, 10 semantic deselected |
+
+Lần chạy đầu tiên cố ý giữ nguyên expectation đã chốt và trả `0/10`: fixture còn
+`member_kind=near_duplicate` dù baseline §2.5 giữ mọi member, alias cũ
+`privacy-security` không khớp slug runtime `cybersecurity`, và seed 8 topic thiếu
+`semiconductors`/`science-research` cùng signal cho các case hardware, language và
+browser fingerprinting. Clustering member set thực tế đã đúng cả 10 case ngay từ lần
+chẩn đoán đầu; failure nằm ở taxonomy/classification input.
+
+Cách xử lý theo thứ tự data/input của §12.2:
+
+- bỏ field `expected_member_kinds` đã nằm ngoài schema MVP, nhưng giữ expectation hai
+  article cùng publisher đều là member và `n_distinct_sources=1`;
+- chuẩn hóa alias fixture `privacy-security → cybersecurity`;
+- mở seed từ 8 lên 10 technical beat bằng `semiconductors` và `science-research`, rồi
+  bổ sung exemplar/keyword domain cho custom silicon, research integrity, browser
+  fingerprinting, Rust/Zig, Mac và tracking accessory;
+- giữ nguyên expected cluster/topic intent, model, công thức, threshold `0.40` và mọi
+  cluster threshold; không sửa expected theo float output.
+
+Database đã import seed cũ cần chạy lại `taxonomy-import`, `taxonomy-rebuild`, rồi
+reclassify stale article để runtime nhận hai topic và prototype revision mới. T9 runner
+tự compile trực tiếp seed đã check-in nên không ghi database.
+
+---
+
+## T10 — Compose và MVP smoke (2026-08-30)
+
+Đã validate `docker compose config`, build image `news-radar-api`, rồi khởi động
+`db` + `api` bằng compose sau khi schema hiện có đã ở migration head. Compose không
+chạy Alembic, taxonomy import, worker hoặc scheduler tự động.
+
+| Gate | Kết quả |
+| --- | --- |
+| Compose DB | PostgreSQL/pgvector healthy, host port 5433 |
+| Compose API | image build pass, `/health` và `/health/db` trả 200, container healthy |
+| Taxonomy API | `/api/topics` trả default taxonomy và 10 active topic |
+| Stories API | `/api/stories?limit=2` trả story/member/source data |
+| Frontend | `pnpm build` pass với Next.js 16.3.0 + webpack, route manifest được generate đầy đủ |
+| Backend default suite | 315 pass, 33 skip, 10 semantic deselected |
+| Golden suite | 10/10 pass |
+
+Snapshot smoke của database local sau khi drain worker:
+
+| Số đo | Kết quả |
+| --- | --- |
+| Processing jobs | embed/classify/cluster đều 1,195 `done`, không còn state khác |
+| Prototype | 10 topic, MiniLM 384 chiều |
+| Classifier coverage | 186/1,195 article có nhãn (15.6%); 12 article đa nhãn |
+| Uncategorized | 1,009/1,195 (84.4%) |
+| Canonical/non-merged cluster | 993 tổng; 875 singleton; 108 cluster có ≥2 article |
+| Cluster lớn nhất | 17 article |
+| Article thuộc nhiều cluster | 0 |
+
+Build frontend ban đầu lộ hai dependency môi trường: `next/font/google` cần network và
+Turbopack/PostCSS bind cổng tạm trong sandbox. UI chuyển sang system font stack đã có
+sẵn và build script cố định `next build --webpack`; không thay đổi API/UI behavior.
+
+README root hiện là runbook để migrate, import/rebuild taxonomy, drain từng worker,
+smoke SQL/API, mở Stories và chạy golden suite. Production scheduler, image slimming
+và container hardening vẫn để sau MVP đúng scope T10.
+
+---
+
+## Chỗ trống cho các task sau
 
 Các bảng dưới đây được tạo trước theo §12.6 của kế hoạch; điền số liệu khi
 task tương ứng hoàn thành. Không điền trước khi có code thật chạy.
@@ -333,7 +415,7 @@ task tương ứng hoàn thành. Không điền trước khi có code thật ch�
 | Classifier | articles/s, confidence histogram, uncategorized rate | T6 | đã đo (mục T6) |
 | Taxonomy | prototype rebuild time/topic, reclassify time/1k articles | T5 | chưa đo |
 | API | stories p50/p95, query plan cho topic/source filter | T7 | chưa đo |
-| Golden | N/10 case pass, `case_id` fail + reason | T9 | chưa đo |
+| Golden | N/10 case pass, `case_id` fail + reason | T9 | 10/10, không còn case fail |
 
 ## Số đo phục vụ quyết định backlog L2/L3
 

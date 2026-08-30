@@ -42,7 +42,9 @@ build-backend = "setuptools.build_meta"
 where = ["backend"]
 
 [tool.pytest.ini_options]
+addopts = "-m 'not semantic'"
 markers = [
     "integration: requires a migrated PostgreSQL database",
+    "semantic: loads the production embedding model for golden semantic cases",
 ]
 testpaths = ["backend/tests"]

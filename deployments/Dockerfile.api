@@ -1,5 +1,5 @@
-# Runs the news-api FastAPI service. Not yet wired into docker-compose.yml —
-# the API depends on the same pyproject.toml as the crawler jobs, so this
+# Runs the news-api FastAPI service used by the development compose stack.
+# The API depends on the same pyproject.toml as the crawler jobs, so this
 # image currently installs the full dependency set (including crawl4ai).
 # Build from the repo root: docker build -f deployments/Dockerfile.api -t news-radar-api .
 FROM python:3.12-slim
@@ -8,13 +8,14 @@ RUN pip install --no-cache-dir uv
 
 WORKDIR /app
 
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 COPY backend ./backend
 
 RUN uv sync --frozen --no-dev
 
 ENV API_HOST=0.0.0.0
 ENV API_PORT=8000
+ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
 CMD ["uv", "run", "news-api"]

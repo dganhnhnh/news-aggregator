@@ -1,9 +1,14 @@
 # News Aggregator
 
 Repo này crawl nội dung web trực tiếp hoặc từ RSS/Atom, lưu bản mới nhất của
-mỗi article vào PostgreSQL, đồng thời duy trì hàng đợi retry và thống kê từng
-lần ingest. Backend (Python/FastAPI) nằm trong `backend/`, frontend (Next.js)
-nằm trong `frontend/`.
+mỗi article vào PostgreSQL, rồi embed, gán topic và gom article thành story
+cluster toàn cục. FastAPI phục vụ article/story/taxonomy ở chế độ read-only;
+frontend Next.js hiển thị Articles và Stories với topic tags.
+
+```text
+crawl → raw_articles → embed ─┬→ classify → article topics ─┐
+                             └→ cluster  → story members ──┴→ story topics → API/UI
+```
 
 ## Cài đặt
 
@@ -15,14 +20,17 @@ uv run crawl4ai-setup
 
 Điền `TAVILY_API_KEY` trong `.env` nếu dùng lệnh `search`.
 
-## Khởi động PostgreSQL
+## Khởi động PostgreSQL và API
 
-PostgreSQL 16 chạy trong Compose (`deployments/docker-compose.yml`), còn các
-CLI job chạy trên host:
+PostgreSQL 16 và API chạy trong Compose (`deployments/docker-compose.yml`),
+còn migration và worker chạy trên host. Khởi động DB trước, migrate schema,
+rồi mới khởi động API:
 
 ```bash
 docker compose -f deployments/docker-compose.yml --env-file .env up -d db
 uv run alembic upgrade head
+docker compose -f deployments/docker-compose.yml --env-file .env up -d --build api
+curl --fail http://localhost:8000/health/db
 ```
 
 Compose dùng named volume `news_radar_postgres_data`, vì vậy dữ liệu vẫn còn
@@ -30,9 +38,10 @@ khi container được restart hoặc tạo lại. Nếu port `5432` trên host 
 cả `POSTGRES_PORT` và port trong `DATABASE_URL`, ví dụ `55432`. `--env-file .env`
 là bắt buộc vì file compose không còn nằm cạnh `.env` ở root.
 
-Alembic không tự chạy khi service khởi động. Nếu DB chưa kết nối được hoặc
-schema chưa migrate, job có persistence sẽ dừng trước khi crawl và in hướng
-dẫn chạy migration.
+Alembic **không** tự chạy khi service khởi động. API readiness `/health/db`
+chỉ xanh sau khi DB đã migrate; container không chứa worker scheduler hay
+cron. Xem log bằng `docker compose -f deployments/docker-compose.yml
+--env-file .env logs -f api`.
 
 ### Thay đổi schema và tạo migration
 
@@ -49,6 +58,91 @@ uv run alembic check
 Không tạo file revision thủ công và không truyền `--rev-id`; giữ nguyên hex ID
 và filename prefix do Alembic sinh. Luôn review nội dung autogenerate trước khi
 apply vì rename và data migration có thể cần điều chỉnh thêm.
+
+## Chạy flow Week 2 end-to-end
+
+### 1. Bootstrap taxonomy và prototype
+
+PostgreSQL là runtime source of truth; YAML chỉ dùng để bootstrap/import. Sau
+migration mới hoặc sau khi exemplar/topic trong seed thay đổi:
+
+```bash
+uv run news-worker taxonomy-import --file data/taxonomy.seed.yaml
+uv run news-worker taxonomy-rebuild
+```
+
+Import dùng stable slug và idempotent. Không thêm `--prune` trừ khi chủ đích
+deactivate topic/node vắng khỏi file.
+
+### 2. Crawl và drain các stage downstream
+
+Ví dụ ingest một nhóm feed rồi xử lý toàn bộ queue vừa tạo:
+
+```bash
+uv run news-worker crawl \
+  --feed-path data/engineering_blogs.opml \
+  --max-feeds 5 \
+  --max-articles-per-feed 5 \
+  --once
+
+uv run news-worker embed --once
+uv run news-worker classify --once
+uv run news-worker cluster --once
+uv run news-worker cluster --merge-only --once
+uv run news-worker classify --refresh-clusters --last 30d --once
+```
+
+`classify` và `cluster` độc lập nên có thể đổi thứ tự; attach/classify sẽ
+refresh `cluster_topics` để hai đường cuối cùng hội tụ. Mỗi command drain queue
+theo chunk đến khi hết việc hoặc đạt `--limit`.
+
+Nếu nâng taxonomy trên database đã có embedding/cluster, requeue dữ liệu cũ
+theo cửa sổ rồi drain lại:
+
+```bash
+uv run news-worker classify --stale --last 30d --once
+uv run news-worker cluster --reprocess --last 30d --once
+uv run news-worker cluster --merge-only --once
+uv run news-worker classify --refresh-clusters --last 30d --once
+```
+
+Nếu đổi embedding model hoặc input builder, chạy `embed --model-changed`
+trước; re-embedding sẽ enqueue lại cả `classify` và `cluster`.
+
+### 3. Smoke-check dữ liệu, API và Stories UI
+
+Kiểm tra queue, prototype, classifier coverage và cluster distribution:
+
+```bash
+docker compose -f deployments/docker-compose.yml --env-file .env exec db sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT stage, state, count(*) FROM processing_jobs GROUP BY 1,2 ORDER BY 1,2"'
+
+docker compose -f deployments/docker-compose.yml --env-file .env exec db sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT model, dim, count(*) FROM topic_prototypes GROUP BY 1,2"'
+
+docker compose -f deployments/docker-compose.yml --env-file .env exec db sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT assigned_count, count(*) FROM article_classifications GROUP BY 1 ORDER BY 1"'
+
+docker compose -f deployments/docker-compose.yml --env-file .env exec db sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT n_articles, count(*) FROM clusters WHERE status <> '\''merged'\'' GROUP BY 1 ORDER BY 1"'
+
+curl --fail http://localhost:8000/health/db
+curl --fail 'http://localhost:8000/api/topics'
+curl --fail 'http://localhost:8000/api/stories?limit=5'
+```
+
+Sau đó mở frontend:
+
+```bash
+cd frontend
+cp .env.example .env.local
+pnpm install
+pnpm dev
+```
+
+Mở `http://localhost:3000`, chọn **Stories** và click một story để xem member.
+`API_URL` chỉ dùng server-side trong Next.js và mặc định trỏ tới
+`http://localhost:8000`.
 
 ## Chạy pipeline một lần
 
@@ -77,9 +171,10 @@ uv run news-pipeline rss --feed-path ./data/engineering_blogs.opml --max-feeds 5
 
 ## Chạy worker
 
-`news-worker` là entry point cho mọi worker; hiện có subcommand `crawl`. Worker
-luôn yêu cầu PostgreSQL. Mỗi run xử lý tối đa `MAX_RETRIES_PER_RUN` failure đến
-hạn trước, rồi mới ingest feed hiện tại. Mặc định chạy một lần rồi thoát:
+`news-worker` là entry point chung cho `crawl`, `embed`, `classify`, `cluster`
+và các admin command taxonomy/replay/cleanup. Worker luôn yêu cầu PostgreSQL.
+Mỗi crawl run xử lý tối đa `MAX_RETRIES_PER_RUN` failure đến hạn trước, rồi mới
+ingest feed hiện tại. Mặc định chạy một lần rồi thoát:
 
 ```bash
 uv run news-worker crawl --feed-path ./data/engineering_blogs.opml --max-feeds 5
@@ -155,20 +250,20 @@ Với OPML, pipeline đọc mọi `outline` có `xmlUrl` và chuyển đổi:
 của `--feed-path`. Có thể đặt nguồn mặc định bằng `RSS_FEED_PATH`; biến cũ
 `GOOGLE_NEWS_TSV_PATH` vẫn được hỗ trợ. `--max-feeds 0` nghĩa là xử lý toàn bộ.
 
-## Raw storage và monitoring
+## Storage và monitoring
 
-Schema có bốn bảng:
+Các nhóm dữ liệu chính:
 
-- `raw_articles`: nội dung Markdown mới nhất, URL chuẩn hóa và SHA-256
-  `content_hash`; upsert chỉ update khi content hoặc metadata thay đổi.
-- `sources`: nguồn đã chuẩn hóa mà `raw_articles` tham chiếu tới.
-- `crawl_failures`: lỗi hiện tại và durable retry queue, không lưu lịch sử từng
-  attempt.
-- `worker_runs`: sổ vận hành chung cho mọi worker — trạng thái
-  `running/succeeded/partial/failed/abandoned`, `heartbeat_at`, cửa sổ thời
-  gian, cùng `params` và `stats` dạng JSONB.
+- ingest: `raw_articles`, `sources`, `feed_state`, `crawl_failures`;
+- orchestration: `processing_jobs`, `processing_dlq`, `worker_runs`;
+- semantic: `article_embeddings`, `clusters`, `cluster_members`,
+  `article_classifications`, `article_topics`, `cluster_topics`;
+- taxonomy: `topics`, `topic_signals`, `topic_prototypes`, `taxonomies`,
+  `taxonomy_nodes` và mapping node-topic.
 
-Không lưu raw HTML hay phiên bản cũ. Có thể kiểm tra nhanh trạng thái bằng:
+`raw_articles` chỉ giữ bản Markdown mới nhất theo normalized URL; không lưu raw
+HTML hay lịch sử version. `cluster_topics` là derived data có thể rebuild từ
+article scores và source-balanced aggregation. Có thể kiểm tra nhanh trạng thái bằng:
 
 ```bash
 docker compose -f deployments/docker-compose.yml --env-file .env exec db psql -U news_radar -d news_radar -c "SELECT worker, status, count(*) FROM worker_runs GROUP BY worker, status;"
@@ -177,8 +272,8 @@ docker compose -f deployments/docker-compose.yml --env-file .env exec db psql -U
 
 ## Chạy API
 
-`backend/api/` là một FastAPI app read-only trên cùng schema (`raw_articles`),
-dùng chung `PostgresRawStorage`
+`backend/api/` là FastAPI app read-only trên cùng schema, dùng chung
+`PostgresRawStorage`
 ([backend/adapters/storage/postgres.py](backend/adapters/storage/postgres.py))
 với pipeline/service. Yêu cầu PostgreSQL đã migrate:
 
@@ -191,18 +286,23 @@ trong `.env` là danh sách origin (phân tách bởi dấu phẩy) được ph�
 mặc định `http://localhost:3000` cho frontend dev. Endpoint hiện có:
 
 - `GET /health`, `GET /health/db`
-- `GET /api/articles?limit=&offset=&source=&q=`
+- `GET /api/articles?limit=&cursor=&source=&topic=&q=`
 - `GET /api/articles/{id}`
+- `GET /api/sources`, `GET /api/sources/{slug}/articles`
+- `GET /api/topics?taxonomy=default`
+- `GET /api/stories?limit=&cursor=&source=&topic=&min_sources=&min_articles=`
+- `GET /api/stories/{id}`
 
 ## Frontend
 
-`frontend/` hiện là chỗ trống, chưa scaffold. Xem
-[frontend/README.md](frontend/README.md) để khởi tạo bằng `pnpm create next-app`
-khi cần.
+`frontend/` là Next.js app. Browser gọi route `/api/*` cùng origin; Next.js
+server proxy request tới FastAPI theo `API_URL`, nên không expose URL nội bộ ra
+client. Xem [frontend/README.md](frontend/README.md) cho cấu hình local.
 
 ## Kiểm thử
 
-Unit test không yêu cầu DB:
+Suite mặc định không tải embedding model thật; semantic suite được tách bằng
+marker. Unit test không yêu cầu DB:
 
 ```bash
 uv run --extra dev pytest -m "not integration"
@@ -212,4 +312,16 @@ Integration test yêu cầu một DB đã migrate:
 
 ```bash
 TEST_DATABASE_URL="$DATABASE_URL" uv run --extra dev pytest
+```
+
+Golden semantic suite dùng đúng MiniLM production và đúng 10 scenario:
+
+```bash
+uv run --extra dev pytest backend/tests/test_semantic_golden.py -m semantic
+```
+
+Frontend build gate:
+
+```bash
+cd frontend && pnpm build
 ```

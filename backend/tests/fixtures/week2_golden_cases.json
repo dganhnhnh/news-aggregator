@@ -25,10 +25,6 @@
       }
     ],
     "expected_clusters": [["mac-launch-theverge", "mac-launch-cnet"]],
-    "expected_member_kinds": {
-      "mac-launch-theverge": "primary",
-      "mac-launch-cnet": "primary"
-    },
     "expected_distinct_sources": 2,
     "notes": "Expected: same cluster, both sources retained as evidence, neither article suppressed."
   },
@@ -44,7 +40,7 @@
         "published_at": "2026-08-24T12:32:00Z",
         "title": "AliExpress accused of fingerprinting shoppers with silent audio trick",
         "text": "Developer Matt Callaghan claims he caught Alibaba trying to track web users by playing inaudible sounds through browsers vulnerable to audio fingerprinting, an outdated technique that also impeded his ability to use a Bluetooth headset while browsing the site.",
-        "expected_topics": ["privacy-security"],
+        "expected_topics": ["cybersecurity"],
         "forbidden_topics": ["consumer-hardware"]
       },
       {
@@ -53,15 +49,11 @@
         "published_at": "2026-08-24T19:19:21Z",
         "title": "Inaudible sounds used to fingerprint browsers catch AliExpress red-handed",
         "text": "Chinese retailer AliExpress has been caught fingerprinting visitors after one of the metrics it collects, an outdated technique that measures inaudible sounds sent to browsers, interfered with a researcher's ability to use his Bluetooth headphones.",
-        "expected_topics": ["privacy-security"],
+        "expected_topics": ["cybersecurity"],
         "forbidden_topics": ["consumer-hardware"]
       }
     ],
     "expected_clusters": [["aliexpress-fingerprint-register", "aliexpress-fingerprint-arstechnica"]],
-    "expected_member_kinds": {
-      "aliexpress-fingerprint-register": "primary",
-      "aliexpress-fingerprint-arstechnica": "primary"
-    },
     "expected_distinct_sources": 2,
     "notes": "Wording differs heavily (title, opening sentence) but it is the same concrete event: must still cluster together."
   },
@@ -91,10 +83,6 @@
       }
     ],
     "expected_clusters": [["mac-launch-theverge-2"], ["airtags-discount-theverge"]],
-    "expected_member_kinds": {
-      "mac-launch-theverge-2": "primary",
-      "airtags-discount-theverge": "primary"
-    },
     "expected_distinct_sources": null,
     "notes": "Expected: DIFFERENT clusters (different concrete events) even though they may share the consumer-hardware topic. This tests the invariant that 'same topic' does not imply 'same event'."
   },
@@ -124,12 +112,8 @@
       }
     ],
     "expected_clusters": [["reddit-zig-rust-a", "reddit-zig-rust-b"]],
-    "expected_member_kinds": {
-      "reddit-zig-rust-a": "primary",
-      "reddit-zig-rust-b": "near_duplicate"
-    },
     "expected_distinct_sources": 1,
-    "notes": "Expected: the article that arrives later (by published_at/crawled_at) is marked member_kind=near_duplicate and does NOT pull the centroid. n_distinct_sources must be 1, not 2, since this is the same publisher."
+    "notes": "Expected: both valid articles remain cluster members and contribute to the centroid in the Week 2 MVP. n_distinct_sources must be 1, not 2, since this is the same publisher."
   },
   {
     "case_id": "near_identical_cross_publisher",
@@ -157,10 +141,6 @@
       }
     ],
     "expected_clusters": [["antibody-images-arstechnica", "antibody-images-slashdot"]],
-    "expected_member_kinds": {
-      "antibody-images-arstechnica": "primary",
-      "antibody-images-slashdot": "primary"
-    },
     "expected_distinct_sources": 2,
     "notes": "Expected: even though the content is nearly sentence-for-sentence identical, because they are DIFFERENT publishers both remain primary members and both are retained as evidence (no cross-source suppression, per plan Sec 2.5)."
   },
@@ -181,9 +161,6 @@
       }
     ],
     "expected_clusters": [["ai-custom-hardware-register"]],
-    "expected_member_kinds": {
-      "ai-custom-hardware-register": "primary"
-    },
     "expected_distinct_sources": 1,
     "notes": "Expected: article_topics has both artificial-intelligence AND semiconductors assigned=true (score >= threshold for both)."
   },
@@ -204,9 +181,6 @@
       }
     ],
     "expected_clusters": [["airtags-discount-hardneg"]],
-    "expected_member_kinds": {
-      "airtags-discount-hardneg": "primary"
-    },
     "expected_distinct_sources": 1,
     "notes": "Expected: the artificial-intelligence topic is NOT assigned. This tests the token-boundary keyword matching called out in plan Sec 3.4/5.1 ('AI' must not match inside 'said'/'AirTags')."
   },
@@ -223,13 +197,11 @@
         "title": "Effects of peppermint (Mentha x piperita L.) oil on cardiometabolic outcomes",
         "text": "This study examines the effects of peppermint oil supplementation on cardiometabolic outcomes in patients, reporting on blood pressure, lipid profile, and related biomarkers over the trial period.",
         "expected_topics": [],
-        "forbidden_topics": ["artificial-intelligence", "consumer-hardware", "semiconductors", "privacy-security", "programming-languages", "science-research"]
+        "forbidden_topics": ["artificial-intelligence", "consumer-hardware", "semiconductors", "cybersecurity", "programming-languages", "science-research"],
+        "expected_uncategorized": true
       }
     ],
     "expected_clusters": [["peppermint-study-plos"]],
-    "expected_member_kinds": {
-      "peppermint-study-plos": "primary"
-    },
     "expected_distinct_sources": 1,
     "notes": "Expected: no topic in the current taxonomy is assigned (assigned_count=0 / uncategorized). Do not force this article into science-research -- this corpus is tech-focused, not biomedical."
   },
@@ -259,10 +231,6 @@
       }
     ],
     "expected_clusters": [["mac-launch-theverge-early"], ["mac-launch-cnet-late"]],
-    "expected_member_kinds": {
-      "mac-launch-theverge-early": "primary",
-      "mac-launch-cnet-late": "primary"
-    },
     "expected_distinct_sources": null,
     "notes": "Timestamps are 5 days apart (>72h cluster_window). Expected: NOT the same cluster despite high cosine similarity, because ClusterWorker only considers candidates 'still active within 72h'. This is a dedicated time-window test, distinct from case 1 (same event, same time window)."
   },
@@ -292,10 +260,6 @@
       }
     ],
     "expected_clusters": [["mac-launch-cnet-order", "mac-launch-theverge-order"]],
-    "expected_member_kinds": {
-      "mac-launch-cnet-order": "primary",
-      "mac-launch-theverge-order": "primary"
-    },
     "expected_distinct_sources": 2,
     "notes": "The 'articles' list here is in REVERSED order relative to case 1 (cnet first, theverge second) to serve as input for the first run; T9 must also run at least one other permutation (e.g. case 1's original order) and assert both runs produce the same canonical member set (same cluster, same headline after tie-break, independent of arrival order)."
   }

@@ -18,6 +18,33 @@ services:
       retries: 10
     restart: unless-stopped
 
+  api:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@db:5432/${POSTGRES_DB:-news_radar}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:3000}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8000/health/db', timeout=2)
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
 volumes:
   news_radar_postgres_data:
     name: news_radar_postgres_data

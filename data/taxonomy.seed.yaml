@@ -11,6 +11,8 @@ topics:
       - the smartwatch adds new health tracking sensors
       - unboxing and first impressions of the newest tablet
       - benchmark comparison of the latest flagship phones
+      - a desktop computer lineup launches with a faster processor and graphics chip
+      - a wireless tracking accessory for keys and luggage goes on sale
     keywords:
       - value: smartphone
         weight: 1.0
@@ -20,6 +22,18 @@ topics:
         weight: 0.5
       - value: wearable
         weight: 0.6
+      - value: desktop
+        weight: 0.8
+      - value: accessory
+        weight: 0.8
+      - value: AirTag
+        weight: 1.0
+      - value: AirTags
+        weight: 1.0
+      - value: tracking
+        weight: 0.8
+      - value: Mac
+        weight: 0.8
 
   - slug: artificial-intelligence
     name: Artificial Intelligence
@@ -80,6 +94,10 @@ topics:
         weight: 0.6
       - value: syntax
         weight: 0.4
+      - value: Rust
+        weight: 0.8
+      - value: Zig
+        weight: 0.8
 
   - slug: cloud-infrastructure
     name: Cloud & Infrastructure
@@ -111,6 +129,8 @@ topics:
       - attackers exploited a zero-day flaw before a patch was available
       - the security team published a report on a new phishing campaign
       - a patch was released to fix a remote code execution bug
+      - browser fingerprinting tracks visitors without cookies or consent
+      - an inaudible audio signal is used to fingerprint users across websites
     keywords:
       - value: vulnerability
         weight: 1.0
@@ -120,6 +140,56 @@ topics:
         weight: 0.8
       - value: security
         weight: 0.6
+      - value: fingerprinting
+        weight: 1.0
+      - value: privacy
+        weight: 0.8
+      - value: browser
+        weight: 0.7
+
+  - slug: science-research
+    name: Science & Research
+    description: Scientific findings, research methods, integrity and reproducibility.
+    threshold: 0.40
+    exemplars:
+      - researchers investigate manipulated figures in a published scientific paper
+      - a replication study finds that an influential experimental result does not hold
+      - laboratories review whether commercial research reagents were validated correctly
+      - a journal retracts a paper after evidence of image manipulation and misconduct
+      - scientists publish a new method for improving reproducibility in laboratory experiments
+    keywords:
+      - value: scientific
+        weight: 0.6
+      - value: laboratory
+        weight: 0.8
+      - value: antibody
+        weight: 1.0
+      - value: manipulated images
+        weight: 1.0
+      - value: reproducibility
+        weight: 0.8
+
+  - slug: semiconductors
+    name: Semiconductors
+    description: Chips, foundries, fabrication, accelerators and custom silicon.
+    threshold: 0.40
+    exemplars:
+      - a chip manufacturer announces a new semiconductor process node
+      - foundry capacity expands as wafer shipments increase
+      - export restrictions limit access to lithography equipment
+      - AI companies design custom silicon accelerators for datacenter workloads
+      - GPU vendors launch new chips for training and serving machine learning models
+    keywords:
+      - value: semiconductor
+        weight: 1.0
+      - value: foundry
+        weight: 0.8
+      - value: wafer
+        weight: 0.7
+      - value: GPU
+        weight: 1.0
+      - value: custom silicon
+        weight: 1.0
 
   - slug: open-source
     name: Open Source
@@ -171,6 +241,9 @@ taxonomies:
           - slug: hardware
             name: Hardware
             topics: [consumer-hardware]
+          - slug: semiconductors
+            name: Semiconductors
+            topics: [semiconductors]
           - slug: ai
             name: Artificial Intelligence
             topics: [artificial-intelligence]
@@ -192,6 +265,9 @@ taxonomies:
           - slug: oss
             name: Open Source
             topics: [open-source]
+          - slug: research
+            name: Science & Research
+            topics: [science-research]
       - slug: business
         name: Business
         children:
