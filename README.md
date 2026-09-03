@@ -111,12 +111,15 @@ trước; re-embedding sẽ enqueue lại cả `classify` và `cluster`.
 
 ### 3. Smoke-check dữ liệu, API và Stories UI
 
-Kiểm tra queue, prototype, classifier coverage và cluster distribution:
+Queue, retry queue và worker runs xem bằng một lệnh:
 
 ```bash
-docker compose -f deployments/docker-compose.yml --env-file .env exec db sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT stage, state, count(*) FROM processing_jobs GROUP BY 1,2 ORDER BY 1,2"'
+uv run news-worker queue-status
+```
 
+Prototype, classifier coverage và cluster distribution vẫn cần truy vấn riêng:
+
+```bash
 docker compose -f deployments/docker-compose.yml --env-file .env exec db sh -c \
   'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT model, dim, count(*) FROM topic_prototypes GROUP BY 1,2"'
 
@@ -228,6 +231,12 @@ row.
   hàng chờ, nên đặt cron dày hơn thời lượng run vẫn an toàn.
 - **Exit code:** `0` khi run `succeeded`/`partial` hoặc khi không lấy được
   lock; `1` khi run `failed`. Thêm `--strict` nếu muốn `partial` cũng trả `1`.
+- **`--exit-busy CODE`:** thoát `CODE` thay vì `0` khi lock đã có chủ, để
+  scheduler phân biệt "bị bỏ qua" với "chạy xong". Mặc định vẫn `0` nên cron
+  hiện có không đổi; `1` bị từ chối vì đó là mã lỗi.
+- **`--summary-json PATH`:** append đúng một dòng JSON mô tả run vừa xong
+  (`run_id`, `status`, `stats`, `error_message`). `-` hoặc `/dev/stdout` ghi
+  vào dòng **cuối cùng** của stdout, là dòng Airflow đẩy lên XCom.
 - **Tắt êm:** SIGTERM/SIGINT dừng ở ranh giới chunk kế tiếp, đóng sổ run ở
   trạng thái `partial` thay vì để kẹt `running`.
 - **Run treo:** run nào ngừng heartbeat quá `max(3 × --interval,
@@ -235,6 +244,43 @@ row.
 
 `news-service` vẫn chạy được nhưng đã deprecated: nó chỉ in cảnh báo, đổi
 `--interval-seconds` thành `--interval` rồi gọi lại `news-worker crawl`.
+
+## Điều phối bằng Airflow
+
+Thay cho việc chạy tay chuỗi lệnh ở §"Chạy flow Week 2 end-to-end". Thiết kế và
+lý do từng quyết định nằm ở [docs/orchestration-airflow.md](docs/orchestration-airflow.md).
+
+Bốn DAG trong `orchestration/dags/`, mỗi task là **một lệnh `news-worker` chạy
+trong container riêng** (`DockerOperator`):
+
+| DAG | Lịch | Nội dung |
+|---|---|---|
+| `news_ingest` | `*/30 * * * *` | `preflight_db → crawl → queue_gate`, phát Asset khi có job embed pending |
+| `news_semantic` | Asset-triggered | `embed → classify ‖ cluster → cluster_merge → refresh_cluster_topics` |
+| `news_maintenance` | `0 3 * * *` | `cluster --repair`, replay dead-letter, cleanup dry-run, `queue-status --fail-on-alert` |
+| `news_taxonomy_refresh` | Trigger tay | import seed → rebuild prototype → reclassify/recluster trong cửa sổ chọn bằng param |
+
+Khởi động (build image worker trước, vì scheduler chỉ chạy container chứ không
+build):
+
+```bash
+docker build -f deployments/Dockerfile.worker -t news-radar-worker:latest .
+```
+
+```bash
+NEWS_RADAR_REPO=$PWD docker compose --env-file .env -f deployments/docker-compose.yml -f deployments/docker-compose.airflow.yml up -d
+```
+
+UI ở `http://localhost:8080`. `NEWS_RADAR_REPO` phải là đường dẫn **trên host**
+tới repo: scheduler mount `$NEWS_RADAR_REPO/data` vào từng container worker,
+và bind mount đó do Docker daemon của host giải quyết chứ không phải container
+scheduler. Trên host mà `/var/run/docker.sock` không thuộc group `999`, đặt
+thêm `AIRFLOW_DOCKER_GID`.
+
+`airflow-init` tạo sẵn bốn pool `news_crawl` / `news_embed` / `news_cluster` /
+`news_classify`, mỗi pool **1 slot**. Đó là toàn bộ mô hình concurrency: worker
+đã tự loại trừ nhau bằng advisory lock, pool chỉ để Airflow không phải khởi
+động container rồi nhận về một task `skipped`.
 
 ## Nguồn TSV và OPML
 
@@ -266,9 +312,17 @@ HTML hay lịch sử version. `cluster_topics` là derived data có thể rebuil
 article scores và source-balanced aggregation. Có thể kiểm tra nhanh trạng thái bằng:
 
 ```bash
-docker compose -f deployments/docker-compose.yml --env-file .env exec db psql -U news_radar -d news_radar -c "SELECT worker, status, count(*) FROM worker_runs GROUP BY worker, status;"
-docker compose -f deployments/docker-compose.yml --env-file .env exec db psql -U news_radar -d news_radar -c "SELECT failure_kind, count(*) FROM crawl_failures GROUP BY failure_kind;"
+uv run news-worker queue-status
 ```
+
+Lệnh này read-only, gộp `processing_jobs` (theo stage/state), `crawl_failures`
+(theo kind) và `worker_runs` trong 24h gần nhất. Hai cờ dành cho scheduler:
+
+- `--json` in đúng một dòng JSON trên stdout, dùng được với `jq` hoặc XCom;
+- `--fail-on-alert` thoát `1` khi có job `dead_letter`, có failure đã
+  dead-letter, hoặc có run `failed`/`abandoned` trong cửa sổ. Backlog `pending`
+  **không** phải alert — nó cần lịch sử nhiều lần đo, không đọc được từ một
+  snapshot.
 
 ## Chạy API
 

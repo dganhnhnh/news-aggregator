@@ -7,7 +7,18 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from adapters.storage.postgres import PostgresRawStorage
-from adapters.storage.schema import worker_runs
+from adapters.storage.schema import (
+    crawl_failures,
+    processing_jobs,
+    raw_articles,
+    sources,
+    worker_runs,
+)
+from models.storage_models import (
+    FailureQueueStatus,
+    RawArticle,
+    StageQueueStatus,
+)
 
 
 DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -102,3 +113,164 @@ async def _test_reaper_only_touches_stale_runs_of_its_own_worker() -> None:
                 )
         await engine.dispose()
         await storage.close()
+
+
+def _stage(snapshot, name: str) -> StageQueueStatus:
+    for stage in snapshot.stages:
+        if stage.stage == name:
+            return stage
+    return StageQueueStatus(stage=name)
+
+
+def _failures(snapshot, kind: str) -> FailureQueueStatus:
+    for failure in snapshot.failures:
+        if failure.failure_kind == kind:
+            return failure
+    return FailureQueueStatus(failure_kind=kind)
+
+
+def _runs(snapshot, worker: str, status: str) -> int:
+    return sum(
+        row.count
+        for row in snapshot.runs
+        if row.worker == worker and row.status == status
+    )
+
+
+def test_queue_status_counts_every_queue_and_raises_the_right_alerts() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_queue_status_counts_every_queue_and_raises_the_right_alerts())
+
+
+async def _test_queue_status_counts_every_queue_and_raises_the_right_alerts() -> None:
+    url = "https://queue-status-integration.example/a"
+    slug = "queue-status-integration.example"
+    failure_url = "https://queue-status-integration.example/dead"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    now = datetime.now(timezone.utc)
+    run_ids: list[int] = []
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        await _purge_queue_status_fixtures(engine, url, slug, failure_url)
+        before = await storage.queue_status(runs_window_hours=1)
+
+        await storage.apply_batch(
+            [
+                RawArticle(
+                    url=url,
+                    url_original=url,
+                    title="Title",
+                    source="Example",
+                    lang="en",
+                    content="body",
+                    content_hash=b"q" * 32,
+                    published_at=now,
+                    crawled_at=now,
+                )
+            ],
+            [],
+            [],
+            received=1,
+            rejected=0,
+        )
+        async with engine.begin() as connection:
+            article_id = await connection.scalar(
+                select(raw_articles.c.id).where(raw_articles.c.url == url)
+            )
+            await connection.execute(
+                update(processing_jobs)
+                .where(
+                    processing_jobs.c.article_id == article_id,
+                    processing_jobs.c.stage == "embed",
+                )
+                .values(state="dead_letter", attempts=5)
+            )
+            await connection.execute(
+                crawl_failures.insert().values(
+                    failure_kind="article",
+                    url=failure_url,
+                    error_type="Timeout",
+                    error_message="took too long",
+                    attempt_count=7,
+                    first_failed_at=now,
+                    last_failed_at=now,
+                    next_retry_at=now,
+                    dead_lettered_at=now,
+                )
+            )
+
+        run_ids.append(
+            await storage.start_run(worker="queue-status-test", trigger="scheduled")
+        )
+        await storage.finish_run(run_ids[0], "abandoned", None)
+        run_ids.append(
+            await storage.start_run(worker="queue-status-test", trigger="scheduled")
+        )
+        await storage.finish_run(run_ids[1], "succeeded", None)
+
+        after = await storage.queue_status(runs_window_hours=1)
+
+        assert (
+            _stage(after, "embed").dead_letter - _stage(before, "embed").dead_letter
+        ) == 1
+        assert (
+            _failures(after, "article").dead_lettered
+            - _failures(before, "article").dead_lettered
+        ) == 1
+        assert _failures(after, "article").max_attempts >= 7
+        assert _runs(after, "queue-status-test", "abandoned") == 1
+        assert _runs(after, "queue-status-test", "succeeded") == 1
+
+        alerts = after.alerts()
+        assert any("news-worker replay --stage embed" in alert for alert in alerts)
+        assert any("news-worker replay --failures" in alert for alert in alerts)
+        assert any("abandoned run" in alert for alert in alerts)
+        # A succeeded run is never an alert on its own.
+        assert not any("succeeded" in alert for alert in alerts)
+
+        # The window is a real filter, not decoration.
+        async with engine.begin() as connection:
+            await connection.execute(
+                update(worker_runs)
+                .where(worker_runs.c.id.in_(run_ids))
+                .values(started_at=now - timedelta(hours=6))
+            )
+        narrowed = await storage.queue_status(runs_window_hours=1)
+        assert _runs(narrowed, "queue-status-test", "abandoned") == 0
+    finally:
+        if ready:
+            if run_ids:
+                async with engine.begin() as connection:
+                    await connection.execute(
+                        delete(worker_runs).where(worker_runs.c.id.in_(run_ids))
+                    )
+            await _purge_queue_status_fixtures(engine, url, slug, failure_url)
+        await engine.dispose()
+        await storage.close()
+
+
+async def _purge_queue_status_fixtures(
+    engine, url: str, slug: str, failure_url: str
+) -> None:
+    async with engine.begin() as connection:
+        article_ids = [
+            row.id
+            for row in await connection.execute(
+                select(raw_articles.c.id).where(raw_articles.c.url == url)
+            )
+        ]
+        if article_ids:
+            await connection.execute(
+                delete(processing_jobs).where(
+                    processing_jobs.c.article_id.in_(article_ids)
+                )
+            )
+        await connection.execute(delete(raw_articles).where(raw_articles.c.url == url))
+        await connection.execute(delete(sources).where(sources.c.slug == slug))
+        await connection.execute(
+            delete(crawl_failures).where(crawl_failures.c.url == failure_url)
+        )

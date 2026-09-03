@@ -36,7 +36,15 @@ future Next.js UI.
   - `tests/`: unit and PostgreSQL integration tests.
 - `frontend/`: empty placeholder for a future Next.js app; see
   `frontend/README.md` for the scaffold command.
-- `deployments/`: `docker-compose.yml` (PostgreSQL only) and `Dockerfile.api`.
+- `orchestration/dags/`: Airflow DAGs, deliberately outside `backend/` so
+  setuptools does not package them. `_common.py` is the only module that names
+  an operator — every task is one `news-worker` argv, so swapping
+  `DockerOperator` for something else must not touch a DAG file. See
+  `docs/orchestration-airflow.md`.
+- `deployments/`: `docker-compose.yml` (PostgreSQL only), `Dockerfile.api`,
+  `Dockerfile.worker` (adds Chromium and makes `news-worker` PID 1 so SIGTERM
+  reaches it) and `docker-compose.airflow.yml` (Airflow on its own metadata
+  database, never the application one).
 - PostgreSQL groups its tables in four layers: ingestion (`raw_articles`,
   latest version only; `sources`; `crawl_failures`, the current durable retry
   queue; `worker_runs`, one operational log for every worker with JSONB

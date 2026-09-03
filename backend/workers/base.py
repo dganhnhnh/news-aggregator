@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import signal
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import timedelta
+from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, NamedTuple
 
 from adapters.storage import PostgresRawStorage
@@ -27,6 +30,10 @@ logger = get_logger(__name__)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
+# Paths that mean "write the summary to this process's stdout" rather than to
+# a file. `/dev/stdout` is accepted because that is what a Docker command line
+# reads naturally, but opening it in append mode is not portable.
+STDOUT_TARGETS = frozenset({"-", "/dev/stdout"})
 
 
 class RunOutcome(NamedTuple):
@@ -76,6 +83,38 @@ async def sleep_or_shutdown(seconds: float, event: asyncio.Event) -> None:
         await asyncio.wait_for(event.wait(), timeout=seconds)
     except asyncio.TimeoutError:
         return
+
+
+def _json_safe(value: Any) -> Any:
+    """Flatten a stats dataclass the same way `worker_runs.stats` stores it."""
+    if value is None:
+        return None
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    if isinstance(value, Mapping):
+        return dict(value)
+    return value
+
+
+def emit_summary(target: str, payload: Mapping[str, Any]) -> None:
+    """Write one JSON line describing a finished run.
+
+    It has to be the *last* line on stdout: `DockerOperator(do_xcom_push=True)`
+    pushes `log_lines[-1]` and nothing else, so anything logged afterwards
+    would silently become the XCom value instead.
+    """
+    line = json.dumps(payload, default=str, ensure_ascii=False)
+    try:
+        if target in STDOUT_TARGETS:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+            return
+        with Path(target).open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        # A summary is a reporting convenience; losing it must never turn a
+        # successful run into a failed one.
+        logger.exception("Could not write the run summary to %s", target)
 
 
 class Worker(ABC):
@@ -141,7 +180,7 @@ class Worker(ABC):
                     "Another %s run holds the lock; exiting without doing work",
                     self.name,
                 )
-                return EXIT_OK
+                return exit_busy_for(args)
 
             if window.is_deep_backfill:
                 logger.warning(
@@ -179,16 +218,22 @@ class Worker(ABC):
                     storage,
                     run_id,
                     RunOutcome("partial", None, "Cancelled before the run completed"),
+                    args=args,
+                    window=window,
                 )
                 raise
             except Exception as exc:
                 logger.exception("%s run %d failed", self.name, run_id)
                 await self._finish(
-                    storage, run_id, RunOutcome("failed", None, str(exc))
+                    storage,
+                    run_id,
+                    RunOutcome("failed", None, str(exc)),
+                    args=args,
+                    window=window,
                 )
                 return EXIT_FAILED
 
-            await self._finish(storage, run_id, outcome)
+            await self._finish(storage, run_id, outcome, args=args, window=window)
             if outcome.status == "failed":
                 return EXIT_FAILED
             if outcome.status == "partial" and getattr(args, "strict", False):
@@ -200,6 +245,9 @@ class Worker(ABC):
         storage: PostgresRawStorage,
         run_id: int,
         outcome: RunOutcome,
+        *,
+        args: argparse.Namespace,
+        window: RunWindow,
     ) -> None:
         try:
             await storage.finish_run(
@@ -207,8 +255,36 @@ class Worker(ABC):
             )
         except Exception:  # pragma: no cover - best effort bookkeeping
             logger.exception("Could not close out %s run %d", self.name, run_id)
-            return
-        logger.info("Finished %s run %d as %s", self.name, run_id, outcome.status)
+        else:
+            logger.info("Finished %s run %d as %s", self.name, run_id, outcome.status)
+
+        target = getattr(args, "summary_json", None)
+        if target:
+            emit_summary(
+                target,
+                {
+                    "run_id": run_id,
+                    "worker": self.name,
+                    "status": outcome.status,
+                    "trigger": _trigger_for(args, window),
+                    "window_start": window.start.isoformat(),
+                    "window_end": window.end.isoformat(),
+                    "stats": _json_safe(outcome.stats),
+                    "error_message": outcome.error_message,
+                    "emitted_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+
+def exit_busy_for(args: argparse.Namespace) -> int:
+    """Exit code to use when another run already holds the worker's lock.
+
+    Defaults to `EXIT_OK`, because overlapping cron schedules are a non-event
+    and always have been. A scheduler that needs to tell "skipped" apart from
+    "did the work" -- Airflow's `skip_on_exit_code` -- passes its own code, so
+    a busy run stops showing up as a success that quietly did nothing.
+    """
+    return int(getattr(args, "exit_busy", None) or EXIT_OK)
 
 
 def _trigger_for(args: argparse.Namespace, window: RunWindow) -> WorkerTrigger:

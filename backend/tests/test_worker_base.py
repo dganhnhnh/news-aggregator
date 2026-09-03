@@ -9,6 +9,9 @@ from typing import Any
 
 import pytest
 
+import json
+from pathlib import Path
+
 from models.storage_models import IngestRunStats
 from workers.base import (
     EXIT_FAILED,
@@ -16,6 +19,7 @@ from workers.base import (
     RunContext,
     RunOutcome,
     Worker,
+    exit_busy_for,
     shutdown_signals,
     stale_after_for,
 )
@@ -271,6 +275,81 @@ def test_sigterm_sets_the_shutdown_event_without_killing_the_process() -> None:
         return event.is_set()
 
     assert asyncio.run(scenario()) is True
+
+
+def test_a_busy_run_stays_a_success_unless_a_code_is_asked_for() -> None:
+    # Overlapping cron schedules have always been a non-event, so the default
+    # must not change; a scheduler that needs "skipped" opts in explicitly.
+    assert exit_busy_for(_args()) == EXIT_OK
+    assert exit_busy_for(_args(exit_busy=0)) == EXIT_OK
+    assert exit_busy_for(_args(exit_busy=99)) == 99
+
+
+def test_lock_held_elsewhere_uses_the_requested_busy_exit_code() -> None:
+    storage = FakeStorage(lock_acquired=False)
+    worker = ScriptedWorker(RunOutcome("succeeded", IngestRunStats()))
+
+    exit_code = _run(worker, storage, _args(exit_busy=99))
+
+    assert exit_code == 99
+    assert worker.executed == 0
+    assert [call[0] for call in storage.calls] == ["reap", "lock"]
+
+
+def test_summary_json_writes_one_line_per_finished_run(tmp_path: Path) -> None:
+    target = tmp_path / "summary.jsonl"
+    storage = FakeStorage()
+    stats = IngestRunStats()
+    stats.articles_written = 7
+
+    _run(
+        ScriptedWorker(RunOutcome("partial", stats, "1 feed failed")),
+        storage,
+        _args(summary_json=str(target)),
+    )
+
+    lines = target.read_text().splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["run_id"] == 1
+    assert payload["worker"] == "crawl"
+    assert payload["status"] == "partial"
+    assert payload["trigger"] == "scheduled"
+    assert payload["error_message"] == "1 feed failed"
+    assert payload["stats"]["articles_written"] == 7
+
+
+def test_summary_json_is_written_even_when_the_run_failed(tmp_path: Path) -> None:
+    # The failure path is exactly when a scheduler most wants the summary.
+    target = tmp_path / "summary.jsonl"
+    storage = FakeStorage()
+
+    exit_code = _run(
+        ScriptedWorker(RuntimeError("feed host is down")),
+        storage,
+        _args(summary_json=str(target)),
+    )
+
+    assert exit_code == EXIT_FAILED
+    payload = json.loads(target.read_text().splitlines()[0])
+    assert payload["status"] == "failed"
+    assert payload["error_message"] == "feed host is down"
+    assert payload["stats"] is None
+
+
+def test_a_summary_that_cannot_be_written_does_not_fail_the_run(
+    tmp_path: Path,
+) -> None:
+    storage = FakeStorage()
+
+    exit_code = _run(
+        ScriptedWorker(RunOutcome("succeeded", IngestRunStats())),
+        storage,
+        _args(summary_json=str(tmp_path / "missing-dir" / "summary.jsonl")),
+    )
+
+    assert exit_code == EXIT_OK
+    assert ("finish", 1, "succeeded", None) in storage.calls
 
 
 def test_stale_after_never_dips_below_the_configured_floor() -> None:

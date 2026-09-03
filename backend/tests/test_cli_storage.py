@@ -52,6 +52,52 @@ def test_persistence_and_worker_output_flags_are_exposed() -> None:
         )
 
 
+def _parse(argv: list[str]) -> argparse.Namespace:
+    parser = worker_cli.build_parser(_settings())
+    args = parser.parse_args(argv)
+    worker_cli.validate(args, parser)
+    return args
+
+
+def test_scheduler_flags_are_available_to_every_worker_command() -> None:
+    for command in ("crawl", "embed", "classify", "cluster"):
+        args = _parse(
+            [command, "--once", "--exit-busy", "99", "--summary-json", "-",
+             "--trigger", "scheduled"]
+        )
+        assert args.exit_busy == 99
+        assert args.summary_json == "-"
+        # An explicit trigger is what keeps a scheduled run out of the
+        # backfill bucket when the DAG also passes a window.
+        assert args.trigger == "scheduled"
+
+    # taxonomy-rebuild takes the same advisory lock, so it needs the same flag.
+    assert _parse(["taxonomy-rebuild", "--exit-busy", "99"]).exit_busy == 99
+
+
+def test_exit_busy_defaults_to_success_and_rejects_the_failure_code() -> None:
+    assert _parse(["embed", "--once"]).exit_busy == 0
+
+    for bad in ("1", "256", "-1"):
+        with pytest.raises(SystemExit):
+            _parse(["embed", "--once", "--exit-busy", bad])
+
+
+def test_queue_status_defaults_to_a_human_readable_daily_window() -> None:
+    default = _parse(["queue-status"])
+    assert default.as_json is False
+    assert default.fail_on_alert is False
+    assert default.runs_window == 24
+
+    monitoring = _parse(["queue-status", "--json", "--fail-on-alert",
+                         "--runs-window", "6"])
+    assert (monitoring.as_json, monitoring.fail_on_alert) == (True, True)
+    assert monitoring.runs_window == 6
+
+    with pytest.raises(SystemExit):
+        _parse(["queue-status", "--runs-window", "0"])
+
+
 def test_block_page_cleanup_is_dry_run_by_default() -> None:
     parser = worker_cli.build_parser(_settings())
 

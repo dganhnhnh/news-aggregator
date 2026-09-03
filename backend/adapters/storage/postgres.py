@@ -62,13 +62,16 @@ from models.storage_models import (
     FailureKind,
     FailureTarget,
     FeedFailureOutcome,
+    FailureQueueStatus,
     FeedPollTarget,
     FeedSeed,
     FlatTaxonomyNode,
     HistoricalBlockPage,
+    QueueStatusSnapshot,
     RawArticle,
     RunStatus,
     SourceItem,
+    StageQueueStatus,
     StoredCrawlFailure,
     StorageWriteSummary,
     StoryDetailItem,
@@ -85,6 +88,7 @@ from models.storage_models import (
     TopicRefItem,
     TopicSignalSnapshot,
     TopicSnapshot,
+    WorkerRunCount,
     WorkerTrigger,
 )
 from services.raw_storage import build_excerpt, source_slug
@@ -510,6 +514,101 @@ class PostgresRawStorage:
         if is_dataclass(stats) and not isinstance(stats, type):
             return asdict(stats)
         return dict(stats)
+
+    async def queue_status(self, *, runs_window_hours: int = 24) -> QueueStatusSnapshot:
+        """Read every operational queue in one pass, without writing anything.
+
+        Exists so monitoring -- a scheduler task, a smoke check -- goes through
+        the repository like every other reader instead of opening its own
+        connection and querying `processing_jobs` directly.
+        """
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=runs_window_hours)
+        async with self._engine.connect() as connection:
+            stage_rows = (
+                await connection.execute(
+                    select(
+                        processing_jobs.c.stage,
+                        processing_jobs.c.state,
+                        func.count().label("count"),
+                        func.min(processing_jobs.c.available_at).label("oldest"),
+                    ).group_by(processing_jobs.c.stage, processing_jobs.c.state)
+                )
+            ).all()
+            failure_rows = (
+                await connection.execute(
+                    select(
+                        crawl_failures.c.failure_kind,
+                        func.count().label("total"),
+                        func.count()
+                        .filter(crawl_failures.c.dead_lettered_at.isnot(None))
+                        .label("dead_lettered"),
+                        func.count()
+                        .filter(
+                            crawl_failures.c.dead_lettered_at.is_(None),
+                            crawl_failures.c.next_retry_at <= now,
+                        )
+                        .label("due_now"),
+                        func.max(crawl_failures.c.attempt_count).label("max_attempts"),
+                    )
+                    .group_by(crawl_failures.c.failure_kind)
+                    .order_by(crawl_failures.c.failure_kind)
+                )
+            ).all()
+            run_rows = (
+                await connection.execute(
+                    select(
+                        worker_runs.c.worker,
+                        worker_runs.c.status,
+                        func.count().label("count"),
+                    )
+                    .where(worker_runs.c.started_at >= cutoff)
+                    .group_by(worker_runs.c.worker, worker_runs.c.status)
+                    .order_by(worker_runs.c.worker, worker_runs.c.status)
+                )
+            ).all()
+
+        counts: dict[str, dict[str, int]] = defaultdict(dict)
+        oldest_pending: dict[str, datetime] = {}
+        for row in stage_rows:
+            counts[row.stage][row.state] = int(row.count)
+            if row.state == "pending" and row.oldest is not None:
+                oldest_pending[row.stage] = row.oldest
+
+        stages = tuple(
+            StageQueueStatus(
+                stage=stage,
+                pending=states.get("pending", 0),
+                running=states.get("running", 0),
+                done=states.get("done", 0),
+                dead_letter=states.get("dead_letter", 0),
+                oldest_pending_at=oldest_pending.get(stage),
+            )
+            for stage, states in sorted(counts.items())
+        )
+        return QueueStatusSnapshot(
+            captured_at=now,
+            runs_window_hours=runs_window_hours,
+            stages=stages,
+            failures=tuple(
+                FailureQueueStatus(
+                    failure_kind=row.failure_kind,
+                    total=int(row.total),
+                    dead_lettered=int(row.dead_lettered),
+                    due_now=int(row.due_now),
+                    max_attempts=int(row.max_attempts or 0),
+                )
+                for row in failure_rows
+            ),
+            runs=tuple(
+                WorkerRunCount(
+                    worker=row.worker,
+                    status=row.status,
+                    count=int(row.count),
+                )
+                for row in run_rows
+            ),
+        )
 
     @staticmethod
     async def _ensure_sources(

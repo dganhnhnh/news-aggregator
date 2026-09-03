@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from asyncio import to_thread
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +27,13 @@ from services.taxonomy import (
     to_seed_dict,
     validate_seed,
 )
-from workers.base import EXIT_FAILED, EXIT_OK, Worker, stale_after_for
+from workers.base import (
+    EXIT_FAILED,
+    EXIT_OK,
+    Worker,
+    exit_busy_for,
+    stale_after_for,
+)
 from workers.classify import ClassifyWorker
 from workers.crawl import CrawlWorker
 from workers.cluster import ClusterWorker
@@ -79,6 +88,24 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--trigger",
         choices=("scheduled", "manual", "backfill"),
         help="Override how this run is labelled in worker_runs",
+    )
+    parser.add_argument(
+        "--exit-busy",
+        type=int,
+        default=0,
+        metavar="CODE",
+        help=(
+            "Exit with CODE instead of 0 when another run holds the lock, so a "
+            "scheduler can report the run as skipped rather than successful"
+        ),
+    )
+    parser.add_argument(
+        "--summary-json",
+        metavar="PATH",
+        help=(
+            "Append one JSON line describing the finished run; '-' or "
+            "/dev/stdout writes it as the last line of stdout"
+        ),
     )
 
 
@@ -378,6 +405,39 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     taxonomy_rebuild.add_argument(
         "--topic", metavar="SLUG", help="Rebuild only this topic; default is every active topic"
     )
+    taxonomy_rebuild.add_argument(
+        "--exit-busy",
+        type=int,
+        default=0,
+        metavar="CODE",
+        help="Exit with CODE when another rebuild holds the lock",
+    )
+
+    queue_status = subparsers.add_parser(
+        "queue-status",
+        help="Report processing_jobs, crawl_failures and worker_runs state",
+    )
+    queue_status.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit one JSON object on stdout instead of human-readable lines",
+    )
+    queue_status.add_argument(
+        "--runs-window",
+        type=int,
+        default=24,
+        metavar="HOURS",
+        help="How far back to summarise worker_runs",
+    )
+    queue_status.add_argument(
+        "--fail-on-alert",
+        action="store_true",
+        help=(
+            "Exit 1 when the snapshot contains a dead-lettered job, a "
+            "dead-lettered failure, or a failed/abandoned run in the window"
+        ),
+    )
 
     enable_feed = subparsers.add_parser(
         "enable-feed", help="Clear a feed's disabled_at"
@@ -459,7 +519,22 @@ def _validate_cluster(args: argparse.Namespace, parser: argparse.ArgumentParser)
         parser.error("--limit must not be negative")
 
 
+def _validate_exit_busy(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    code = getattr(args, "exit_busy", 0)
+    if not 0 <= code <= 255:
+        parser.error("--exit-busy must be between 0 and 255")
+    if code == EXIT_FAILED:
+        # Reusing the failure code would make "another run holds the lock"
+        # indistinguishable from "this run failed", which is the whole point
+        # of the flag.
+        parser.error(f"--exit-busy must not be {EXIT_FAILED}, which means failure")
+
+
 def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.command in WORKERS or args.command == "taxonomy-rebuild":
+        _validate_exit_busy(args, parser)
     if args.command in WORKERS:
         if args.interval is not None and args.interval <= 0:
             parser.error("--interval must be positive")
@@ -474,6 +549,9 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     elif args.command in {"replay", "cleanup-block-pages"}:
         if args.limit <= 0:
             parser.error("--limit must be positive")
+    elif args.command == "queue-status":
+        if args.runs_window <= 0:
+            parser.error("--runs-window must be positive")
     elif args.command in {"taxonomy-import", "taxonomy-export"}:
         if args.command == "taxonomy-import" and not args.file.is_file():
             parser.error(f"Taxonomy seed file not found: {args.file}")
@@ -638,13 +716,16 @@ async def _dispatch_admin(
         )
         return EXIT_OK
 
+    if args.command == "queue-status":
+        return await _report_queue_status(storage, args)
+
     if args.command == "taxonomy-rebuild":
         async with storage.worker_lock("taxonomy-rebuild") as acquired:
             if not acquired:
                 logger.info(
                     "Another taxonomy-rebuild run holds the lock; exiting without doing work"
                 )
-                return EXIT_OK
+                return exit_busy_for(args)
             run_id = await storage.start_run(
                 worker="taxonomy-rebuild",
                 trigger="manual",
@@ -668,6 +749,67 @@ async def _dispatch_admin(
         return EXIT_OK
 
     raise AssertionError(f"unhandled admin command: {args.command}")
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+async def _report_queue_status(
+    storage: PostgresRawStorage, args: argparse.Namespace
+) -> int:
+    """Print one read-only snapshot of every operational queue.
+
+    The JSON form is what a scheduler consumes; the default form is what
+    replaces the ad-hoc `psql` one-liners in the README.
+    """
+    snapshot = await storage.queue_status(runs_window_hours=args.runs_window)
+    alerts = snapshot.alerts()
+
+    if args.as_json:
+        payload = asdict(snapshot) | {"alerts": alerts}
+        # Single line, on stdout, so `--json` composes with XCom and with jq.
+        # Timestamps go out as ISO-8601, matching `--summary-json`; `str()` on
+        # a datetime would emit a space where the 'T' belongs.
+        print(json.dumps(payload, default=_json_default, ensure_ascii=False))
+    else:
+        for stage in snapshot.stages:
+            logger.info(
+                "stage %-9s pending=%-6d running=%-4d done=%-7d dead_letter=%-4d "
+                "oldest_pending=%s",
+                stage.stage,
+                stage.pending,
+                stage.running,
+                stage.done,
+                stage.dead_letter,
+                stage.oldest_pending_at.isoformat() if stage.oldest_pending_at else "-",
+            )
+        for failure in snapshot.failures:
+            logger.info(
+                "failures %-8s total=%-6d due_now=%-5d dead_lettered=%-4d "
+                "max_attempts=%d",
+                failure.failure_kind,
+                failure.total,
+                failure.due_now,
+                failure.dead_lettered,
+                failure.max_attempts,
+            )
+        for run in snapshot.runs:
+            logger.info(
+                "runs(%dh) %-16s %-10s %d",
+                snapshot.runs_window_hours,
+                run.worker,
+                run.status,
+                run.count,
+            )
+        for alert in alerts:
+            logger.warning("ALERT: %s", alert)
+
+    if alerts and args.fail_on_alert:
+        return EXIT_FAILED
+    return EXIT_OK
 
 
 async def _rebuild_taxonomy_prototypes(

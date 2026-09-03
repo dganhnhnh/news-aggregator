@@ -526,3 +526,98 @@ class ClassifyRunStats:
     clusters_refreshed: int = 0
     missing_embedding: int = 0
     failed: int = 0
+
+
+@dataclass(frozen=True)
+class StageQueueStatus:
+    """How much work is waiting for one `processing_jobs` stage.
+
+    `oldest_pending_at` is the signal that matters operationally: a growing
+    `pending` count with a recent oldest entry is a burst, while an old one
+    means the stage has stopped draining.
+    """
+
+    stage: str
+    pending: int = 0
+    running: int = 0
+    done: int = 0
+    dead_letter: int = 0
+    oldest_pending_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class FailureQueueStatus:
+    failure_kind: str
+    total: int = 0
+    dead_lettered: int = 0
+    due_now: int = 0
+    max_attempts: int = 0
+
+
+@dataclass(frozen=True)
+class WorkerRunCount:
+    worker: str
+    status: RunStatus
+    count: int
+
+
+@dataclass(frozen=True)
+class QueueStatusSnapshot:
+    """A point-in-time read of every operational queue.
+
+    Read-only by construction: nothing here writes, so a monitoring caller can
+    run it as often as it likes.
+    """
+
+    captured_at: datetime
+    runs_window_hours: int
+    stages: tuple[StageQueueStatus, ...] = ()
+    failures: tuple[FailureQueueStatus, ...] = ()
+    runs: tuple[WorkerRunCount, ...] = ()
+
+    @property
+    def dead_letter_jobs(self) -> int:
+        return sum(stage.dead_letter for stage in self.stages)
+
+    @property
+    def dead_lettered_failures(self) -> int:
+        return sum(failure.dead_lettered for failure in self.failures)
+
+    @property
+    def abandoned_runs(self) -> int:
+        return sum(run.count for run in self.runs if run.status == "abandoned")
+
+    @property
+    def failed_runs(self) -> int:
+        return sum(run.count for run in self.runs if run.status == "failed")
+
+    def alerts(self) -> list[str]:
+        """Point-in-time conditions worth failing a monitoring task on.
+
+        Queue growth is deliberately absent: it needs history, which belongs to
+        whatever is doing the sampling, not to a single snapshot.
+        """
+        problems: list[str] = []
+        if self.abandoned_runs:
+            problems.append(
+                f"{self.abandoned_runs} abandoned run(s) in the last "
+                f"{self.runs_window_hours}h; a worker process died mid-run"
+            )
+        if self.failed_runs:
+            problems.append(
+                f"{self.failed_runs} failed run(s) in the last "
+                f"{self.runs_window_hours}h"
+            )
+        for stage in self.stages:
+            if stage.dead_letter:
+                problems.append(
+                    f"stage {stage.stage!r} has {stage.dead_letter} dead-lettered "
+                    f"job(s); replay them with `news-worker replay --stage {stage.stage}`"
+                )
+        for failure in self.failures:
+            if failure.dead_lettered:
+                problems.append(
+                    f"{failure.dead_lettered} dead-lettered {failure.failure_kind} "
+                    "failure(s); replay them with `news-worker replay --failures`"
+                )
+        return problems

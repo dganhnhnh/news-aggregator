@@ -1,0 +1,159 @@
+# Airflow 3.3.1 (LocalExecutor) driving the news-radar workers.
+#
+#   docker compose --env-file .env \
+#     -f deployments/docker-compose.yml \
+#     -f deployments/docker-compose.airflow.yml up -d
+#
+# The application database in docker-compose.yml is *not* reused as Airflow's
+# metadata database: Airflow owns its schema with its own migrations, and a
+# `news-worker` run must never be able to lock or bloat the tables the
+# scheduler needs to stay responsive.
+#
+# The scheduler talks to the host Docker daemon and starts one
+# `news-radar-worker` container per task, so build that image first:
+#   docker build -f deployments/Dockerfile.worker -t news-radar-worker:latest .
+
+name: news-radar
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.3.1-python3.12
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__CORE__PARALLELISM: "8"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:-airflow}@airflow-db:5432/airflow
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-change-me-before-any-shared-host}
+    # `worker()` renders this into every container's DATABASE_URL, so the DAGs
+    # never carry a credential of their own.
+    AIRFLOW_CONN_NEWS_RADAR_PG: postgresql://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@db:5432/${POSTGRES_DB:-news_radar}
+    # Read by _common.py to bind-mount the repo's data/ into each worker.
+    NEWS_RADAR_REPO: ${NEWS_RADAR_REPO:-/opt/news-radar}
+    NEWS_RADAR_WORKER_IMAGE: ${NEWS_RADAR_WORKER_IMAGE:-news-radar-worker:latest}
+    NEWS_RADAR_DOCKER_NETWORK: ${NEWS_RADAR_DOCKER_NETWORK:-news-radar_default}
+  volumes:
+    - ../orchestration/dags:/opt/airflow/dags:ro
+    - airflow_logs:/opt/airflow/logs
+    # DockerOperator starts sibling containers on the host daemon; it does not
+    # run Docker inside this one.
+    - /var/run/docker.sock:/var/run/docker.sock
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  airflow-db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+    volumes:
+      - airflow_metadata_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    # Root, because it has to chown the mounted log volume and install the
+    # provider packages before the long-running services start.
+    user: "0:0"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+      _PIP_ADDITIONAL_REQUIREMENTS: >-
+        apache-airflow-providers-docker==4.5.9
+        apache-airflow-providers-postgres==7.0.2
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs
+        /entrypoint airflow version
+        # One slot each, which is the whole concurrency model: a worker takes a
+        # PostgreSQL advisory lock, so a second copy could only skip. Four
+        # pools rather than one so classify and cluster still overlap.
+        for pool in news_crawl news_embed news_cluster news_classify; do
+          /entrypoint airflow pools set "$$pool" 1 "news-radar $$pool worker"
+        done
+    restart: "no"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    # The docker.sock group differs per host (docker on Linux, staff/0 on
+    # Docker Desktop); override AIRFLOW_DOCKER_GID when the socket is not
+    # readable by the container's supplementary groups.
+    group_add:
+      - ${AIRFLOW_DOCKER_GID:-999}
+    environment:
+      <<: *airflow-common-env
+      _PIP_ADDITIONAL_REQUIREMENTS: >-
+        apache-airflow-providers-docker==4.5.9
+        apache-airflow-providers-postgres==7.0.2
+    command: scheduler
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-apiserver:
+    <<: *airflow-common
+    environment:
+      <<: *airflow-common-env
+      _PIP_ADDITIONAL_REQUIREMENTS: >-
+        apache-airflow-providers-docker==4.5.9
+        apache-airflow-providers-postgres==7.0.2
+    command: api-server
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    environment:
+      <<: *airflow-common-env
+      _PIP_ADDITIONAL_REQUIREMENTS: >-
+        apache-airflow-providers-docker==4.5.9
+        apache-airflow-providers-postgres==7.0.2
+    command: dag-processor
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  airflow_metadata_data:
+    name: news_radar_airflow_metadata
+  airflow_logs:
+    name: news_radar_airflow_logs
+  # Downloaded once by the first embed/classify run and reused by every
+  # worker container after that.
+  model_cache:
+    name: news_radar_model_cache
