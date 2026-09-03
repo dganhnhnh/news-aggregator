@@ -1,6 +1,6 @@
 # Runs one `news-worker` subcommand per container, launched by Airflow's
 # DockerOperator. Build from the repo root:
-#   docker build -f deployments/Dockerfile.worker -t news-radar-worker:latest .
+#   docker build -f deployments/Dockerfile.worker -t news-radar-worker:<git-sha> .
 #
 # Three things make this image different from Dockerfile.api, and all three
 # matter for a scheduled one-shot process:

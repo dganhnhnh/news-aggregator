@@ -63,16 +63,25 @@ def test_scheduler_flags_are_available_to_every_worker_command() -> None:
     for command in ("crawl", "embed", "classify", "cluster"):
         args = _parse(
             [command, "--once", "--exit-busy", "99", "--summary-json", "-",
+             "--max-runtime", "25m",
              "--trigger", "scheduled"]
         )
         assert args.exit_busy == 99
         assert args.summary_json == "-"
+        assert args.max_runtime == "25m"
         # An explicit trigger is what keeps a scheduled run out of the
         # backfill bucket when the DAG also passes a window.
         assert args.trigger == "scheduled"
 
     # taxonomy-rebuild takes the same advisory lock, so it needs the same flag.
     assert _parse(["taxonomy-rebuild", "--exit-busy", "99"]).exit_busy == 99
+
+
+def test_max_runtime_rejects_invalid_or_looping_worker_values() -> None:
+    with pytest.raises(SystemExit):
+        _parse(["embed", "--max-runtime", "soon"])
+    with pytest.raises(SystemExit):
+        _parse(["embed", "--max-runtime", "25m", "--interval", "60"])
 
 
 def test_exit_busy_defaults_to_success_and_rejects_the_failure_code() -> None:

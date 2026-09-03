@@ -11,17 +11,26 @@
 #
 # The scheduler talks to the host Docker daemon and starts one
 # `news-radar-worker` container per task, so build that image first:
-#   docker build -f deployments/Dockerfile.worker -t news-radar-worker:latest .
+#   docker build -f deployments/Dockerfile.worker -t news-radar-worker:<git-sha> .
 
 name: news-radar
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:3.3.1-python3.12
+  image: news-radar-airflow:3.3.1
+  build:
+    context: ..
+    dockerfile: deployments/Dockerfile.airflow
   user: "${AIRFLOW_UID:-50000}:0"
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    # DAG files share the operator factory as a top-level `_common` module.
+    # Make that import contract explicit instead of relying on version-specific
+    # DagBag sys.path side effects.
+    PYTHONPATH: /opt/airflow/dags
     AIRFLOW__CORE__PARALLELISM: "8"
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:-airflow}@airflow-db:5432/airflow
     AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-change-me-before-any-shared-host}
@@ -30,7 +39,9 @@ x-airflow-common: &airflow-common
     AIRFLOW_CONN_NEWS_RADAR_PG: postgresql://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@db:5432/${POSTGRES_DB:-news_radar}
     # Read by _common.py to bind-mount the repo's data/ into each worker.
     NEWS_RADAR_REPO: ${NEWS_RADAR_REPO:-/opt/news-radar}
-    NEWS_RADAR_WORKER_IMAGE: ${NEWS_RADAR_WORKER_IMAGE:-news-radar-worker:latest}
+    # `dev` is only a local fallback. Set an immutable Git SHA tag or digest
+    # in every deployed .env so an old dagrun remains reproducible.
+    NEWS_RADAR_WORKER_IMAGE: ${NEWS_RADAR_WORKER_IMAGE:-news-radar-worker:dev}
     NEWS_RADAR_DOCKER_NETWORK: ${NEWS_RADAR_DOCKER_NETWORK:-news-radar_default}
   volumes:
     - ../orchestration/dags:/opt/airflow/dags:ro
@@ -70,9 +81,6 @@ services:
       _AIRFLOW_WWW_USER_CREATE: "true"
       _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
       _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
-      _PIP_ADDITIONAL_REQUIREMENTS: >-
-        apache-airflow-providers-docker==4.5.9
-        apache-airflow-providers-postgres==7.0.2
     entrypoint: /bin/bash
     command:
       - -c
@@ -96,9 +104,6 @@ services:
       - ${AIRFLOW_DOCKER_GID:-999}
     environment:
       <<: *airflow-common-env
-      _PIP_ADDITIONAL_REQUIREMENTS: >-
-        apache-airflow-providers-docker==4.5.9
-        apache-airflow-providers-postgres==7.0.2
     command: scheduler
     depends_on:
       airflow-db:
@@ -116,9 +121,6 @@ services:
     <<: *airflow-common
     environment:
       <<: *airflow-common-env
-      _PIP_ADDITIONAL_REQUIREMENTS: >-
-        apache-airflow-providers-docker==4.5.9
-        apache-airflow-providers-postgres==7.0.2
     command: api-server
     ports:
       - "${AIRFLOW_PORT:-8080}:8080"
@@ -138,9 +140,6 @@ services:
     <<: *airflow-common
     environment:
       <<: *airflow-common-env
-      _PIP_ADDITIONAL_REQUIREMENTS: >-
-        apache-airflow-providers-docker==4.5.9
-        apache-airflow-providers-postgres==7.0.2
     command: dag-processor
     depends_on:
       airflow-db:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from airflow.sdk import Asset, Param, dag
+from airflow.sdk import Asset, Param, dag, get_current_context, task
 
 from _common import (
     EXIT_BUSY,
@@ -17,6 +17,7 @@ from _common import (
     TAXONOMY_SEED_PATH,
     admin,
     dag_defaults,
+    topic_invariant_check,
     worker,
 )
 
@@ -52,6 +53,13 @@ WINDOW = "{{ params.window }}"
             description="Maps to `taxonomy-import --prune`; logs what it will "
             "deactivate before writing",
         ),
+        "reprocess_clusters": Param(
+            False,
+            type="boolean",
+            title="Reprocess missing cluster memberships",
+            description="Normally unnecessary for a taxonomy-only change; "
+            "enable only when cluster membership also needs repair",
+        ),
     },
     doc_md=__doc__,
     **dag_defaults(),
@@ -76,7 +84,6 @@ def news_taxonomy_refresh():
         "--exit-busy",
         str(EXIT_BUSY),
         timeout=timedelta(minutes=20),
-        skip_on_exit_code=EXIT_BUSY,
     )
 
     # --stale, not --reprocess: it re-queues only articles never classified or
@@ -85,43 +92,63 @@ def news_taxonomy_refresh():
     classify_stale = worker(
         "classify_stale",
         "classify",
+        "--strict",
         "--stale",
         "--last",
         WINDOW,
         pool="news_classify",
         timeout=timedelta(hours=2),
         trigger="manual",
+        busy_is_failure=True,
     )
+
+    @task.branch
+    def choose_cluster_reprocess() -> str:
+        return (
+            "cluster_reprocess"
+            if get_current_context()["params"]["reprocess_clusters"]
+            else "skip_cluster_reprocess"
+        )
+
+    @task
+    def skip_cluster_reprocess() -> None:
+        """Explicitly record that taxonomy changes do not imply reclustering."""
 
     # Picks up embedded articles in the window that never landed in a cluster.
     cluster_reprocess = worker(
         "cluster_reprocess",
         "cluster",
+        "--strict",
         "--reprocess",
         "--last",
         WINDOW,
         pool="news_cluster",
         timeout=timedelta(hours=2),
         trigger="manual",
+        busy_is_failure=True,
     )
 
     cluster_merge = worker(
         "cluster_merge",
         "cluster",
+        "--strict",
         "--merge-only",
         "--last",
         WINDOW,
         pool="news_cluster",
         timeout=timedelta(minutes=30),
         trigger="manual",
+        busy_is_failure=True,
+        trigger_rule="none_failed_min_one_success",
     )
 
-    # Same rule as in news_semantic: `cluster_topics` is fully replaced from
-    # `article_topics`, so this must be the last task and must still run when
-    # an upstream task skipped on a busy lock.
+    # Same aggregation path as news_semantic. Manual consistency work treats a
+    # busy lock as failure; the invariant check below is the final task and the
+    # only one that publishes the stories Asset.
     refresh_cluster_topics = worker(
         "refresh_cluster_topics",
         "classify",
+        "--strict",
         "--refresh-clusters",
         "--last",
         WINDOW,
@@ -129,12 +156,17 @@ def news_taxonomy_refresh():
         timeout=timedelta(minutes=30),
         trigger="manual",
         trigger_rule="none_failed_min_one_success",
-        outlets=[STORIES],
+        busy_is_failure=True,
     )
+    validate_topic_invariants = topic_invariant_check(outlets=[STORIES])
 
-    taxonomy_import >> taxonomy_rebuild >> [classify_stale, cluster_reprocess]
-    cluster_reprocess >> cluster_merge
+    choose_reprocess = choose_cluster_reprocess()
+    skip_reprocess = skip_cluster_reprocess()
+    taxonomy_import >> taxonomy_rebuild >> [classify_stale, choose_reprocess]
+    choose_reprocess >> [cluster_reprocess, skip_reprocess]
+    [cluster_reprocess, skip_reprocess] >> cluster_merge
     [classify_stale, cluster_merge] >> refresh_cluster_topics
+    refresh_cluster_topics >> validate_topic_invariants
 
 
 news_taxonomy_refresh()

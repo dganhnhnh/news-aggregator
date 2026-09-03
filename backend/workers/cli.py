@@ -38,7 +38,7 @@ from workers.classify import ClassifyWorker
 from workers.crawl import CrawlWorker
 from workers.cluster import ClusterWorker
 from workers.embed import EmbedWorker
-from workers.window import RunWindow, build_window
+from workers.window import RunWindow, build_window, parse_duration
 
 
 logger = get_logger(__name__)
@@ -105,6 +105,14 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Append one JSON line describing the finished run; '-' or "
             "/dev/stdout writes it as the last line of stdout"
+        ),
+    )
+    parser.add_argument(
+        "--max-runtime",
+        metavar="DURATION",
+        help=(
+            "Request a cooperative stop after a duration such as 25m or 2h; "
+            "the current chunk is checkpointed before the worker exits"
         ),
     )
 
@@ -540,6 +548,13 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             parser.error("--interval must be positive")
         if args.once and args.interval is not None:
             parser.error("--once and --interval are mutually exclusive")
+        if args.max_runtime is not None:
+            try:
+                parse_duration(args.max_runtime)
+            except ValueError as exc:
+                parser.error(str(exc))
+            if args.interval is not None:
+                parser.error("--max-runtime cannot be combined with --interval")
         if args.command == "crawl":
             _validate_crawl(args, parser)
         elif args.command in {"embed", "classify"}:

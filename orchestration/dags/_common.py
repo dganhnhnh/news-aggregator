@@ -3,7 +3,7 @@
 Every task in every DAG is "one argv for `news-worker`". Keeping that shape in
 a single factory is what makes the choice of `DockerOperator` reversible: a
 move to `BashOperator` or `KubernetesPodOperator` rewrites `worker()` here and
-leaves the four DAG files untouched. So `DockerOperator` must not be imported
+leaves the DAG files untouched. So `DockerOperator` must not be imported
 anywhere else under `orchestration/`.
 
 See docs/orchestration-airflow.md §5 for the reasoning.
@@ -16,6 +16,7 @@ from datetime import timedelta
 
 import pendulum
 from airflow.providers.docker.operators.docker import DockerOperator
+from airflow.providers.common.sql.operators.sql import SQLCheckOperator
 from docker.types import Mount
 
 
@@ -33,7 +34,7 @@ PG_CONN_ID = "news_radar_pg"
 # `news-worker --exit-busy` rejects 1 for exactly this reason.
 EXIT_BUSY = 99
 
-WORKER_IMAGE = os.environ.get("NEWS_RADAR_WORKER_IMAGE", "news-radar-worker:latest")
+WORKER_IMAGE = os.environ.get("NEWS_RADAR_WORKER_IMAGE", "news-radar-worker:dev")
 DOCKER_NETWORK = os.environ.get("NEWS_RADAR_DOCKER_NETWORK", "news-radar_default")
 REPO = os.environ.get("NEWS_RADAR_REPO", "/opt/news-radar")
 
@@ -50,13 +51,21 @@ DEFAULT_ARGS = {
 }
 
 # Rendered by DockerOperator's Jinja pass, not at import time.
-_DATABASE_URL = "{{ conn." + PG_CONN_ID + ".get_uri() }}"
+_DATABASE_URL = (
+    "{{ conn."
+    + PG_CONN_ID
+    + ".get_uri()"
+    + " | replace('postgres://', 'postgresql+asyncpg://')"
+    + " | replace('postgresql://', 'postgresql+asyncpg://') }}"
+)
 
 COMMON = dict(
     image=WORKER_IMAGE,
     docker_url="unix://var/run/docker.sock",
     network_mode=DOCKER_NETWORK,
-    auto_remove="force",
+    # Preserve failed containers for diagnosis. A separate cleanup policy can
+    # remove them after logs and the image revision have been captured.
+    auto_remove="success",
     mount_tmp_dir=False,
     # Chromium dies at random on the 64MB default; crawl4ai is the reason this
     # is set for every task rather than only for crawl.
@@ -69,6 +78,10 @@ COMMON = dict(
         "DATABASE_URL": _DATABASE_URL,
         "FASTEMBED_CACHE_PATH": "/models",
         "LOG_LEVEL": "{{ var.value.get('news_radar_log_level', 'INFO') }}",
+        "NEWS_RADAR_ORCHESTRATION_ID": "{{ dag.dag_id }}:{{ run_id }}",
+        "NEWS_RADAR_AIRFLOW_DAG_ID": "{{ dag.dag_id }}",
+        "NEWS_RADAR_AIRFLOW_TASK_ID": "{{ task.task_id }}",
+        "NEWS_RADAR_IMAGE_REVISION": WORKER_IMAGE,
     },
 )
 
@@ -99,13 +112,14 @@ def worker(
     pool: str,
     timeout: timedelta,
     trigger: str = "scheduled",
+    busy_is_failure: bool = False,
     **kwargs,
 ) -> DockerOperator:
     """One run of one of the four workers (crawl, embed, classify, cluster).
 
-    `--trigger` is always passed explicitly: `_trigger_for` labels any run
-    given `--since/--until` as a backfill, and a scheduled DAG run that
-    happens to use an explicit window is not a backfill.
+    `--trigger` is always passed explicitly. The hard Airflow timeout is five
+    minutes longer than the worker-owned cooperative budget, leaving time to
+    checkpoint the active chunk and emit its final JSON summary.
     """
     command = [
         *argv,
@@ -118,15 +132,18 @@ def worker(
         # DockerOperator pushes to XCom.
         "--summary-json",
         "/dev/stdout",
+        "--max-runtime",
+        f"{max(1, int(timeout.total_seconds() // 60) - 5)}m",
     ]
     kwargs.setdefault("do_xcom_push", True)
     return _container(
         task_id,
         command,
         timeout=timeout,
-        # Turns "another run holds the lock" into a visibly skipped task
-        # instead of a success that quietly did nothing.
-        skip_on_exit_code=EXIT_BUSY,
+        # Scheduled runs treat lock contention as a visible skip. Manual
+        # consistency operations set busy_is_failure so the operator must
+        # explicitly retry instead of receiving a deceptively green dagrun.
+        skip_on_exit_code=None if busy_is_failure else EXIT_BUSY,
         pool=pool,
         **kwargs,
     )
@@ -165,3 +182,43 @@ def dag_defaults(**overrides):
     )
     defaults.update(overrides)
     return defaults
+
+
+def topic_invariant_check(
+    task_id: str = "validate_topic_invariants", *, outlets=None
+) -> SQLCheckOperator:
+    """Fail when materialized topic labels disagree with their source rows."""
+    return SQLCheckOperator(
+        task_id=task_id,
+        conn_id=PG_CONN_ID,
+        retries=1,
+        execution_timeout=timedelta(minutes=5),
+        outlets=outlets or [],
+        sql="""
+        SELECT
+          NOT EXISTS (
+            SELECT 1
+            FROM article_classifications ac
+            WHERE ac.assigned_count <> (
+              SELECT count(*)
+              FROM article_topics article_topic
+              WHERE article_topic.article_id = ac.article_id
+                AND article_topic.assigned
+            )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM cluster_topics ct
+            WHERE ct.assigned
+              AND NOT EXISTS (
+                SELECT 1
+                FROM cluster_members cm
+                JOIN article_topics article_topic
+                  ON article_topic.article_id = cm.article_id
+                WHERE cm.cluster_id = ct.cluster_id
+                  AND article_topic.topic_id = ct.topic_id
+                  AND article_topic.assigned
+              )
+          )
+        """,
+    )

@@ -10,11 +10,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import Any, NamedTuple
 from adapters.storage import PostgresRawStorage
 from core.logger import get_logger
 from models.storage_models import RunStatus, WorkerTrigger
-from workers.window import RunWindow
+from workers.window import RunWindow, parse_duration
 
 
 logger = get_logger(__name__)
@@ -83,6 +84,36 @@ async def sleep_or_shutdown(seconds: float, event: asyncio.Event) -> None:
         await asyncio.wait_for(event.wait(), timeout=seconds)
     except asyncio.TimeoutError:
         return
+
+
+async def request_shutdown_after(
+    duration: timedelta, event: asyncio.Event, worker_name: str
+) -> None:
+    """Request a cooperative stop before the orchestrator's hard timeout."""
+    await sleep_or_shutdown(duration.total_seconds(), event)
+    if event.is_set():
+        return
+    logger.warning(
+        "%s reached its %s max runtime; stopping after the current chunk",
+        worker_name,
+        duration,
+    )
+    event.set()
+
+
+def orchestration_context() -> dict[str, str]:
+    """Read optional scheduler correlation metadata injected by the runtime."""
+    fields = {
+        "orchestration_id": "NEWS_RADAR_ORCHESTRATION_ID",
+        "dag_id": "NEWS_RADAR_AIRFLOW_DAG_ID",
+        "task_id": "NEWS_RADAR_AIRFLOW_TASK_ID",
+        "image_revision": "NEWS_RADAR_IMAGE_REVISION",
+    }
+    return {
+        key: value
+        for key, env_name in fields.items()
+        if (value := os.getenv(env_name, "").strip())
+    }
 
 
 def _json_safe(value: Any) -> Any:
@@ -194,7 +225,7 @@ class Worker(ABC):
                 trigger=_trigger_for(args, window),
                 window_start=window.start,
                 window_end=window.end,
-                params=self.run_params(args),
+                params=self._recorded_params(args),
             )
             logger.info(
                 "Started %s run %d over %s..%s",
@@ -211,8 +242,24 @@ class Worker(ABC):
                 args=args,
                 storage=storage,
             )
+            max_runtime = getattr(args, "max_runtime", None)
+            runtime_guard = (
+                asyncio.create_task(
+                    request_shutdown_after(
+                        parse_duration(max_runtime), shutdown, self.name
+                    )
+                )
+                if max_runtime
+                else None
+            )
             try:
-                outcome = await self.execute(ctx)
+                try:
+                    outcome = await self.execute(ctx)
+                finally:
+                    if runtime_guard is not None:
+                        runtime_guard.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await runtime_guard
             except asyncio.CancelledError:
                 await self._finish(
                     storage,
@@ -240,6 +287,15 @@ class Worker(ABC):
                 return EXIT_FAILED
             return EXIT_OK
 
+    def _recorded_params(self, args: argparse.Namespace) -> dict[str, Any]:
+        """Combine business flags with scheduler metadata without a migration."""
+        params = dict(self.run_params(args))
+        if max_runtime := getattr(args, "max_runtime", None):
+            params["max_runtime"] = max_runtime
+        if context := orchestration_context():
+            params["orchestration"] = context
+        return params
+
     async def _finish(
         self,
         storage: PostgresRawStorage,
@@ -260,6 +316,7 @@ class Worker(ABC):
 
         target = getattr(args, "summary_json", None)
         if target:
+            context = orchestration_context()
             emit_summary(
                 target,
                 {
@@ -271,6 +328,7 @@ class Worker(ABC):
                     "window_end": window.end.isoformat(),
                     "stats": _json_safe(outcome.stats),
                     "error_message": outcome.error_message,
+                    "orchestration": context or None,
                     "emitted_at": datetime.now(timezone.utc).isoformat(),
                 },
             )

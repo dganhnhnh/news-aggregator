@@ -11,7 +11,13 @@ from datetime import timedelta
 
 from airflow.sdk import Asset, dag
 
-from _common import JOBS_ASSET_URI, STORIES_ASSET_URI, dag_defaults, worker
+from _common import (
+    JOBS_ASSET_URI,
+    STORIES_ASSET_URI,
+    dag_defaults,
+    topic_invariant_check,
+    worker,
+)
 
 
 JOBS = Asset(JOBS_ASSET_URI)
@@ -63,8 +69,9 @@ def news_semantic():
         timeout=timedelta(minutes=15),
     )
 
-    # Always the last task, and it runs even when classify or cluster skipped
-    # on a busy lock. `cluster_topics` is derived data that
+    # Runs even when classify or cluster skipped on a busy lock. The invariant
+    # check below is the final task and publishes the Asset. `cluster_topics`
+    # is derived data that
     # `_refresh_cluster_topics_locked` replaces wholesale, so an extra refresh
     # costs nothing while a missed one leaves a story wearing a stale label.
     refresh_cluster_topics = worker(
@@ -76,12 +83,13 @@ def news_semantic():
         pool="news_classify",
         timeout=timedelta(minutes=15),
         trigger_rule="none_failed_min_one_success",
-        outlets=[STORIES],
     )
+    validate_topic_invariants = topic_invariant_check(outlets=[STORIES])
 
     embed >> [classify, cluster]
     cluster >> cluster_merge
     [classify, cluster_merge] >> refresh_cluster_topics
+    refresh_cluster_topics >> validate_topic_invariants
 
 
 news_semantic()

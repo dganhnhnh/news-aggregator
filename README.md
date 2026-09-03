@@ -237,6 +237,9 @@ row.
 - **`--summary-json PATH`:** append đúng một dòng JSON mô tả run vừa xong
   (`run_id`, `status`, `stats`, `error_message`). `-` hoặc `/dev/stdout` ghi
   vào dòng **cuối cùng** của stdout, là dòng Airflow đẩy lên XCom.
+- **`--max-runtime DURATION`:** yêu cầu worker dừng êm sau ngân sách như
+  `25m`; Airflow đặt hard timeout dài hơn 5 phút để chunk hiện tại kịp
+  checkpoint và emit summary.
 - **Tắt êm:** SIGTERM/SIGINT dừng ở ranh giới chunk kế tiếp, đóng sổ run ở
   trạng thái `partial` thay vì để kẹt `running`.
 - **Run treo:** run nào ngừng heartbeat quá `max(3 × --interval,
@@ -250,26 +253,32 @@ row.
 Thay cho việc chạy tay chuỗi lệnh ở §"Chạy flow Week 2 end-to-end". Thiết kế và
 lý do từng quyết định nằm ở [docs/orchestration-airflow.md](docs/orchestration-airflow.md).
 
-Bốn DAG trong `orchestration/dags/`, mỗi task là **một lệnh `news-worker` chạy
+Sáu DAG trong `orchestration/dags/`, mỗi task là **một lệnh `news-worker` chạy
 trong container riêng** (`DockerOperator`):
 
 | DAG | Lịch | Nội dung |
 |---|---|---|
 | `news_ingest` | `*/30 * * * *` | `preflight_db → crawl → queue_gate`, phát Asset khi có job embed pending |
-| `news_semantic` | Asset-triggered | `embed → classify ‖ cluster → cluster_merge → refresh_cluster_topics` |
-| `news_maintenance` | `0 3 * * *` | `cluster --repair`, replay dead-letter, cleanup dry-run, `queue-status --fail-on-alert` |
-| `news_taxonomy_refresh` | Trigger tay | import seed → rebuild prototype → reclassify/recluster trong cửa sổ chọn bằng param |
+| `news_semantic` | Asset-triggered | `embed → classify ‖ cluster → merge → refresh → topic invariants` |
+| `news_maintenance` | `0 3 * * *` | `cluster --repair`, cleanup dry-run, `queue-status --fail-on-alert`; không tự replay poison item |
+| `news_taxonomy_refresh` | Trigger tay | import → rebuild → reclassify; recluster là param mặc định tắt |
+| `news_backfill` | Trigger tay | full flow strict trên cửa sổ `since`/`until` tối đa 31 ngày |
+| `news_dlq_replay` | Trigger tay | preview mặc định; chỉ requeue dead letter khi `apply=true` |
 
 Khởi động (build image worker trước, vì scheduler chỉ chạy container chứ không
 build):
 
 ```bash
-docker build -f deployments/Dockerfile.worker -t news-radar-worker:latest .
+docker build -f deployments/Dockerfile.worker -t news-radar-worker:a1b2c3d .
 ```
 
 ```bash
 NEWS_RADAR_REPO=$PWD docker compose --env-file .env -f deployments/docker-compose.yml -f deployments/docker-compose.airflow.yml up -d
 ```
+
+Đặt `NEWS_RADAR_WORKER_IMAGE=news-radar-worker:a1b2c3d` trong `.env` cùng tag
+vừa build. Production phải dùng Git SHA hoặc image digest bất biến; tag `dev`
+chỉ là fallback cục bộ.
 
 UI ở `http://localhost:8080`. `NEWS_RADAR_REPO` phải là đường dẫn **trên host**
 tới repo: scheduler mount `$NEWS_RADAR_REPO/data` vào từng container worker,

@@ -41,6 +41,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "interval": None,
         "strict": False,
         "trigger": None,
+        "max_runtime": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -53,6 +54,7 @@ class FakeStorage:
         self.calls: list[Any] = []
         self._lock_acquired = lock_acquired
         self._next_run_id = 1
+        self.started_params: list[dict[str, Any]] = []
 
     async def reap_abandoned(self, worker: str, stale_after: timedelta) -> int:
         self.calls.append(("reap", worker, stale_after))
@@ -67,6 +69,7 @@ class FakeStorage:
         run_id = self._next_run_id
         self._next_run_id += 1
         self.calls.append(("start", run_id, kwargs["worker"], kwargs["trigger"]))
+        self.started_params.append(dict(kwargs["params"]))
         return run_id
 
     async def update_run(self, run_id: int, stats: Any) -> None:
@@ -200,6 +203,55 @@ def test_shutdown_between_chunks_keeps_the_first_checkpoint() -> None:
     assert ("checkpoint", 1, 1) in storage.calls
     assert ("checkpoint", 1, 2) not in storage.calls
     assert ("finish", 1, "partial", "Stopped on a shutdown signal") in storage.calls
+
+
+def test_max_runtime_requests_a_cooperative_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = FakeStorage()
+
+    class WaitingWorker(Worker):
+        name = "crawl"
+
+        async def execute(self, ctx: RunContext) -> RunOutcome:
+            await asyncio.wait_for(ctx.shutdown.wait(), timeout=1)
+            return RunOutcome("partial", IngestRunStats(), "Runtime budget reached")
+
+    monkeypatch.setattr(
+        "workers.base.parse_duration", lambda value: timedelta(milliseconds=1)
+    )
+
+    exit_code = _run(WaitingWorker(), storage, _args(max_runtime="25m"))
+
+    assert exit_code == EXIT_OK
+    assert ("finish", 1, "partial", "Runtime budget reached") in storage.calls
+    assert storage.started_params == [{"max_runtime": "25m"}]
+
+
+def test_orchestration_metadata_is_recorded_and_emitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NEWS_RADAR_ORCHESTRATION_ID", "news_semantic:run-42")
+    monkeypatch.setenv("NEWS_RADAR_AIRFLOW_DAG_ID", "news_semantic")
+    monkeypatch.setenv("NEWS_RADAR_AIRFLOW_TASK_ID", "classify")
+    monkeypatch.setenv("NEWS_RADAR_IMAGE_REVISION", "news-radar-worker:abc123")
+    target = tmp_path / "summary.jsonl"
+    storage = FakeStorage()
+
+    _run(
+        ScriptedWorker(RunOutcome("succeeded", IngestRunStats())),
+        storage,
+        _args(summary_json=str(target)),
+    )
+
+    expected = {
+        "orchestration_id": "news_semantic:run-42",
+        "dag_id": "news_semantic",
+        "task_id": "classify",
+        "image_revision": "news-radar-worker:abc123",
+    }
+    assert storage.started_params == [{"orchestration": expected}]
+    assert json.loads(target.read_text())["orchestration"] == expected
 
 
 def test_interval_loops_with_a_refreshed_implicit_window_until_shutdown(

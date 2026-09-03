@@ -1,6 +1,6 @@
 """Daily repair pass, deliberately off the ingest path.
 
-Everything here either rewrites aggregates or requeues abandoned work, so it
+Everything here either rewrites aggregates or reports abandoned work, so it
 runs at 03:00 rather than competing with a crawl for the same locks.
 """
 
@@ -32,24 +32,6 @@ def news_maintenance():
         timeout=timedelta(minutes=30),
     )
 
-    replay_dead_letter_jobs = admin(
-        "replay_dead_letter_jobs",
-        "replay",
-        "--stage",
-        "embed",
-        "--limit",
-        "200",
-        timeout=timedelta(minutes=10),
-    )
-    replay_failures = admin(
-        "replay_failures",
-        "replay",
-        "--failures",
-        "--limit",
-        "200",
-        timeout=timedelta(minutes=10),
-    )
-
     # Dry run on purpose. Quarantining rows is a judgement call an operator
     # makes after reading the log, not something a nightly DAG should decide;
     # `--apply` also needs the crawl and embed locks, which would make this
@@ -79,13 +61,7 @@ def news_maintenance():
         trigger_rule="all_done",
     )
 
-    (
-        cluster_repair
-        >> replay_dead_letter_jobs
-        >> replay_failures
-        >> cleanup_block_pages
-        >> run_health_report
-    )
+    cluster_repair >> cleanup_block_pages >> run_health_report
 
 
 news_maintenance()
