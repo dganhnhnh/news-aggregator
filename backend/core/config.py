@@ -57,7 +57,13 @@ class Settings:
     feed_offset: int
     max_retries_per_run: int
     service_interval_seconds: int
+    feed_fetch_timeout_seconds: float = 8.0
+    feed_poll_fast_interval_seconds: int = 300
     feed_poll_interval_seconds: int = 1800
+    feed_poll_slow_interval_seconds: int = 21600
+    feed_poll_min_gaps: int = 3
+    feed_poll_trim_fraction: float = 0.1
+    feed_poll_future_tolerance_seconds: float = 300.0
     feed_disable_after_failures: int = 10
     # Per-host politeness. max_concurrent_crawls bounds total browser load;
     # these bound how hard any single publisher is hit, which is what actually
@@ -103,13 +109,27 @@ class Settings:
             rss_feed_path=Path(feed_path) if feed_path else None,
             max_feeds=_env_int("MAX_FEEDS", 0),
             max_articles_per_feed=_env_int("MAX_ARTICLES_PER_FEED", 20),
-            max_concurrent_feeds=_env_int("MAX_CONCURRENT_FEEDS", 2),
-            max_concurrent_crawls=_env_int("MAX_CONCURRENT_CRAWLS", 2),
+            max_concurrent_feeds=_env_int("MAX_CONCURRENT_FEEDS", 8),
+            max_concurrent_crawls=_env_int("MAX_CONCURRENT_CRAWLS", 6),
             crawl_batch_size=_env_int("CRAWL_BATCH_SIZE", 10),
             feed_offset=_env_int("RSS_FEED_OFFSET", 0),
             max_retries_per_run=_env_int("MAX_RETRIES_PER_RUN", 50),
             service_interval_seconds=_env_int("SERVICE_INTERVAL_SECONDS", 1800),
+            feed_fetch_timeout_seconds=_env_float(
+                "FEED_FETCH_TIMEOUT_SECONDS", 8.0
+            ),
+            feed_poll_fast_interval_seconds=_env_int(
+                "FEED_POLL_FAST_INTERVAL_SECONDS", 300
+            ),
             feed_poll_interval_seconds=_env_int("FEED_POLL_INTERVAL_SECONDS", 1800),
+            feed_poll_slow_interval_seconds=_env_int(
+                "FEED_POLL_SLOW_INTERVAL_SECONDS", 21600
+            ),
+            feed_poll_min_gaps=_env_int("FEED_POLL_MIN_GAPS", 3),
+            feed_poll_trim_fraction=_env_float("FEED_POLL_TRIM_FRACTION", 0.1),
+            feed_poll_future_tolerance_seconds=_env_float(
+                "FEED_POLL_FUTURE_TOLERANCE_SECONDS", 300.0
+            ),
             feed_disable_after_failures=_env_int("FEED_DISABLE_AFTER_FAILURES", 10),
             max_crawls_per_host=_env_int("MAX_CRAWLS_PER_HOST", 1),
             crawl_delay_per_host_seconds=_env_float(

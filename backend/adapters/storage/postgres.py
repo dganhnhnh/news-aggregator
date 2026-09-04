@@ -2392,6 +2392,8 @@ class PostgresRawStorage:
             feed_state.c.etag,
             feed_state.c.last_modified,
             feed_state.c.resolved_url,
+            feed_state.c.poll_interval_seconds,
+            feed_state.c.cadence_checked_at,
         )
         if feed_urls:
             stmt = stmt.where(feed_state.c.feed_url.in_(list(feed_urls)))
@@ -2415,6 +2417,9 @@ class PostgresRawStorage:
         etag: str | None = None,
         last_modified: str | None = None,
         last_entry_published_at: datetime | None = None,
+        poll_interval_seconds: int | None = None,
+        observed_publish_gap_seconds: float | None = None,
+        observed_publish_gap_count: int = 0,
         resolved_url: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc)
@@ -2431,10 +2436,16 @@ class PostgresRawStorage:
             values["resolved_url"] = resolved_url
         if not not_modified:
             # A 304 carries no new headers/entries, so leave the existing
-            # etag/last_modified/last_entry_published_at untouched.
+            # validators and cadence evidence untouched.
             values["etag"] = etag
             values["last_modified"] = last_modified
             values["last_entry_published_at"] = last_entry_published_at
+            values["poll_interval_seconds"] = poll_interval_seconds
+            values["observed_publish_gap_seconds"] = (
+                observed_publish_gap_seconds
+            )
+            values["observed_publish_gap_count"] = observed_publish_gap_count
+            values["cadence_checked_at"] = now
         async with self._engine.begin() as connection:
             await connection.execute(
                 update(feed_state)

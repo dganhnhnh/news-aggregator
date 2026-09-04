@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -42,7 +43,13 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "crawl_delay_per_host": 0.0,
         "feed_content_min_chars": 1200,
         "user_agent": "news-radar/1.0",
+        "feed_fetch_timeout": 8.0,
+        "poll_fast_interval": 300,
         "poll_interval": 1800,
+        "poll_slow_interval": 21600,
+        "poll_min_gaps": 3,
+        "poll_trim_fraction": 0.1,
+        "poll_future_tolerance": 300.0,
         "disable_after_failures": 3,
         "max_retries_per_run": 50,
         "emit_jsonl": False,
@@ -125,10 +132,22 @@ class FakeStorage:
         etag: str | None = None,
         last_modified: str | None = None,
         last_entry_published_at: datetime | None = None,
+        poll_interval_seconds: int | None = None,
+        observed_publish_gap_seconds: float | None = None,
+        observed_publish_gap_count: int = 0,
         resolved_url: str | None = None,
     ) -> None:
         self.calls.append(
-            ("record_feed_poll", feed_url, not_modified, next_poll_at, resolved_url)
+            (
+                "record_feed_poll",
+                feed_url,
+                not_modified,
+                next_poll_at,
+                poll_interval_seconds,
+                observed_publish_gap_seconds,
+                observed_publish_gap_count,
+                resolved_url,
+            )
         )
         self._consecutive_failures[feed_url] = 0
 
@@ -206,7 +225,9 @@ def _run(
 def test_not_modified_feed_skips_crawl_and_advances_schedule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    target = _target()
+    target = replace(
+        _target(), poll_interval_seconds=21600, cadence_checked_at=NOW
+    )
     storage = FakeStorage()
     storage.set_due_feeds([target])
     discovery = FakeDiscovery(
@@ -219,10 +240,10 @@ def test_not_modified_feed_skips_crawl_and_advances_schedule(
     assert outcome.stats.feeds_not_modified == 1
     poll_calls = [c for c in storage.calls if c[0] == "record_feed_poll"]
     assert len(poll_calls) == 1
-    _, feed_url, not_modified, next_poll_at, _resolved = poll_calls[0]
+    _, feed_url, not_modified, next_poll_at, *_rest = poll_calls[0]
     assert feed_url == target.feed_url
     assert not_modified is True
-    assert next_poll_at > NOW
+    assert next_poll_at > datetime.now(timezone.utc) + timedelta(hours=5, minutes=59)
 
 
 def test_undated_entry_passes_implicit_window(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -241,6 +262,29 @@ def test_undated_entry_passes_implicit_window(monkeypatch: pytest.MonkeyPatch) -
     assert outcome.stats.entries_skipped_undated == 1
     assert outcome.stats.entries_skipped_out_of_window == 0
     assert discovery.crawl_entries_calls == [[undated]]
+
+
+def test_fetched_feed_records_trimmed_mean_cadence_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _target()
+    entries = [
+        _entry(
+            entry_url=f"https://article.example/{index}",
+            published_at=NOW - timedelta(hours=8 - index * 2),
+        )
+        for index in range(4)
+    ]
+    storage = FakeStorage()
+    storage.set_due_feeds([target])
+    discovery = FakeDiscovery([FeedPoll(target=target, status="fetched", entries=entries)])
+
+    _run(storage, discovery, _args(), monkeypatch=monkeypatch)
+
+    poll_call = next(call for call in storage.calls if call[0] == "record_feed_poll")
+    assert poll_call[4] == 1800
+    assert poll_call[5] == 7200
+    assert poll_call[6] == 3
 
 
 def test_undated_entry_excluded_from_explicit_window(

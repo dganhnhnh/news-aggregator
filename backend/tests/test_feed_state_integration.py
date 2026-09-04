@@ -92,7 +92,11 @@ async def _test_due_feeds_ordering_filtering_and_explicit_urls_bypass_disabled()
             await connection.execute(
                 update(feed_state)
                 .where(feed_state.c.feed_url == due_soon)
-                .values(next_poll_at=now - timedelta(minutes=10))
+                .values(
+                    next_poll_at=now - timedelta(minutes=10),
+                    poll_interval_seconds=1800,
+                    cadence_checked_at=now - timedelta(days=1),
+                )
             )
             await connection.execute(
                 update(feed_state)
@@ -117,6 +121,9 @@ async def _test_due_feeds_ordering_filtering_and_explicit_urls_bypass_disabled()
         targets = await storage.due_feeds(limit=0, now=now)
         due_urls = [t.feed_url for t in targets if t.feed_url in all_urls]
         assert due_urls == [due_soon, due_later]
+        due_soon_target = next(t for t in targets if t.feed_url == due_soon)
+        assert due_soon_target.poll_interval_seconds == 1800
+        assert due_soon_target.cadence_checked_at == now - timedelta(days=1)
 
         bypassed = await storage.due_feeds(limit=0, feed_urls=[disabled], now=now)
         assert [t.feed_url for t in bypassed] == [disabled]
@@ -172,17 +179,29 @@ async def _test_record_feed_failure_backoff_and_disable_threshold_then_poll_rese
                 assert row.disabled_at is None
 
         await storage.record_feed_poll(
-            feed_url, next_poll_at=datetime.now(timezone.utc) + timedelta(minutes=30)
+            feed_url,
+            next_poll_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+            poll_interval_seconds=1800,
+            observed_publish_gap_seconds=7200,
+            observed_publish_gap_count=8,
         )
         async with engine.connect() as connection:
             row = (
                 await connection.execute(
-                    select(feed_state.c.consecutive_failures).where(
-                        feed_state.c.feed_url == feed_url
-                    )
+                    select(
+                        feed_state.c.consecutive_failures,
+                        feed_state.c.poll_interval_seconds,
+                        feed_state.c.observed_publish_gap_seconds,
+                        feed_state.c.observed_publish_gap_count,
+                        feed_state.c.cadence_checked_at,
+                    ).where(feed_state.c.feed_url == feed_url)
                 )
             ).one()
         assert row.consecutive_failures == 0
+        assert row.poll_interval_seconds == 1800
+        assert row.observed_publish_gap_seconds == 7200
+        assert row.observed_publish_gap_count == 8
+        assert row.cadence_checked_at is not None
     finally:
         if ready:
             await _delete_feeds(engine, [feed_url])

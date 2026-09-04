@@ -160,6 +160,14 @@ feed_state = Table(
     Column("last_polled_at", DateTime(timezone=True)),
     Column("last_success_at", DateTime(timezone=True)),
     Column("last_entry_published_at", DateTime(timezone=True)),
+    # NULL means the feed has not yet had its one unconditional cadence
+    # bootstrap fetch. Afterwards 304 responses reuse this persisted tier.
+    Column("poll_interval_seconds", Integer),
+    Column("observed_publish_gap_seconds", Float),
+    Column(
+        "observed_publish_gap_count", Integer, nullable=False, server_default="0"
+    ),
+    Column("cadence_checked_at", DateTime(timezone=True)),
     Column("consecutive_failures", Integer, nullable=False, server_default="0"),
     Column(
         "next_poll_at",

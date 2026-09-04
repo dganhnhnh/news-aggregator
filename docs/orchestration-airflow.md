@@ -76,7 +76,7 @@ không làm gì.
 | 2   | Nếu không truyền `--trigger`, explicit window được suy ra là `backfill`; explicit `--trigger` được ưu tiên ([base.py](../backend/workers/base.py)) | Map `data_interval` vào worker drain-queue vẫn gây hiểu nhầm rằng task sở hữu partition thời gian đó, dù label có thể override thành scheduled. | DAG định kỳ dùng `--last`. Chỉ `news_backfill` dùng `--since/--until`; mọi task truyền `--trigger` tường minh.                                                                            |
 | 3   | Worker là **drain queue**, không time-partitioned                                                                                                  | `catchup=True` sinh N dagrun lịch sử vô nghĩa, tranh nhau cùng một queue.                                                                       | `catchup=False` + `max_active_runs=1` trên **mọi** DAG.                                                                                                                                   |
 | 4   | Đã có 2 tầng retry bền vững: `crawl_failures` (backoff 5′→24h) và `processing_jobs.attempts` → `dead_letter` sau 5 lần                             | `retries` của Airflow tạo tầng thứ ba, không quan sát được, làm nhiễu backoff.                                                                  | `retries=0` cho crawl/embed/classify/cluster. `retries=1` chỉ cho task hạ tầng.                                                                                                           |
-| 5   | SIGTERM ⇒ dừng ở ranh giới chunk, đóng run `partial`, exit 0                                                                                       | Docker chỉ cho một grace window ngắn; chờ tới hard timeout có thể không đủ để checkpoint.                                                       | Worker nhận `--max-runtime` sớm hơn `execution_timeout` 5 phút; hard timeout vẫn là safety net.                                                                                           |
+| 5   | SIGTERM ⇒ dừng ở ranh giới chunk, đóng run `partial`, exit 0                                                                                       | Docker chỉ cho một grace window ngắn; chờ tới hard timeout có thể không đủ để checkpoint.                                                       | Worker nhận `--max-runtime` sớm hơn `execution_timeout` 25% (tối đa 5 phút); hard timeout vẫn là safety net.                                                                              |
 | 6   | `partial` là bình thường (feed lỗi lẻ tẻ); `--strict` biến nó thành exit 1                                                                         | Bật `--strict` ở DAG định kỳ ⇒ alert fatigue ⇒ tắt alert.                                                                                       | **Không** `--strict` ở DAG định kỳ. Chỉ dùng ở `news_taxonomy_refresh` và `news_backfill`, nơi `partial` nghĩa là dữ liệu chưa nhất quán.                                                 |
 
 
@@ -89,7 +89,7 @@ không làm gì.
 Sáu DAG, tách theo **nhịp**, **rủi ro** và quyền thay đổi dữ liệu.
 
 ```text
-news_ingest              (*/30 phút)
+news_ingest              (*/5 phút)
   preflight_db → crawl → queue_gate ─┐
                                      └─▶ Asset("news-radar://processing_jobs")
                                                     │
@@ -116,7 +116,7 @@ news_dlq_replay          (schedule=None, apply=false mặc định)
 
 | DAG                     | Lịch                          | Vì sao tách riêng                                                                                       |
 | ----------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `news_ingest`           | `*/30 * * * *`                | Phụ thuộc mạng ngoài, `partial` là bình thường                                                          |
+| `news_ingest`           | `*/5 * * * *`                 | Phụ thuộc mạng ngoài, `partial` là bình thường; feed tự giữ tier 5m/30m/6h                              |
 | `news_semantic`         | Asset-triggered               | Tính toán nội bộ, `failed` ở đây mới là tín hiệu thật; `embed` phải nạp MiniLM nên chạy dày là lãng phí |
 | `news_maintenance`      | Hằng ngày 03:00               | Thao tác sửa chữa, không được xen vào đường ingest                                                      |
 | `news_taxonomy_refresh` | Trigger tay + params          | Thay đổi taxonomy kéo theo reclassify diện rộng, phải có người quyết định                               |
@@ -269,8 +269,8 @@ Hai điểm bản triển khai khác phác thảo trên, cả hai đều do th�
 # orchestration/dags/news_ingest.py
 JOBS = Asset("news-radar://processing_jobs")
 
-@dag(schedule="*/30 * * * *", catchup=False, max_active_runs=1,
-     dagrun_timeout=timedelta(minutes=25))
+@dag(schedule="*/5 * * * *", catchup=False, max_active_runs=1,
+     dagrun_timeout=timedelta(minutes=9))
 def news_ingest():
     preflight = SQLExecuteQueryOperator(
         task_id="preflight_db", conn_id="news_radar_pg", retries=1,
@@ -278,7 +278,7 @@ def news_ingest():
     )
     crawl = worker(
         "crawl", "crawl", "--feed-path", "/data/engineering_blogs.opml",
-        "--last", "12h", pool="news_crawl", timeout=timedelta(minutes=20),
+        "--last", "12h", pool="news_crawl", timeout=timedelta(minutes=8),
     )
 
     @task(outlets=[JOBS])
@@ -478,7 +478,7 @@ command line các DAG sinh ra đều qua được `build_parser` + `validate` c�
 
 Vì vậy thứ tự bật vẫn giữ nguyên: `news_ingest` **phải được trigger tay và đối
 chiếu với một run cron tương đương trước.** `news_ingest` đang để lịch
-`*/30 * * * *` trong code, nên khi bật stack lần đầu hãy để DAG ở trạng thái
+`*/5 * * * *` trong code, nên khi bật stack lần đầu hãy để DAG ở trạng thái
 paused và trigger tay, thay vì sửa file thành `schedule=None`.
 
 Cron cũ phải chạy song song suốt Phase 1. Chỉ tắt cron sau khi Phase 2 chạy
@@ -557,9 +557,11 @@ SQLAlchemy `<2.0`" là của Airflow 2.x và **đã bị bác bỏ**; lập lu�
 
 **Còn mở**
 
-1. **Nhịp** `*/30` **cho crawl** là giả định, chưa đo. Cần đối chiếu với
-  `feed_poll_interval_seconds` và thời lượng thực tế của một run crawl trước
-   khi chốt.
+1. ~~**Nhịp** `*/30` **cho crawl** là giả định, chưa đo.~~ **Đã đo và triển
+   khai (2026-09-03).** Baseline/barrier ở
+   [measurements.md §T11](measurements.md); sweep cadence on-demand ở §T12.
+   DAG chạy `*/5`, còn từng feed tự giữ tier 5m/30m/6h theo trimmed mean từ RSS
+   body như [spec-parallel-ingest.md](spec-parallel-ingest.md) §5.
 2. **Giới hạn tài nguyên thực tế** cho crawl/embed chưa đo trên host đích.
   `mem_limit` và tổng concurrency cần chốt sau shadow run; pool riêng chỉ
    kiểm soát theo worker type, chưa giới hạn tổng RAM của hai nhánh semantic.

@@ -353,6 +353,7 @@ async def _fetch_rss(
     *,
     etag: str | None = None,
     last_modified: str | None = None,
+    timeout_seconds: float = 8.0,
 ) -> FeedFetch:
     """
     Fetch and parse a single RSS feed, using conditional GET when possible.
@@ -368,7 +369,9 @@ async def _fetch_rss(
     if last_modified:
         headers["If-Modified-Since"] = last_modified
     try:
-        response = await client.get(url, timeout=20.0, headers=headers or None)
+        response = await client.get(
+            url, timeout=timeout_seconds, headers=headers or None
+        )
         if response.status_code == 304:
             return FeedFetch(
                 [],
@@ -443,8 +446,8 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         self,
         feed_path: Optional[str | Path] = None,
         http_client: Optional[httpx.AsyncClient] = None,
-        max_concurrent_crawls: int = 2,
-        max_concurrent_feeds: int = 2,
+        max_concurrent_crawls: int = 6,
+        max_concurrent_feeds: int = 8,
         crawl_batch_size: int = 10,
         crawl_provider: CrawlerProvider | None = None,
         *,
@@ -453,6 +456,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         max_crawls_per_host: int = 1,
         crawl_delay_per_host: float = 1.0,
         user_agent: str = DEFAULT_USER_AGENT,
+        feed_fetch_timeout_seconds: float = 8.0,
     ) -> None:
         if feed_path is not None and tsv_path is not None:
             raise ValueError("Pass only one of feed_path or tsv_path")
@@ -468,6 +472,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
         self._max_crawls_per_host = max_crawls_per_host
         self._crawl_delay_per_host = crawl_delay_per_host
         self._user_agent = user_agent or DEFAULT_USER_AGENT
+        self._feed_fetch_timeout_seconds = feed_fetch_timeout_seconds
         self._feed_offset = 0
         self._last_feed_offset = 0
         self._logger = get_logger(__name__)
@@ -509,82 +514,103 @@ class GoogleNewsRssSearcher(CrawlerProvider):
     ) -> AsyncIterator[FeedPoll]:
         """Poll each target feed, honoring conditional GET; yield one FeedPoll per feed.
 
-        Fetches in groups of ``max_concurrent_feeds`` like the old
-        ``iter_batches`` did, but yields per-feed instead of merging a group
-        into one discovery batch, so a caller can react to each feed's
-        304/failure/fetched outcome independently.
+        A fixed worker pool refills each slot as soon as its previous fetch
+        completes. The bounded result queue preserves backpressure while the
+        caller crawls/persists an earlier feed, without creating one task per
+        configured feed.
         """
         own_client = self._http_client is None
         client = self._http_client or self._build_default_client()
+        target_list = list(targets)
+        target_iterator = iter(target_list)
+        results: asyncio.Queue[tuple[FeedPollTarget, FeedFetch | Exception]] = (
+            asyncio.Queue(maxsize=self._max_concurrent_feeds)
+        )
+
+        async def fetch_worker() -> None:
+            for target in target_iterator:
+                try:
+                    outcome: FeedFetch | Exception = await _fetch_rss(
+                        target.fetch_url,
+                        client,
+                        etag=(
+                            target.etag
+                            if not target.needs_cadence_bootstrap
+                            else None
+                        ),
+                        last_modified=(
+                            target.last_modified
+                            if not target.needs_cadence_bootstrap
+                            else None
+                        ),
+                        timeout_seconds=self._feed_fetch_timeout_seconds,
+                    )
+                except Exception as exc:
+                    outcome = exc
+                await results.put((target, outcome))
+
+        workers = [
+            asyncio.create_task(fetch_worker())
+            for _ in range(min(self._max_concurrent_feeds, len(target_list)))
+        ]
         try:
-            for feed_group in self._chunks(list(targets), self._max_concurrent_feeds):
-                fetched = await asyncio.gather(
-                    *[
-                        _fetch_rss(
-                            target.fetch_url,
-                            client,
-                            etag=target.etag,
-                            last_modified=target.last_modified,
-                        )
-                        for target in feed_group
-                    ],
-                    return_exceptions=True,
-                )
-                for target, outcome in zip(feed_group, fetched, strict=True):
-                    if isinstance(outcome, Exception):
-                        yield FeedPoll(
-                            target=target,
-                            status="failed",
-                            error=CrawlFailureOccurrence(
-                                failure_kind="feed",
-                                url=target.feed_url,
-                                source=target.source_label,
-                                error_type=type(outcome).__name__,
-                                error_message=str(outcome),
-                                permanent=_is_permanent_feed_error(outcome),
-                            ),
-                            resolved_url=_redirect_from_failure(
-                                outcome, target.fetch_url
-                            ),
-                        )
-                        continue
-
-                    fetch = outcome
-                    if fetch.not_modified:
-                        yield FeedPoll(
-                            target=target,
-                            status="not_modified",
-                            etag=fetch.etag,
-                            last_modified=fetch.last_modified,
-                            resolved_url=fetch.permanent_url,
-                        )
-                        continue
-
-                    entries = [
-                        DiscoveredEntry(
-                            feed_url=target.feed_url,
-                            query_label=target.source_label or "",
-                            feed_title=fetch.feed_title,
-                            entry_url=entry["feed_entry_url"],
-                            title=entry["title"],
-                            source=entry["source"],
-                            published_at=entry["published_date"],
-                            content_html=entry.get("content_html", ""),
-                            summary_html=entry.get("summary_html", ""),
-                        )
-                        for entry in fetch.entries
-                    ]
+            for _ in target_list:
+                target, outcome = await results.get()
+                if isinstance(outcome, Exception):
                     yield FeedPoll(
                         target=target,
-                        status="fetched",
-                        entries=entries,
-                        feed_title=fetch.feed_title,
+                        status="failed",
+                        error=CrawlFailureOccurrence(
+                            failure_kind="feed",
+                            url=target.feed_url,
+                            source=target.source_label,
+                            error_type=type(outcome).__name__,
+                            error_message=str(outcome),
+                            permanent=_is_permanent_feed_error(outcome),
+                        ),
+                        resolved_url=_redirect_from_failure(outcome, target.fetch_url),
+                    )
+                    continue
+
+                fetch = outcome
+                if fetch.not_modified:
+                    yield FeedPoll(
+                        target=target,
+                        status="not_modified",
                         etag=fetch.etag,
                         last_modified=fetch.last_modified,
                         resolved_url=fetch.permanent_url,
-                        entries_skipped_non_article=fetch.entries_skipped_non_article,
                     )
+                    continue
+
+                entries = [
+                    DiscoveredEntry(
+                        feed_url=target.feed_url,
+                        query_label=target.source_label or "",
+                        feed_title=fetch.feed_title,
+                        entry_url=entry["feed_entry_url"],
+                        title=entry["title"],
+                        source=entry["source"],
+                        published_at=entry["published_date"],
+                        content_html=entry.get("content_html", ""),
+                        summary_html=entry.get("summary_html", ""),
+                    )
+                    for entry in fetch.entries
+                ]
+                yield FeedPoll(
+                    target=target,
+                    status="fetched",
+                    entries=entries,
+                    feed_title=fetch.feed_title,
+                    etag=fetch.etag,
+                    last_modified=fetch.last_modified,
+                    resolved_url=fetch.permanent_url,
+                    entries_skipped_non_article=fetch.entries_skipped_non_article,
+                )
         finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
             if own_client:
                 await client.aclose()
 

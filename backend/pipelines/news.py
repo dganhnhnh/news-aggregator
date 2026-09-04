@@ -119,10 +119,11 @@ async def run_rss_batch(
     max_feeds: int,
     max_articles_per_feed: int,
     max_concurrent_crawls: int,
-    max_concurrent_feeds: int = 2,
+    max_concurrent_feeds: int = 8,
     crawl_batch_size: int = 10,
     feed_offset: int = 0,
     user_agent: str = DEFAULT_USER_AGENT,
+    feed_fetch_timeout_seconds: float = 8.0,
 ) -> CrawlBatch:
     searcher = RssFeedSearcher(
         feed_path=feed_path,
@@ -130,6 +131,7 @@ async def run_rss_batch(
         max_concurrent_feeds=max_concurrent_feeds,
         crawl_batch_size=crawl_batch_size,
         user_agent=user_agent,
+        feed_fetch_timeout_seconds=feed_fetch_timeout_seconds,
     )
     return await searcher.fetch_batch(
         max_articles_per_feed=max_articles_per_feed,
@@ -144,7 +146,7 @@ async def run_rss(
     max_feeds: int,
     max_articles_per_feed: int,
     max_concurrent_crawls: int,
-    max_concurrent_feeds: int = 2,
+    max_concurrent_feeds: int = 8,
     crawl_batch_size: int = 10,
     feed_offset: int = 0,
 ) -> list[CrawlResult]:
@@ -287,6 +289,7 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> None:
                 max_concurrent_feeds=args.max_concurrent_feeds,
                 crawl_batch_size=args.crawl_batch_size,
                 user_agent=settings.feed_user_agent,
+                feed_fetch_timeout_seconds=settings.feed_fetch_timeout_seconds,
             )
             has_failures = False
             total_received = 0

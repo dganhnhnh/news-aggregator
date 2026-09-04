@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -273,7 +274,7 @@ def test_opml_feed_runs_through_rss_crawl_pipeline(
     class FakeClient:
         async def get(self, url: str, timeout: float, headers=None):
             assert url == "https://example.com/feed.xml"
-            assert timeout == 20.0
+            assert timeout == 8.0
             return FakeResponse()
 
     async def fake_crawl_batch(self, urls, *, max_concurrency=None):
@@ -351,6 +352,7 @@ def test_poll_feeds_sends_conditional_get_headers() -> None:
         source_label="Feed",
         etag='"abc123"',
         last_modified="Wed, 19 Aug 2026 00:00:00 GMT",
+        cadence_checked_at=datetime(2026, 8, 19, tzinfo=timezone.utc),
     )
     searcher = GoogleNewsRssSearcher(http_client=FakeClient())
 
@@ -366,6 +368,116 @@ def test_poll_feeds_sends_conditional_get_headers() -> None:
     assert polls[0].status == "not_modified"
     assert polls[0].etag == '"abc123"'
     assert polls[0].last_modified == "Wed, 19 Aug 2026 00:00:00 GMT"
+
+
+def test_cadence_bootstrap_omits_existing_conditional_headers() -> None:
+    seen_headers: list[dict | None] = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "<rss><channel><title>Feed</title></channel></rss>"
+        headers: dict[str, str] = {}
+        url = "https://example.com/feed.xml"
+        history: list = []
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        async def get(self, url: str, timeout: float, headers=None):
+            seen_headers.append(headers)
+            return FakeResponse()
+
+    target = FeedPollTarget(
+        feed_url="https://example.com/feed.xml",
+        source_label="Feed",
+        etag='"old-etag"',
+        last_modified="Wed, 19 Aug 2026 00:00:00 GMT",
+    )
+
+    polls = asyncio.run(
+        _collect(GoogleNewsRssSearcher(http_client=FakeClient()).poll_feeds([target]))
+    )
+
+    assert polls[0].status == "fetched"
+    assert seen_headers == [None]
+
+
+def test_poll_feeds_uses_configured_fetch_timeout() -> None:
+    seen_timeouts: list[float] = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "<rss><channel><title>Feed</title></channel></rss>"
+        headers: dict[str, str] = {}
+        url = "https://example.com/feed.xml"
+        history: list = []
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        async def get(self, url: str, timeout: float, headers=None):
+            seen_timeouts.append(timeout)
+            return FakeResponse()
+
+    target = FeedPollTarget("https://example.com/feed.xml", "Feed", None, None)
+    searcher = GoogleNewsRssSearcher(
+        http_client=FakeClient(), feed_fetch_timeout_seconds=3.5
+    )
+
+    asyncio.run(_collect(searcher.poll_feeds([target])))
+
+    assert seen_timeouts == [3.5]
+
+
+def test_poll_feeds_refills_a_finished_slot_before_a_slow_fetch_finishes() -> None:
+    class FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+        history: list = []
+
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.text = "<rss><channel><title>Feed</title></channel></rss>"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class ControlledClient:
+        def __init__(self) -> None:
+            self.release_slow = asyncio.Event()
+            self.next_started = asyncio.Event()
+
+        async def get(self, url: str, timeout: float, headers=None):
+            if url.endswith("slow.xml"):
+                await self.release_slow.wait()
+            if url.endswith("next.xml"):
+                self.next_started.set()
+            return FakeResponse(url)
+
+    async def scenario() -> list:
+        client = ControlledClient()
+        targets = [
+            FeedPollTarget("https://example.com/slow.xml", "slow", None, None),
+            FeedPollTarget("https://example.com/fast.xml", "fast", None, None),
+            FeedPollTarget("https://example.com/next.xml", "next", None, None),
+        ]
+        collecting = asyncio.create_task(
+            _collect(
+                GoogleNewsRssSearcher(
+                    http_client=client, max_concurrent_feeds=2
+                ).poll_feeds(targets)
+            )
+        )
+        await asyncio.wait_for(client.next_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        client.release_slow.set()
+        return await collecting
+
+    polls = asyncio.run(scenario())
+
+    assert [poll.target.source_label for poll in polls] == ["fast", "next", "slow"]
 
 
 def test_poll_feeds_reads_new_etag_and_last_modified_on_a_fresh_fetch() -> None:

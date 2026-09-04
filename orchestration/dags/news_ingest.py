@@ -20,8 +20,8 @@ JOBS = Asset(JOBS_ASSET_URI)
 
 
 @dag(
-    schedule="*/30 * * * *",
-    dagrun_timeout=timedelta(minutes=25),
+    schedule="*/5 * * * *",
+    dagrun_timeout=timedelta(minutes=9),
     doc_md=__doc__,
     **dag_defaults(),
 )
@@ -46,7 +46,7 @@ def news_ingest():
         "--last",
         "12h",
         pool="news_crawl",
-        timeout=timedelta(minutes=20),
+        timeout=timedelta(minutes=8),
     )
 
     @task(outlets=[JOBS])
@@ -55,7 +55,7 @@ def news_ingest():
 
         Skipping here is what keeps `news_semantic` from loading MiniLM to
         find an empty queue. A crawl run that wrote nothing new is the normal
-        case at a 30-minute cadence, not an error.
+        case at an adaptive cadence, not an error.
         """
         pending = PostgresHook(postgres_conn_id=PG_CONN_ID).get_first(
             "SELECT count(*) FROM processing_jobs "

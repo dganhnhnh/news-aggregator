@@ -82,11 +82,18 @@ class FeedPollTarget:
     etag: str | None
     last_modified: str | None
     resolved_url: str | None = None
+    poll_interval_seconds: int | None = None
+    cadence_checked_at: datetime | None = None
 
     @property
     def fetch_url(self) -> str:
         """Where to send the request; `feed_url` stays the row's identity."""
         return self.resolved_url or self.feed_url
+
+    @property
+    def needs_cadence_bootstrap(self) -> bool:
+        """Whether the next fetch must return a body instead of a 304."""
+        return self.cadence_checked_at is None
 
 
 @dataclass(frozen=True)

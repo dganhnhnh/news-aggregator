@@ -9,6 +9,7 @@ from typing import Any
 
 from adapters.retrieve_news_data.google_news_rss_searcher import RssFeedSearcher
 from adapters.retrieve_news_data.rss_discovery import RssDiscovery
+from core.feed_schedule import observe_feed_cadence, poll_interval_for_gap
 from core.logger import get_logger
 from models.discovery_models import DiscoveredEntry
 from models.storage_models import CrawlBatch, FailureTarget, FeedSeed, IngestRunStats
@@ -40,7 +41,15 @@ class CrawlWorker(Worker):
             "max_concurrent_crawls": args.max_concurrent_crawls,
             "crawl_batch_size": args.crawl_batch_size,
             "user_agent": args.user_agent,
-            "poll_interval": args.poll_interval,
+            "feed_fetch_timeout": args.feed_fetch_timeout,
+            "poll_tiers": [
+                args.poll_fast_interval,
+                args.poll_interval,
+                args.poll_slow_interval,
+            ],
+            "poll_min_gaps": args.poll_min_gaps,
+            "poll_trim_fraction": args.poll_trim_fraction,
+            "poll_future_tolerance": args.poll_future_tolerance,
             "disable_after_failures": args.disable_after_failures,
             "max_retries_per_run": args.max_retries_per_run,
         }
@@ -57,6 +66,7 @@ class CrawlWorker(Worker):
             max_crawls_per_host=args.max_crawls_per_host,
             crawl_delay_per_host=args.crawl_delay_per_host,
             user_agent=args.user_agent,
+            feed_fetch_timeout_seconds=args.feed_fetch_timeout,
         )
         discovery = RssDiscovery(searcher)
         stats = IngestRunStats()
@@ -135,12 +145,15 @@ class CrawlWorker(Worker):
                         poll.target.feed_url,
                         poll.resolved_url,
                     )
-                next_poll_at = datetime.now(timezone.utc) + timedelta(
-                    seconds=args.poll_interval
-                )
-
                 if poll.status == "not_modified":
                     stats.feeds_not_modified += 1
+                    interval = (
+                        poll.target.poll_interval_seconds
+                        or args.poll_fast_interval
+                    )
+                    next_poll_at = datetime.now(timezone.utc) + timedelta(
+                        seconds=interval
+                    )
                     await persist_batch(
                         storage,
                         CrawlBatch(
@@ -189,6 +202,27 @@ class CrawlWorker(Worker):
 
                 # poll.status == "fetched"
                 stats.articles_discovered += len(poll.entries)
+                cadence_observed_at = datetime.now(timezone.utc)
+                cadence = observe_feed_cadence(
+                    [
+                        (entry.entry_url, entry.published_at)
+                        for entry in poll.entries
+                    ],
+                    observed_at=cadence_observed_at,
+                    trim_fraction=args.poll_trim_fraction,
+                    future_tolerance_seconds=args.poll_future_tolerance,
+                )
+                interval = poll_interval_for_gap(
+                    cadence.trimmed_mean_gap_seconds,
+                    gap_count=cadence.gap_count,
+                    min_gaps=args.poll_min_gaps,
+                    tiers_seconds=(
+                        args.poll_fast_interval,
+                        args.poll_interval,
+                        args.poll_slow_interval,
+                    ),
+                )
+                next_poll_at = cadence_observed_at + timedelta(seconds=interval)
                 await persist_batch(
                     storage,
                     CrawlBatch(
@@ -235,15 +269,6 @@ class CrawlWorker(Worker):
                         still_new.append(entry)
                     selected = still_new
 
-                latest_published = max(
-                    (
-                        entry.published_at
-                        for entry in poll.entries
-                        if entry.published_at is not None
-                    ),
-                    default=None,
-                )
-
                 for chunk in _chunks(selected, args.crawl_batch_size):
                     batch = await discovery.crawl_entries(chunk)
                     summary = await persist_batch(storage, batch)
@@ -269,7 +294,12 @@ class CrawlWorker(Worker):
                     next_poll_at=next_poll_at,
                     etag=poll.etag,
                     last_modified=poll.last_modified,
-                    last_entry_published_at=latest_published,
+                    last_entry_published_at=cadence.latest_published_at,
+                    poll_interval_seconds=interval,
+                    observed_publish_gap_seconds=(
+                        cadence.trimmed_mean_gap_seconds
+                    ),
+                    observed_publish_gap_count=cadence.gap_count,
                     resolved_url=poll.resolved_url,
                 )
 

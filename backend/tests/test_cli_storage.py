@@ -46,6 +46,12 @@ def test_persistence_and_worker_output_flags_are_exposed() -> None:
     assert worker_args.max_concurrent_feeds == 2
     assert worker_args.max_concurrent_crawls == 2
     assert worker_args.crawl_batch_size == 10
+    assert worker_args.feed_fetch_timeout == 8.0
+    assert (
+        worker_args.poll_fast_interval,
+        worker_args.poll_interval,
+        worker_args.poll_slow_interval,
+    ) == (300, 1800, 21600)
     with pytest.raises(SystemExit):
         pipeline_parser.parse_args(
             ["search", "query", "--persist"]
@@ -82,6 +88,19 @@ def test_max_runtime_rejects_invalid_or_looping_worker_values() -> None:
         _parse(["embed", "--max-runtime", "soon"])
     with pytest.raises(SystemExit):
         _parse(["embed", "--max-runtime", "25m", "--interval", "60"])
+
+
+def test_adaptive_poll_settings_reject_invalid_order() -> None:
+    with pytest.raises(SystemExit):
+        _parse(
+            [
+                "crawl",
+                "--poll-fast-interval",
+                "1800",
+                "--poll-interval",
+                "1800",
+            ]
+        )
 
 
 def test_exit_busy_defaults_to_success_and_rejects_the_failure_code() -> None:

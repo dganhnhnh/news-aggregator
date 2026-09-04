@@ -203,11 +203,51 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="User-Agent sent when fetching feeds",
     )
     crawl.add_argument(
+        "--feed-fetch-timeout",
+        type=float,
+        metavar="SECONDS",
+        default=settings.feed_fetch_timeout_seconds,
+        help="Timeout for one RSS/Atom fetch",
+    )
+    crawl.add_argument(
+        "--poll-fast-interval",
+        type=int,
+        metavar="SECONDS",
+        default=settings.feed_poll_fast_interval_seconds,
+        help="Fast adaptive feed poll tier",
+    )
+    crawl.add_argument(
         "--poll-interval",
         type=int,
         metavar="SECONDS",
         default=settings.feed_poll_interval_seconds,
-        help="How long before a successfully polled feed is due again",
+        help="Medium adaptive feed poll tier (legacy flag name)",
+    )
+    crawl.add_argument(
+        "--poll-slow-interval",
+        type=int,
+        metavar="SECONDS",
+        default=settings.feed_poll_slow_interval_seconds,
+        help="Slow adaptive feed poll tier",
+    )
+    crawl.add_argument(
+        "--poll-min-gaps",
+        type=int,
+        default=settings.feed_poll_min_gaps,
+        help="Minimum publication gaps required before using a slower tier",
+    )
+    crawl.add_argument(
+        "--poll-trim-fraction",
+        type=float,
+        default=settings.feed_poll_trim_fraction,
+        help="Fraction trimmed from each end of publication-gap samples",
+    )
+    crawl.add_argument(
+        "--poll-future-tolerance",
+        type=float,
+        metavar="SECONDS",
+        default=settings.feed_poll_future_tolerance_seconds,
+        help="Future timestamp tolerance when measuring feed cadence",
     )
     crawl.add_argument(
         "--disable-after-failures",
@@ -492,8 +532,16 @@ def _validate_crawl(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         parser.error("--crawl-delay-per-host must not be negative")
     if args.feed_content_min_chars < 0:
         parser.error("--feed-content-min-chars must not be negative")
-    if args.poll_interval <= 0:
-        parser.error("--poll-interval must be positive")
+    if args.feed_fetch_timeout <= 0:
+        parser.error("--feed-fetch-timeout must be positive")
+    if not 0 < args.poll_fast_interval < args.poll_interval < args.poll_slow_interval:
+        parser.error("adaptive poll intervals must be positive and increasing")
+    if args.poll_min_gaps <= 0:
+        parser.error("--poll-min-gaps must be positive")
+    if not 0 <= args.poll_trim_fraction < 0.5:
+        parser.error("--poll-trim-fraction must be in [0, 0.5)")
+    if args.poll_future_tolerance < 0:
+        parser.error("--poll-future-tolerance must not be negative")
     if args.disable_after_failures <= 0:
         parser.error("--disable-after-failures must be positive")
     if args.max_retries_per_run < 0:

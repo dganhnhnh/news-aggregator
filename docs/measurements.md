@@ -404,7 +404,256 @@ và container hardening vẫn để sau MVP đúng scope T10.
 
 ---
 
-## Chỗ trống cho các task sau
+## T11 — Baseline ingest trước khi song song hoá crawl (2026-09-03)
+
+Đo trước khi quyết định có tách `news_ingest` thành planner tuần tự + N crawl
+worker hay không. Harness: [`scripts/bench_ingest.py`](../scripts/bench_ingest.py),
+đọc input từ database nhưng **không ghi gì** — không `apply_batch`, không
+`record_feed_poll`, không `worker_runs` — nên phép đo không làm lệch lần chạy
+production kế tiếp. Database: `news_radar` local (port 5433), snapshot 7 ngày.
+
+### T11.1 — Độ trễ hiện tại (`published_at` → `crawled_at`)
+
+| Tập | n | p25 | p50 | p75 | p90 |
+| --- | --- | --- | --- | --- | --- |
+| Toàn bộ 7 ngày | 1100 | — | **305 min** | — | 984 min |
+| Chỉ source ≥10 bài/7d | 1035 | 96 min | 305 min | — | 925 min |
+| Chỉ giai đoạn cron chạy đều (2026-09-02 09:00–16:30Z) | 197 | 43 min | **122 min** | 321 min | 618 min |
+
+### T11.2 — Nhịp chạy thực tế của worker `crawl`
+
+| Chỉ số | Giá trị |
+| --- | --- |
+| Số run / 7 ngày | 72 |
+| Khoảng cách giữa 2 run — p50 | 31.7 min (đúng thiết kế) |
+| Khoảng cách — p90 | **197.8 min** |
+| Khoảng cách — max | **2384 min (~40 giờ)** |
+
+Có một lỗ 12 tiếng liền (2026-09-02 16:00Z → 2026-09-03 04:00Z) và một ngày
+(2026-09-01) không có run nào. Chênh lệch p50 305 min (cả tuần) so với 122 min
+(giai đoạn cron đều) là phần độ trễ do **scheduler không chạy**, không phải do
+throughput. Song song hoá không chạm được vào phần này.
+
+### T11.3 — Concurrency polling feed: barrier so với sliding window
+
+80 feed active lấy mẫu ngẫu nhiên (`--seed 11`), cùng một tập cho mọi mức, thứ
+tự mức được xáo để cold-start không trùng với chiều tăng của biến.
+
+```bash
+uv run python scripts/bench_ingest.py feeds   --sample 80 --levels 16,2,24,8 --seed 11
+uv run python scripts/bench_ingest.py sliding --sample 80 --levels 24,8,2     --seed 11
+```
+
+| Concurrency | `poll_feeds` hiện tại (gather barrier) | Sliding window | Tỉ lệ |
+| --- | --- | --- | --- |
+| 2 | 61.0s | 27.2s | 2.2× |
+| 8 | 58.3s | **16.2s** | **3.6×** |
+| 16 | 101.4s (vòng chạy đầu, cold) | — | — |
+| 24 | 56.2s | 20.2s (cold) → 15.4s | 3.6× |
+
+Thời lượng fetch từng feed (sliding, c=8): p50 **0.36s**, p90 1.17s, max 15.05s.
+
+Lần chạy đầu ở mỗi mode bị phạt vì cold DNS/TLS (barrier c=16 = 101.4s; sliding
+c=24 = 20.2s). Chạy lại sliding với thứ tự `8,24,12` để loại yếu tố này:
+
+| Concurrency | Sliding (vòng 2) | "Ideal" = Σ(thời lượng từng feed)/c |
+| --- | --- | --- |
+| 8 | 17.2s | 7.8s |
+| 12 | 16.3s | 4.9s |
+| 24 | 15.4s | 3.3s |
+
+Không có nghịch đảo — nhưng từ c≈8 trở lên tổng thời gian **bị ghim bởi một
+fetch chậm nhất** (max 15.06s ở cả ba mức), nên concurrency thêm không mua được
+gì. Đòn bẩy tiếp theo là hạ timeout 20s, không phải nâng concurrency.
+
+**Phân bố đuôi — chọn timeout bao nhiêu.** Số feed vượt mỗi ngưỡng, hai lần
+chạy độc lập trên cùng 80 feed:
+
+| Lần chạy | >3s | >5s | >8s | >10s | >15s | failed |
+| --- | --- | --- | --- | --- | --- | --- |
+| c=8 | 5 | 5 | 4 | 4 | 4 | 6 |
+| c=12 | 9 | 7 | 7 | 7 | 7 | 11 |
+
+Đuôi **lưỡng cực**: gần như mọi feed xong dưới 3s, phần còn lại treo ở ~15.1s.
+**Không có feed nào nằm giữa 8s và 15s ở cả hai lần chạy**, và số feed ở cụm
+15s luôn nhỏ hơn số feed failed — tức cụm đó là feed đang hỏng sẵn, không phải
+feed chậm mà lành. Trần 15.1s nằm dưới timeout httpx 20s nên nó đến từ tầng
+resolver/connect của OS; timeout httpx 8s sẽ cắt trước. Kết luận: **hạ timeout
+xuống 8s không làm hỏng feed lành nào** trong mẫu này, chỉ rút ngắn thời gian
+thất bại từ 15s xuống 8s.
+
+Hai kết luận, cả hai đều ngược với giả định ban đầu:
+
+1. **Nâng `MAX_CONCURRENT_FEEDS` một mình gần như vô ích**: 2 → 24 chỉ đưa 61.0s
+   xuống 56.2s (8%). Nguyên nhân ở
+   [`poll_feeds`](../backend/adapters/retrieve_news_data/google_news_rss_searcher.py:520):
+   `for feed_group in self._chunks(...)` + `asyncio.gather` là một **barrier** —
+   mỗi nhóm phải xong hết mới sang nhóm sau, nên chi phí mỗi nhóm bằng thành
+   viên chậm nhất. Với p50 0.36s và timeout 20s, tăng N chỉ gom thêm outlier vào
+   cùng một nhóm.
+2. **Sliding window mới là đòn bẩy**, và điểm ngọt là c≈8: từ đó trở lên tổng
+   thời gian bị ghim bởi fetch chậm nhất chứ không giảm thêm. Sàn đó là timeout
+   20s hardcode tại
+   [google_news_rss_searcher.py:371](../backend/adapters/retrieve_news_data/google_news_rss_searcher.py:371).
+   Với p90 = 1.3s, hạ timeout xuống 8s ảnh hưởng rất ít feed nhưng kéo sàn
+   xuống gần mức "ideal" 4.9s.
+
+### T11.4 — Concurrency crawl (crawl4ai)
+
+24 URL bài viết đã crawl gần đây, mỗi host một URL (`--seed 3`, thứ tự mức xáo).
+
+```bash
+uv run python scripts/bench_ingest.py crawls --sample 24 --levels 4,2,8,6 --seed 3
+```
+
+| Concurrency | Tổng | s/URL |
+| --- | --- | --- |
+| 2 | 28.3s | 1.18 |
+| 4 | 19.7s | 0.82 |
+| 6 | **16.9s** | **0.71** |
+| 8 | 18.2s | 0.76 |
+
+2 → 6 cho **1.67×**; từ 6 trở lên không còn lợi. Đây là kịch bản tốt nhất (mọi
+host khác nhau); run thật chậm hơn ~2.6× vì có failure, `_host_waves` và chunk
+barrier `crawl_batch_size`.
+
+### T11.5 — Độ lệch theo host (đầu vào cho bài toán chia tải)
+
+```bash
+uv run python scripts/bench_ingest.py hosts
+```
+
+210 host / 1104 bài trong 7 ngày. p50 = **1 bài/host**, max = 210
+(mashable.com), **top-10 host chiếm 67.8%**. Theo từng run:
+
+| run | bài | host | max/host | % host lớn nhất |
+| --- | --- | --- | --- | --- |
+| 911 | 86 | 23 | 15 | 17.4% |
+| 881 | 54 | 26 | 9 | 16.7% |
+| 852 | 63 | 23 | 14 | 22.2% |
+
+Với `max_crawls_per_host=1` và delay 1s, host đông nhất của run 911 tạo **sàn
+~112s** cho pha crawl (15 × (6.5s + 1s)) mà không worker nào vượt qua được.
+
+### T11.6 — Feed nào thực sự xuất bản
+
+| Nhóm (375 feed active) | Số feed |
+| --- | --- |
+| Có bài trong 24h | **37** |
+| Có bài trong 7 ngày (không tính 24h) | 42 |
+| Có bài trong 30 ngày (không tính 7d) | 58 |
+| Im lặng > 30 ngày | **221 (59%)** |
+| Chưa biết (`last_entry_published_at IS NULL`) | 17 |
+
+Đồng thời: 251/375 có `etag`, 239 có `last_modified`, **79 (21%) không có
+validator nào** → luôn trả 200 kèm full body. Tỉ lệ 304 thực tế 50.4%.
+Feed failure trung bình **77/368 mỗi run** (21%); phân loại trong
+`crawl_failures`: HTTPStatusError 60, ConnectError 43, ValueError 20,
+ConnectTimeout 10.
+
+Poll đều 30 phút cho cả 375 feed = 18.000 lượt/ngày, trong đó phần lớn dành cho
+221 feed đã im lặng hơn một tháng.
+
+### T11.7 — Mô hình wall clock và dự phóng
+
+Kiểm chứng mô hình trên run 911 (402 feed, 152 fetched, 97 lượt crawl, 647s đo được):
+
+| Pha | Hiện tại | Mô hình |
+| --- | --- | --- |
+| Poll feed | ~307s | 402 feed × (61.0s / 80) |
+| Crawl | ~300s | 97 URL × 3.1 s/URL |
+| Tổng | 607s (mô hình) so với **647s (đo)** | sai số 6% |
+
+Dự phóng sau khi sửa (sliding window c=8 + `MAX_CONCURRENT_CRAWLS=6`):
+
+| Pha | Sau khi sửa |
+| --- | --- |
+| Poll feed | ~81s (3.8×) |
+| Crawl | ~180s (1.67×, sàn host 112s chưa chạm) |
+| **Tổng** | **~260s so với 647s — 2.5×** |
+
+Toàn bộ mức cải thiện này đạt được **trong một process**, bằng một thay đổi code
+nhỏ (bỏ barrier) cộng hai biến môi trường. Thêm N crawl worker chỉ có thể lấy
+thêm tối đa ~1.6× nữa trên pha crawl trước khi chạm sàn per-host 112s ở T11.5.
+
+### T11.8 — Nhịp planner 5 phút: chi phí và lợi ích
+
+`due_feeds()` lọc `next_poll_at <= now`, còn `record_feed_poll` đặt
+`next_poll_at = now + FEED_POLL_INTERVAL_SECONDS` (1800s). Độ cũ của feed đo
+được: p50 **26.4 min**, p90 29.6 min — tức là interval 30 phút đang là ràng buộc
+thật sự và đang được tôn trọng, chứ không phải nhịp cron.
+
+Vì vậy độ trễ lập lịch ≈ `interval/2 + cadence/2`:
+
+| Cấu hình | interval | cadence | Độ trễ lập lịch kỳ vọng | Feed due mỗi chu kỳ |
+| --- | --- | --- | --- | --- |
+| Hiện tại | 30 min | 30 min | 30 min | ~375 |
+| Chỉ đổi nhịp planner | 30 min | 5 min | 17.5 min | ~62 |
+| Đổi cả hai (đồng loạt) | 10 min | 5 min | 7.5 min | ~190 |
+| Adaptive theo T11.6 | 5 min / 30 min / 6h | 5 min | ~5 min cho feed có bài | ~50 |
+
+Ngân sách poll mỗi ngày:
+
+| Chiến lược | Lượt poll/ngày |
+| --- | --- |
+| Hiện tại (375 feed × 48) | 18.000 |
+| Hạ interval đồng loạt xuống 10 phút | 54.000 (3×) |
+| Adaptive: 37 feed × 5min + 42 × 30min + 296 × 6h | **13.856 (ít hơn hôm nay)** |
+
+Adaptive interval vừa giảm tải publisher vừa cho nhóm 37 feed thực sự có bài
+được poll dày gấp 6 lần. Đây là đòn bẩy độ trễ lớn nhất còn lại sau khi
+scheduler chạy ổn định (T11.2), và nó không cần thêm worker nào.
+
+### T12 — Cadence từ RSS fetch on-demand (2026-09-03)
+
+Đo lại policy adaptive bằng chính nội dung RSS vừa fetch thay vì suy ra từ
+`last_entry_published_at` trong database. Command gửi request unconditional
+(không ETag/Last-Modified) đúng một lần cho mỗi feed, không ghi database:
+
+```bash
+uv run python scripts/bench_ingest.py cadence --sample 0 --concurrency 8 --timeout 20
+```
+
+Một publication event là một timestamp phân biệt sau khi bỏ entry trùng URL.
+Policy yêu cầu tối thiểu 3 gap; thiếu bằng chứng ở tier 5m. Boundary là strict:
+gap đúng 30m vào 5m, gap đúng 6h vào 30m.
+
+| Chỉ số | Giá trị |
+| --- | --- |
+| Feed active | 369 |
+| Fetch thành công / thất bại | 333 / 36 |
+| Đủ ≥3 gap / thiếu mẫu | **320 / 13** |
+| p50 số gap/feed thành công | 11 |
+| Có batch trùng timestamp | 60 feed |
+| Có / không có validator trong response mới | 290 / 43 |
+| Thời gian fetch toàn bộ, c=8 | 101.9s |
+
+Phân bố tier và budget; cột upper bound giả sử cả 36 fetch lỗi đều ở 5m. Đây
+là trần bảo thủ — production vẫn dùng retry backoff nên số request thật thấp
+hơn. Full-body bytes/ngày chỉ cộng 43 feed thành công không có validator và là
+kích thước body đã decompress, không phải network transfer chính xác.
+
+| Estimator | 5m | 30m | 6h | Poll/ngày, 333 feed thành công | Upper bound, cả 369 | Full body/ngày |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mean | 13 | 10 | 310 | 5.464 | 15.832 | 43.6 MB |
+| Median | 17 | 14 | 302 | 6.776 | 17.144 | 50.7 MB |
+| Trimmed mean 10% | 14 | 12 | 307 | **5.836** | **16.204** | **47.0 MB** |
+
+Baseline cố định 30m là 15.984 poll/ngày trên cùng 333 feed thành công, hoặc
+17.712 trên cả 369 feed. Ngay cả upper bound của trimmed mean vẫn thấp hơn
+baseline toàn tập 1.508 request/ngày (8.5%). Có 9 feed newest entry đã cũ hơn
+24h nhưng vẫn vào tier 5m dưới cả ba estimator: cadence lịch sử không phát hiện
+feed đã ngừng xuất bản. Tuy nhiên 9 feed này chưa làm budget vượt baseline, nên
+chưa đủ căn cứ thêm idle-backoff trái với invariant strict của policy.
+
+**Hướng chốt:** dùng trimmed mean 10% làm estimator ban đầu vì nó vẫn là
+"khoảng cách trung bình" nhưng giảm ảnh hưởng của hai đầu phân bố; tối thiểu 3
+gap; thiếu mẫu ở 5m; giữ tier cũ khi 304; fetch unconditional đúng một lần để
+bootstrap. Lưu metric, sample count và tier trong `feed_state` để 304 có thể
+dùng lại và để audit được invariant. Theo dõi riêng 9 feed stale/5m sau rollout;
+chỉ thêm idle-backoff nếu actual poll/byte budget hoặc publisher load vượt gate.
+
+
 
 Các bảng dưới đây được tạo trước theo §12.6 của kế hoạch; điền số liệu khi
 task tương ứng hoàn thành. Không điền trước khi có code thật chạy.

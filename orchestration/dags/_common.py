@@ -82,8 +82,41 @@ COMMON = dict(
         "NEWS_RADAR_AIRFLOW_DAG_ID": "{{ dag.dag_id }}",
         "NEWS_RADAR_AIRFLOW_TASK_ID": "{{ task.task_id }}",
         "NEWS_RADAR_IMAGE_REVISION": WORKER_IMAGE,
+        "MAX_CONCURRENT_FEEDS": (
+            "{{ var.value.get('news_radar_max_concurrent_feeds', '8') }}"
+        ),
+        "MAX_CONCURRENT_CRAWLS": (
+            "{{ var.value.get('news_radar_max_concurrent_crawls', '6') }}"
+        ),
+        "FEED_FETCH_TIMEOUT_SECONDS": (
+            "{{ var.value.get('news_radar_feed_fetch_timeout_seconds', '8') }}"
+        ),
+        "FEED_POLL_FAST_INTERVAL_SECONDS": (
+            "{{ var.value.get('news_radar_feed_poll_fast_interval_seconds', '300') }}"
+        ),
+        "FEED_POLL_INTERVAL_SECONDS": (
+            "{{ var.value.get('news_radar_feed_poll_interval_seconds', '1800') }}"
+        ),
+        "FEED_POLL_SLOW_INTERVAL_SECONDS": (
+            "{{ var.value.get('news_radar_feed_poll_slow_interval_seconds', '21600') }}"
+        ),
+        "FEED_POLL_MIN_GAPS": (
+            "{{ var.value.get('news_radar_feed_poll_min_gaps', '3') }}"
+        ),
+        "FEED_POLL_TRIM_FRACTION": (
+            "{{ var.value.get('news_radar_feed_poll_trim_fraction', '0.1') }}"
+        ),
+        "FEED_POLL_FUTURE_TOLERANCE_SECONDS": (
+            "{{ var.value.get('news_radar_feed_poll_future_tolerance_seconds', '300') }}"
+        ),
     },
 )
+
+
+def _cooperative_budget_minutes(timeout: timedelta) -> int:
+    hard_minutes = int(timeout.total_seconds() // 60)
+    reserve_minutes = min(5, max(1, hard_minutes // 4))
+    return max(1, hard_minutes - reserve_minutes)
 
 
 def _container(
@@ -117,9 +150,9 @@ def worker(
 ) -> DockerOperator:
     """One run of one of the four workers (crawl, embed, classify, cluster).
 
-    `--trigger` is always passed explicitly. The hard Airflow timeout is five
-    minutes longer than the worker-owned cooperative budget, leaving time to
-    checkpoint the active chunk and emit its final JSON summary.
+    `--trigger` is always passed explicitly. Reserve 25% of short timeouts and
+    at most five minutes of long ones for the active chunk to checkpoint and
+    emit its final JSON summary before Airflow stops the container.
     """
     command = [
         *argv,
@@ -133,7 +166,7 @@ def worker(
         "--summary-json",
         "/dev/stdout",
         "--max-runtime",
-        f"{max(1, int(timeout.total_seconds() // 60) - 5)}m",
+        f"{_cooperative_budget_minutes(timeout)}m",
     ]
     kwargs.setdefault("do_xcom_push", True)
     return _container(
