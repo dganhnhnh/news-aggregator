@@ -675,3 +675,79 @@ identity, quality gate và clustering MVP đã chạy trên corpus sạch hơn.
 | --- | --- | --- |
 | L2 SimHash | duplicate rate còn lại theo source, embedding cost lãng phí, false-positive sample, candidates/article | backlog, chưa đo |
 | L3 semantic | same-source repetition, ảnh hưởng centroid/headline/UX, cross-source evidence retained | backlog, chưa đo |
+
+---
+
+## Resume — Evidence snapshot (2026-09-05)
+
+Đối chiếu cho phần **News Aggregation Platform** trong
+[base-resume.json](base-resume.json). Chỉ đọc DB local qua Compose; không chạy
+thêm job hoặc sửa dữ liệu. Đây không phải phép đo rollout T13 hay load test.
+Hai transaction chụp lúc **16:46:20 và 16:47:09 UTC**, cùng ngày 2026-09-05,
+đều trả về 2.278 article.
+
+### Số liệu được dùng trong resume
+
+| Claim | Bằng chứng | Phạm vi |
+| --- | --- | --- |
+| 2.278 article từ 335 source | `count(*)` và `count(DISTINCT source_id)` trên `raw_articles`; không có `source_id` NULL | Corpus local tại thời điểm chụp, không phải lưu lượng/ngày hay giới hạn tải |
+| Giảm 72% thời gian polling (58,3s → 16,2s) | Benchmark T11.3, cùng mẫu 80 feed và concurrency 8; `(58.3 - 16.2) / 58.3 = 72.2%`, làm tròn 72% | Benchmark bước polling ngày 2026-09-03, không phải tăng tốc toàn pipeline; code hiện có bounded worker pool/backpressure trong `RssFeedSearcher.poll_feeds` |
+| Classification khoảng 110 article/s | `worker_runs.id = 583`: `classified=1015`, `failed=0`, thời lượng 9,242s; `1015 / 9.242 ≈ 109.8` | Một lần chạy local ngày 2026-08-28, xử lý embedding đã có; không bao gồm crawl, embedding hoặc khởi động container |
+
+T11.3 là kết quả lịch sử của benchmark barrier/sliding trước thay đổi.
+`scripts/bench_ingest.py feeds` hiện gọi adapter đã dùng sliding worker pool,
+nên chạy lại hai mode trên code hiện tại không tái tạo baseline barrier cũ.
+
+### Query kiểm chứng
+
+Chạy SQL bên dưới qua lệnh (giá trị kết nối lấy trong container, không in `.env`):
+
+```bash
+docker compose -f deployments/docker-compose.yml --env-file .env exec -T db \
+  sh -c 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT now() AS measured_at, count(*) AS articles,
+       count(DISTINCT source_id) AS article_sources,
+       count(*) FILTER (WHERE source_id IS NULL) AS without_source
+FROM raw_articles;
+
+SELECT id, started_at, status, stats->>'classified' AS classified,
+       stats->>'failed' AS failed,
+       round(extract(epoch FROM finished_at - started_at)::numeric, 3) AS seconds,
+       round((stats->>'classified')::numeric /
+             extract(epoch FROM finished_at - started_at), 1) AS articles_per_second
+FROM worker_runs WHERE id = 583 AND worker = 'classify';
+
+SELECT stage, state, count(*) FROM processing_jobs GROUP BY 1, 2 ORDER BY 1, 2;
+SELECT poll_interval_seconds, count(*), count(cadence_checked_at) AS bootstrapped
+FROM feed_state WHERE disabled_at IS NULL GROUP BY 1 ORDER BY 1;
+COMMIT;
+SQL
+```
+
+### Đối chiếu triển khai và giới hạn diễn giải
+
+- Corpus có 2.278 embedding, 2.278 classification record và 2.278 cluster member;
+  cả ba stage queue đều có 2.278 job `done`, không có state khác ở snapshot.
+  Classification record có thể là `uncategorized`; không suy ra 100% bài có topic
+  hay độ chính xác của classifier. Có 1.914 cluster chưa merged, trong đó 169
+  có nhiều bài và 101 có nhiều source; không gọi tất cả là story đa nguồn.
+- `PostgresRawStorage.apply_batch` commit article và enqueue embed trong cùng
+  transaction; `upsert_embeddings` commit vector và enqueue classify/cluster
+  trong cùng transaction. `PostgresJobQueue` có lease/reclaim, retry/backoff và
+  dead-letter; `workers/base.py` có checkpoint và cooperative shutdown. Đây là
+  cơ chế phục hồi đã triển khai, không phải bằng chứng exactly-once hay zero loss
+  trong mọi trường hợp.
+- DAG `news_ingest` có lịch 5 phút và asset gate theo queue; `news_semantic`
+  chạy classify/cluster độc lập sau embed. DAG backfill và replay đã có. Không
+  claim topic-invariant gate đang hoạt động: gate cuối `news_semantic.py` hiện
+  đang bị comment trong working tree.
+- Cadence thích ứng đã có trong code nhưng **chưa có bằng chứng đang áp dụng
+  trong runtime**: cả 348 active feed đều có `poll_interval_seconds` NULL và
+  `cadence_checked_at` NULL; run crawl 1317 còn ghi `poll_interval=1800`.
+  Không đưa mức tiết kiệm request dự phóng 8,5% của T12 vào resume như thành quả
+  vận hành thực tế.
+- Trong 7 ngày trước snapshot đầu, crawl có 171 run `partial`, 10 `succeeded`
+  và 2 `abandoned`. Không dùng trạng thái Airflow thành công hoặc queue đã drain
+  để suy ra SLA, uptime hay tỷ lệ crawl thành công. Không dùng dự phóng 2,5× ở
+  T11.7, mục tiêu publication-to-ingestion latency, hay accuracy chưa được đo.

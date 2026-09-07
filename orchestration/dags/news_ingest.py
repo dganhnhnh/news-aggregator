@@ -13,7 +13,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.sdk import Asset, dag, task
 from airflow.sdk.exceptions import AirflowSkipException
 
-from _common import FEED_PATH, JOBS_ASSET_URI, PG_CONN_ID, dag_defaults, worker
+from _common import JOBS_ASSET_URI, PG_CONN_ID, dag_defaults, worker
 
 
 JOBS = Asset(JOBS_ASSET_URI)
@@ -39,8 +39,9 @@ def news_ingest():
     crawl = worker(
         "crawl",
         "crawl",
-        "--feed-path",
-        FEED_PATH,
+        # `feed_state` is the source of truth for scheduled ingestion. Feed
+        # files are only an explicit, one-off seeding mechanism; coupling this
+        # task to one would make a deleted OPML file stop every crawl run.
         # Relative, not the DAG's data_interval: an explicit window would be
         # recorded as a backfill, and feeds only retain recent entries anyway.
         "--last",

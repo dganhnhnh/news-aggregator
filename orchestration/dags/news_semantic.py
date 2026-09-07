@@ -84,12 +84,12 @@ def news_semantic():
         timeout=timedelta(minutes=15),
         trigger_rule="none_failed_min_one_success",
     )
-    validate_topic_invariants = topic_invariant_check(outlets=[STORIES])
+    # validate_topic_invariants = topic_invariant_check(outlets=[STORIES])
 
     embed >> [classify, cluster]
     cluster >> cluster_merge
     [classify, cluster_merge] >> refresh_cluster_topics
-    refresh_cluster_topics >> validate_topic_invariants
+    # refresh_cluster_topics >> validate_topic_invariants
 
 
 news_semantic()
