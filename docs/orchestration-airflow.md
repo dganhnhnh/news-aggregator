@@ -3,7 +3,7 @@
 > Chi tiết hoá §4.1 "Mô hình vận hành worker" của [spec.md](spec.md), thay thế
 > phần "Cron / systemd timer" ở §4.1.1 cho môi trường có nhiều hơn một worker.
 >
-> **Trạng thái: ĐÃ TRIỂN KHAI (2026-08-30), chưa chạy trên môi trường thật.**
+> **Trạng thái: ĐÃ TRIỂN KHAI (cập nhật 2026-09-08), chưa chạy trên môi trường thật.**
 > Đích triển khai là **single-host Docker** trên **Airflow 3.3.1 / Python
 > 3.12**. Toàn bộ code của Phase 1–4 đã có trong repo (§9). Đã kiểm chứng:
 > sáu DAG parse sạch bằng `DagBag` thật; mọi command line chúng sinh ra đều
@@ -89,15 +89,15 @@ không làm gì.
 Sáu DAG, tách theo **nhịp**, **rủi ro** và quyền thay đổi dữ liệu.
 
 ```text
+instant-crawl container  (poll liên tục, ngoài Airflow)
+  feed priority 0 → raw_articles + processing_jobs(priority=0)
+
 news_ingest              (*/5 phút)
-  preflight_db → crawl → queue_gate ─┐
-                                     └─▶ Asset("news-radar://processing_jobs")
-                                                    │
-news_semantic            (schedule = Asset trên)    ▼
-  embed ─┬─▶ classify ──┐
-         └─▶ cluster ───┴─▶ cluster_merge → refresh_cluster_topics → invariants
-                                                    │
-                                                    └─▶ Asset("news-radar://stories")
+  preflight_db → crawl feed priority 1
+
+news_semantic            (*/15 phút)
+  queue_gate → embed ─┬─▶ classify ──┐
+                      └─▶ cluster ───┴─▶ cluster_merge → refresh_cluster_topics
 
 news_maintenance         (0 3 * * *)
   cluster_repair → cleanup_block_pages (dry-run) → run_health_report
@@ -117,17 +117,17 @@ news_dlq_replay          (schedule=None, apply=false mặc định)
 | DAG                     | Lịch                          | Vì sao tách riêng                                                                                       |
 | ----------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------- |
 | `news_ingest`           | `*/5 * * * *`                 | Phụ thuộc mạng ngoài, `partial` là bình thường; feed tự giữ tier 5m/30m/6h                              |
-| `news_semantic`         | Asset-triggered               | Tính toán nội bộ, `failed` ở đây mới là tín hiệu thật; `embed` phải nạp MiniLM nên chạy dày là lãng phí |
+| `news_semantic`         | `*/15 * * * *`                | Semantic không critical theo từng bài; queue gate tránh nạp MiniLM khi không có việc                    |
 | `news_maintenance`      | Hằng ngày 03:00               | Thao tác sửa chữa, không được xen vào đường ingest                                                      |
 | `news_taxonomy_refresh` | Trigger tay + params          | Thay đổi taxonomy kéo theo reclassify diện rộng, phải có người quyết định                               |
 | `news_backfill`         | Trigger tay + `since`/`until` | Cửa sổ explicit, strict và tối đa 31 ngày; không làm scheduled DAG phức tạp                             |
 | `news_dlq_replay`       | Trigger tay, preview mặc định | Dead letter đã hết retry budget; không được tự replay thành poison loop hằng ngày                       |
 
 
-**Vì sao không gộp** `ingest` **và** `semantic` **làm một DAG:** trộn chung thì một
-feed hỏng sẽ che mất một lỗi classifier, và hai nhịp chạy hợp lý của chúng
-khác nhau. Asset cho đúng ngữ nghĩa `depends_on` mong muốn: `news_semantic`
-chỉ chạy khi `news_ingest` **thật sự** đưa được job vào queue.
+**Vì sao không gộp** `ingest` **và** `semantic` **làm một DAG:** một feed hỏng
+sẽ che mất một lỗi classifier, và hai nhịp chạy hợp lý của chúng khác nhau.
+Semantic chạy lịch riêng vì job có thể đến từ cả Airflow crawl lẫn container
+instant-crawl. Queue gate chỉ cho pipeline chạy khi có job actionable.
 
 **Kỷ luật bắt buộc trong** `news_semantic`**:** `refresh_cluster_topics` chạy sau
 hai nhánh với `trigger_rule="none_failed_min_one_success"`. Sau đó một SQL
@@ -265,34 +265,9 @@ Hai điểm bản triển khai khác phác thảo trên, cả hai đều do th�
    nhờ đó một biểu thức Jinja render ra rỗng — `{{ '--prune' if params.prune  else '' }}` trong `news_taxonomy_refresh` — biến mất khỏi argv thay vì tới
    argparse dưới dạng chuỗi rỗng.
 
-```python
-# orchestration/dags/news_ingest.py
-JOBS = Asset("news-radar://processing_jobs")
-
-@dag(schedule="*/5 * * * *", catchup=False, max_active_runs=1,
-     dagrun_timeout=timedelta(minutes=9))
-def news_ingest():
-    preflight = SQLExecuteQueryOperator(
-        task_id="preflight_db", conn_id="news_radar_pg", retries=1,
-        sql="SELECT 1 FROM alembic_version",   # kiểm tra, không migrate
-    )
-    crawl = worker(
-        "crawl", "crawl", "--feed-path", "/data/engineering_blogs.opml",
-        "--last", "12h", pool="news_crawl", timeout=timedelta(minutes=8),
-    )
-
-    @task(outlets=[JOBS])
-    def queue_gate():
-        """Chỉ phát Asset khi thật sự có việc; tránh nạp MiniLM cho queue rỗng."""
-        pending = PostgresHook("news_radar_pg").get_first(
-            "SELECT count(*) FROM processing_jobs "
-            "WHERE stage='embed' AND state='pending' AND available_at <= now()"
-        )[0]
-        if not pending:
-            raise AirflowSkipException("không có job embed nào pending")
-
-    preflight >> crawl >> queue_gate()
-```
+`news_ingest.py` chỉ còn `preflight_db → crawl`. `news_semantic.py` chạy mỗi
+15 phút và đặt queue gate trước `embed`; gate tính cả pending job đã tới hạn
+và running job hết lease để worker có cơ hội reclaim sau một process chết.
 
 
 
@@ -466,7 +441,7 @@ materialized topic labels đã lệch khỏi article-level source rows.
 | Phase | Nội dung                                                                                                              | Deliverable                                                                                                  | Trạng thái |
 | ----- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ---------- |
 | **1** | `Dockerfile.worker`, `docker-compose.airflow.yml` (LocalExecutor, metadata DB **riêng**), `_common.py`, `news_ingest` | Trigger tay `news_ingest`, đối chiếu `worker_runs` với một run cron tương đương. Cron cũ vẫn chạy song song. | Code xong  |
-| **2** | `news_semantic` + Asset; bật lịch `news_ingest`, tắt cron; làm §7.1 và §7.2                                           | Một vòng crawl→story tự động, đầy đủ, không thao tác tay                                                     | Code xong  |
+| **2** | `news_semantic` định kỳ; bật lịch `news_ingest`, tắt cron; làm §7.1 và §7.2                                           | Một vòng crawl→story tự động, đầy đủ, không thao tác tay                                                     | Code xong  |
 | **3** | `news_maintenance`, `news_taxonomy_refresh` với params; §7.3                                                          | Xoá được mục "Chạy flow Week 2 end-to-end" khỏi README                                                       | Code xong  |
 | **4** | Manual `news_backfill`, preview/apply `news_dlq_replay`; max-runtime, correlation, invariants; bỏ nightly DLQ replay  | Backfill/replay từ UI có guardrail, không tạo poison loop                                                    | Code xong  |
 

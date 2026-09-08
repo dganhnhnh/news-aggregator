@@ -134,6 +134,94 @@ async def _test_due_feeds_ordering_filtering_and_explicit_urls_bypass_disabled()
         await storage.close()
 
 
+def test_feed_priority_partitions_instant_and_normal_polling() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_feed_priority_partitions_instant_and_normal_polling())
+
+
+async def _test_feed_priority_partitions_instant_and_normal_polling() -> None:
+    instant = "https://feed-state.integration.example/instant.xml"
+    normal = "https://feed-state.integration.example/normal.xml"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        await _delete_feeds(engine, [instant, normal])
+        await storage.seed_feeds(
+            [
+                FeedSeed(instant, "Instant", priority=0),
+                FeedSeed(normal, "Normal", priority=1),
+            ]
+        )
+
+        instant_targets = await storage.due_feeds(
+            limit=0, priority=0, ignore_schedule=True
+        )
+        normal_targets = await storage.due_feeds(
+            limit=0, priority=1, ignore_schedule=True
+        )
+        assert [item.feed_url for item in instant_targets if item.feed_url == instant] == [
+            instant
+        ]
+        assert normal not in {item.feed_url for item in instant_targets}
+        assert instant not in {item.feed_url for item in normal_targets}
+
+        assert await storage.set_feed_priority(normal, 0) is True
+        moved = await storage.due_feeds(limit=0, priority=0, ignore_schedule=True)
+        assert {item.feed_url for item in moved}.issuperset({instant, normal})
+    finally:
+        if ready:
+            await _delete_feeds(engine, [instant, normal])
+        await engine.dispose()
+        await storage.close()
+
+
+def test_crawl_failure_keeps_highest_priority_for_retry() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_crawl_failure_keeps_highest_priority_for_retry())
+
+
+async def _test_crawl_failure_keeps_highest_priority_for_retry() -> None:
+    url = "https://feed-state.integration.example/instant-article"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    failure = CrawlFailureOccurrence(
+        failure_kind="article",
+        url=url,
+        error_type="Timeout",
+        error_message="temporary",
+    )
+    try:
+        await storage.check_ready()
+        async with engine.begin() as connection:
+            await connection.execute(
+                delete(crawl_failures).where(crawl_failures.c.url == url)
+            )
+
+        await storage.apply_batch(
+            [], [failure], [], received=0, rejected=0, priority=0
+        )
+        await storage.apply_batch(
+            [], [failure], [], received=0, rejected=0, priority=1
+        )
+        async with engine.connect() as connection:
+            priority = await connection.scalar(
+                select(crawl_failures.c.priority).where(crawl_failures.c.url == url)
+            )
+        assert priority == 0
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(
+                delete(crawl_failures).where(crawl_failures.c.url == url)
+            )
+        await engine.dispose()
+        await storage.close()
+
+
 def test_record_feed_failure_backoff_and_disable_threshold_then_poll_resets() -> None:
     if not DATABASE_URL:
         pytest.skip("TEST_DATABASE_URL is not set")

@@ -106,6 +106,7 @@ crawl_failures = Table(
     Column("source", Text),
     Column("title", Text),
     Column("published_at", DateTime(timezone=True)),
+    Column("priority", Integer, nullable=False, server_default="1"),
     Column("error_type", Text, nullable=False),
     Column("error_message", Text, nullable=False),
     Column("attempt_count", Integer, nullable=False),
@@ -115,7 +116,11 @@ crawl_failures = Table(
     Column("dead_lettered_at", DateTime(timezone=True)),
     PrimaryKeyConstraint("failure_kind", "url", name="pk_crawl_failures"),
 )
-Index("ix_crawl_failures_next_retry_at", crawl_failures.c.next_retry_at)
+Index(
+    "ix_crawl_failures_next_retry_at",
+    crawl_failures.c.priority,
+    crawl_failures.c.next_retry_at,
+)
 
 worker_runs = Table(
     "worker_runs",
@@ -151,6 +156,9 @@ feed_state = Table(
     metadata,
     Column("feed_url", Text, primary_key=True),
     Column("source_label", Text),
+    # Smaller values are processed first. 0 is the continuously-polled tier;
+    # the existing scheduled feed set defaults to normal priority 1.
+    Column("priority", Integer, nullable=False, server_default="1"),
     # Where a permanent (301/308) redirect actually lands. `feed_url` stays the
     # identity from the OPML/TSV file so re-seeding cannot resurrect a URL we
     # already know has moved; polls follow `resolved_url` when it is set.
@@ -202,6 +210,9 @@ processing_jobs = Table(
         nullable=False,
     ),
     Column("stage", Text, nullable=False),
+    # Propagated from the feed that caused the write. Queue consumers sort
+    # ascending so priority 0 work is claimed before priority 1.
+    Column("priority", Integer, nullable=False, server_default="1"),
     Column("state", Text, nullable=False, server_default="pending"),
     Column("attempts", Integer, nullable=False, server_default="0"),
     Column(
@@ -226,6 +237,7 @@ processing_jobs = Table(
 Index(
     "ix_processing_jobs_ready",
     processing_jobs.c.stage,
+    processing_jobs.c.priority,
     processing_jobs.c.available_at,
     postgresql_where=text("state = 'pending'"),
 )

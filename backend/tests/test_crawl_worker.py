@@ -19,6 +19,7 @@ from models.storage_models import (
 )
 from workers.base import RunContext
 from workers.crawl import CrawlWorker
+from workers.instant_crawl import InstantCrawlWorker
 from workers.window import RunWindow
 
 
@@ -99,7 +100,10 @@ class FakeStorage:
     def set_known_urls(self, urls: set[str]) -> None:
         self._known = urls
 
-    async def due_failures(self, limit: int) -> list:
+    async def due_failures(
+        self, limit: int, *, priority: int | None = None
+    ) -> list:
+        self.calls.append(("due_failures", priority))
         return []
 
     async def purge_stale_feed_failures(self) -> int:
@@ -115,9 +119,17 @@ class FakeStorage:
         limit: int,
         feed_urls: Sequence[str] | None = None,
         ignore_schedule: bool = False,
+        priority: int | None = None,
     ) -> list[FeedPollTarget]:
-        self.calls.append(("due_feeds", tuple(feed_urls) if feed_urls else None))
-        return [t for t in self._due_feeds if t.feed_url not in self._disabled]
+        self.calls.append(
+            ("due_feeds", tuple(feed_urls) if feed_urls else None, priority)
+        )
+        return [
+            target
+            for target in self._due_feeds
+            if target.feed_url not in self._disabled
+            and (priority is None or target.priority == priority)
+        ]
 
     async def known_urls(self, candidates: Sequence[str]) -> set[str]:
         self.calls.append(("known_urls", tuple(candidates)))
@@ -178,8 +190,11 @@ class FakeStorage:
         *,
         received: int,
         rejected: int,
+        priority: int = 1,
     ) -> StorageWriteSummary:
-        self.calls.append(("apply_batch", len(articles), len(failures)))
+        self.calls.append(
+            ("apply_batch", len(articles), len(failures), priority)
+        )
         return StorageWriteSummary(received, 0, len(articles), 0, rejected)
 
     async def update_run(self, run_id: int, stats: Any) -> None:
@@ -220,6 +235,52 @@ def _run(
         storage=storage,
     )
     return asyncio.run(CrawlWorker().execute(ctx))
+
+
+def _run_instant(
+    storage: FakeStorage,
+    discovery: FakeDiscovery,
+    args: argparse.Namespace,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(crawl_module, "RssDiscovery", lambda searcher: discovery)
+    ctx = RunContext(
+        run_id=1,
+        window=_window(),
+        shutdown=asyncio.Event(),
+        args=args,
+        storage=storage,
+    )
+    return asyncio.run(InstantCrawlWorker().execute(ctx))
+
+
+def test_instant_worker_only_queries_priority_zero_and_uses_fixed_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instant = replace(_target(), priority=0, poll_interval_seconds=21600)
+    normal = replace(
+        _target("https://feed.example/normal.xml"),
+        priority=1,
+    )
+    storage = FakeStorage()
+    storage.set_due_feeds([instant, normal])
+    discovery = FakeDiscovery(
+        [FeedPoll(target=instant, status="not_modified")]
+    )
+
+    _run_instant(
+        storage,
+        discovery,
+        _args(poll_interval=30),
+        monkeypatch=monkeypatch,
+    )
+
+    assert ("due_failures", 0) in storage.calls
+    assert ("due_feeds", None, 0) in storage.calls
+    poll_call = next(call for call in storage.calls if call[0] == "record_feed_poll")
+    remaining = (poll_call[3] - datetime.now(timezone.utc)).total_seconds()
+    assert 28 <= remaining <= 30
 
 
 def test_not_modified_feed_skips_crawl_and_advances_schedule(

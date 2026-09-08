@@ -29,6 +29,8 @@ def _chunks(items: list, size: int) -> Iterator[list]:
 
 class CrawlWorker(Worker):
     name = "crawl"
+    feed_priority = 1
+    adaptive_polling = True
 
     def run_params(self, args: argparse.Namespace) -> Mapping[str, Any]:
         return {
@@ -42,11 +44,16 @@ class CrawlWorker(Worker):
             "crawl_batch_size": args.crawl_batch_size,
             "user_agent": args.user_agent,
             "feed_fetch_timeout": args.feed_fetch_timeout,
-            "poll_tiers": [
-                args.poll_fast_interval,
-                args.poll_interval,
-                args.poll_slow_interval,
-            ],
+            "feed_priority": self.feed_priority,
+            "poll_tiers": (
+                [
+                    args.poll_fast_interval,
+                    args.poll_interval,
+                    args.poll_slow_interval,
+                ]
+                if self.adaptive_polling
+                else [args.poll_interval]
+            ),
             "poll_min_gaps": args.poll_min_gaps,
             "poll_trim_fraction": args.poll_trim_fraction,
             "poll_future_tolerance": args.poll_future_tolerance,
@@ -84,7 +91,11 @@ class CrawlWorker(Worker):
         if args.feed_path is not None:
             seeded = await storage.seed_feeds(
                 [
-                    FeedSeed(feed_url=source.rss_url, source_label=source.query_label)
+                    FeedSeed(
+                        feed_url=source.rss_url,
+                        source_label=source.query_label,
+                        priority=self.feed_priority,
+                    )
                     for source in searcher._load_queries()
                 ]
             )
@@ -100,8 +111,11 @@ class CrawlWorker(Worker):
             limit=args.max_retries_per_run,
             max_concurrent_crawls=args.max_concurrent_crawls,
             crawl_batch_size=args.crawl_batch_size,
+            priority=self.feed_priority,
         ):
-            retry_summary = await persist_batch(storage, retry_batch)
+            retry_summary = await persist_batch(
+                storage, retry_batch, priority=self.feed_priority
+            )
             stats.add_batch(retry_batch)
             stats.retries_attempted += retries_attempted
             stats.retries_succeeded += retries_succeeded
@@ -122,9 +136,14 @@ class CrawlWorker(Worker):
                 limit=args.max_feeds,
                 feed_urls=args.feeds or None,
                 ignore_schedule=args.ignore_schedule,
+                priority=self.feed_priority,
             )
             if not targets and args.feed_path is None:
-                probe = await storage.due_feeds(limit=1, ignore_schedule=True)
+                probe = await storage.due_feeds(
+                    limit=1,
+                    ignore_schedule=True,
+                    priority=self.feed_priority,
+                )
                 if not probe:
                     logger.warning(
                         "feed_state is empty; seed it once with "
@@ -148,8 +167,12 @@ class CrawlWorker(Worker):
                 if poll.status == "not_modified":
                     stats.feeds_not_modified += 1
                     interval = (
-                        poll.target.poll_interval_seconds
-                        or args.poll_fast_interval
+                        (
+                            poll.target.poll_interval_seconds
+                            or args.poll_fast_interval
+                        )
+                        if self.adaptive_polling
+                        else args.poll_interval
                     )
                     next_poll_at = datetime.now(timezone.utc) + timedelta(
                         seconds=interval
@@ -183,7 +206,11 @@ class CrawlWorker(Worker):
                         permanent=poll.error.permanent,
                         resolved_url=poll.resolved_url,
                     )
-                    await persist_batch(storage, CrawlBatch(failures=[poll.error]))
+                    await persist_batch(
+                        storage,
+                        CrawlBatch(failures=[poll.error]),
+                        priority=poll.target.priority,
+                    )
                     if outcome.disabled:
                         stats.feeds_disabled += 1
                         if poll.error.permanent:
@@ -212,15 +239,19 @@ class CrawlWorker(Worker):
                     trim_fraction=args.poll_trim_fraction,
                     future_tolerance_seconds=args.poll_future_tolerance,
                 )
-                interval = poll_interval_for_gap(
-                    cadence.trimmed_mean_gap_seconds,
-                    gap_count=cadence.gap_count,
-                    min_gaps=args.poll_min_gaps,
-                    tiers_seconds=(
-                        args.poll_fast_interval,
-                        args.poll_interval,
-                        args.poll_slow_interval,
-                    ),
+                interval = (
+                    poll_interval_for_gap(
+                        cadence.trimmed_mean_gap_seconds,
+                        gap_count=cadence.gap_count,
+                        min_gaps=args.poll_min_gaps,
+                        tiers_seconds=(
+                            args.poll_fast_interval,
+                            args.poll_interval,
+                            args.poll_slow_interval,
+                        ),
+                    )
+                    if self.adaptive_polling
+                    else args.poll_interval
                 )
                 next_poll_at = cadence_observed_at + timedelta(seconds=interval)
                 await persist_batch(
@@ -271,7 +302,9 @@ class CrawlWorker(Worker):
 
                 for chunk in _chunks(selected, args.crawl_batch_size):
                     batch = await discovery.crawl_entries(chunk)
-                    summary = await persist_batch(storage, batch)
+                    summary = await persist_batch(
+                        storage, batch, priority=poll.target.priority
+                    )
                     stats.add_batch(batch)
                     stats.articles_written += summary.written
                     stats.articles_unchanged += summary.unchanged

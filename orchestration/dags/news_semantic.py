@@ -1,36 +1,47 @@
 """Embed → classify/cluster → merge → refresh: everything after ingestion.
 
-Asset-triggered rather than scheduled, so it runs exactly when `news_ingest`
-actually queued work. A failure here is a real signal — nothing in this DAG
-depends on a third-party host being up.
+Scheduled independently because semantic freshness is not latency-critical.
+The queue gate keeps empty runs cheap while allowing work from either the
+instant or normal crawl tier to be processed in priority order.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 
-from airflow.sdk import Asset, dag
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.sdk import dag, task
+from airflow.sdk.exceptions import AirflowSkipException
 
 from _common import (
-    JOBS_ASSET_URI,
-    STORIES_ASSET_URI,
+    PG_CONN_ID,
     dag_defaults,
-    topic_invariant_check,
     worker,
 )
 
 
-JOBS = Asset(JOBS_ASSET_URI)
-STORIES = Asset(STORIES_ASSET_URI)
-
-
 @dag(
-    schedule=[JOBS],
+    schedule="*/15 * * * *",
     dagrun_timeout=timedelta(minutes=60),
     doc_md=__doc__,
     **dag_defaults(),
 )
 def news_semantic():
+    @task
+    def queue_gate() -> int:
+        """Skip model startup when no semantic stage has actionable work."""
+        actionable = PostgresHook(postgres_conn_id=PG_CONN_ID).get_first(
+            "SELECT count(*) FROM processing_jobs "
+            "WHERE stage IN ('embed', 'classify', 'cluster') AND ("
+            "(state = 'pending' AND available_at <= now()) OR "
+            "(state = 'running' AND lease_until < now()))"
+        )[0]
+        if not actionable:
+            raise AirflowSkipException("no semantic jobs are actionable")
+        return int(actionable)
+
+    gate = queue_gate()
+
     embed = worker(
         "embed",
         "embed",
@@ -69,11 +80,10 @@ def news_semantic():
         timeout=timedelta(minutes=15),
     )
 
-    # Runs even when classify or cluster skipped on a busy lock. The invariant
-    # check below is the final task and publishes the Asset. `cluster_topics`
-    # is derived data that
-    # `_refresh_cluster_topics_locked` replaces wholesale, so an extra refresh
-    # costs nothing while a missed one leaves a story wearing a stale label.
+    # Runs even when classify or cluster skipped on a busy lock.
+    # `cluster_topics` is derived data that `_refresh_cluster_topics_locked`
+    # replaces wholesale, so an extra refresh costs nothing while a missed
+    # one leaves a story wearing a stale label.
     refresh_cluster_topics = worker(
         "refresh_cluster_topics",
         "classify",
@@ -84,12 +94,9 @@ def news_semantic():
         timeout=timedelta(minutes=15),
         trigger_rule="none_failed_min_one_success",
     )
-    # validate_topic_invariants = topic_invariant_check(outlets=[STORIES])
-
-    embed >> [classify, cluster]
+    gate >> embed >> [classify, cluster]
     cluster >> cluster_merge
     [classify, cluster_merge] >> refresh_cluster_topics
-    # refresh_cluster_topics >> validate_topic_invariants
 
 
 news_semantic()

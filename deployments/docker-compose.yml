@@ -45,6 +45,29 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  instant-crawl:
+    image: ${NEWS_RADAR_WORKER_IMAGE:-news-radar-worker:dev}
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.worker
+    command:
+      - instant-crawl
+      - --last
+      - 12h
+      - --interval
+      - ${INSTANT_FEED_POLL_INTERVAL_SECONDS:-30}
+      - --poll-interval
+      - ${INSTANT_FEED_POLL_INTERVAL_SECONDS:-30}
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@db:5432/${POSTGRES_DB:-news_radar}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      INSTANT_FEED_POLL_INTERVAL_SECONDS: ${INSTANT_FEED_POLL_INTERVAL_SECONDS:-30}
+    depends_on:
+      db:
+        condition: service_healthy
+    shm_size: 1gb
+    restart: unless-stopped
+
 volumes:
   news_radar_postgres_data:
     name: news_radar_postgres_data

@@ -12,7 +12,6 @@ from datetime import timedelta
 from typing import Any, NamedTuple
 
 from adapters.embedding.embedder import Embedder
-from adapters.embedding.fastembed_embedder import FastEmbedEmbedder
 from adapters.storage import PostgresRawStorage
 from core.logger import get_logger
 from models.storage_models import EmbedRunStats, EmbeddingRecord, TextKind
@@ -36,6 +35,7 @@ class _EmbedItem(NamedTuple):
     text: str
     text_hash: bytes
     text_kind: TextKind
+    priority: int
 
 
 class EmbedWorker(Worker):
@@ -60,7 +60,15 @@ class EmbedWorker(Worker):
     async def execute(self, ctx: RunContext) -> RunOutcome:
         args = ctx.args
         storage = ctx.storage
-        embedder = self._embedder or FastEmbedEmbedder()
+        if self._embedder is None:
+            # Import the ONNX runtime only for an actual embed run. Every CLI
+            # command imports this module to register its worker, and eager
+            # loading made crawl containers emit irrelevant CPU warnings.
+            from adapters.embedding.fastembed_embedder import FastEmbedEmbedder
+
+            embedder: Embedder = FastEmbedEmbedder()
+        else:
+            embedder = self._embedder
         queue = self._queue or PostgresJobQueue(storage.engine)
         locked_by = f"embed-{ctx.run_id}-{os.getpid()}"
         stats = EmbedRunStats()
@@ -122,12 +130,20 @@ class EmbedWorker(Worker):
                     # downstream queues existed. Ensure missing jobs even on
                     # the unchanged fast path, without replaying done jobs.
                     await storage.ensure_processing_jobs(
-                        [job.article_id], ("classify", "cluster")
+                        [job.article_id],
+                        ("classify", "cluster"),
+                        priority=job.priority,
                     )
                     await queue.complete(job.article_id, STAGE)
                     continue
                 to_embed.append(
-                    _EmbedItem(job.article_id, text, text_hash, text_kind)
+                    _EmbedItem(
+                        job.article_id,
+                        text,
+                        text_hash,
+                        text_kind,
+                        job.priority,
+                    )
                 )
 
             if to_embed:
@@ -223,4 +239,5 @@ class EmbedWorker(Worker):
             content_hash=item.text_hash,
             embedding=vector,
             text_kind=item.text_kind,
+            priority=item.priority,
         )

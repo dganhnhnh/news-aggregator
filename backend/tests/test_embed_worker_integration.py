@@ -272,3 +272,92 @@ async def _test_embeddable_articles_and_upsert_embeddings_round_trip() -> None:
         await _cleanup(engine, [url], [slug])
         await engine.dispose()
         await storage.close()
+
+
+def test_processing_priority_is_preserved_and_claimed_first() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_processing_priority_is_preserved_and_claimed_first())
+
+
+async def _test_processing_priority_is_preserved_and_claimed_first() -> None:
+    urls = [
+        "https://embed-priority.integration.example/normal",
+        "https://embed-priority.integration.example/instant",
+    ]
+    slug = "embed-priority.integration.example"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    now = datetime.now(timezone.utc)
+    stage = "priority-integration"
+    try:
+        await storage.check_ready()
+        await _cleanup(engine, urls, [slug])
+        await storage.apply_batch(
+            [_article(urls[0], b"n" * 32, now=now)],
+            [],
+            [],
+            received=1,
+            rejected=0,
+            priority=1,
+        )
+        await storage.apply_batch(
+            [_article(urls[1], b"i" * 32, now=now)],
+            [],
+            [],
+            received=1,
+            rejected=0,
+            priority=0,
+        )
+        async with engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    select(raw_articles.c.id, raw_articles.c.url).where(
+                        raw_articles.c.url.in_(urls)
+                    )
+                )
+            ).all()
+        ids = {row.url: int(row.id) for row in rows}
+
+        await storage.ensure_processing_jobs([ids[urls[0]]], [stage], priority=1)
+        await storage.ensure_processing_jobs([ids[urls[1]]], [stage], priority=0)
+        # A normal producer cannot downgrade a job already marked instant.
+        await storage.ensure_processing_jobs([ids[urls[1]]], [stage], priority=1)
+
+        queue = PostgresJobQueue(engine)
+        claimed = await queue.claim(
+            stage, 1, locked_by="priority-test", lease=timedelta(minutes=1)
+        )
+        assert [(job.article_id, job.priority) for job in claimed] == [
+            (ids[urls[1]], 0)
+        ]
+
+        await storage.upsert_embeddings(
+            [
+                EmbeddingRecord(
+                    article_id=ids[urls[1]],
+                    model="priority-test",
+                    dim=384,
+                    content_hash=b"i" * 32,
+                    embedding=[0.1] * 384,
+                    priority=0,
+                )
+            ]
+        )
+        async with engine.connect() as connection:
+            downstream = (
+                await connection.execute(
+                    select(processing_jobs.c.stage, processing_jobs.c.priority).where(
+                        processing_jobs.c.article_id == ids[urls[1]],
+                        processing_jobs.c.stage.in_(("classify", "cluster")),
+                    )
+                )
+            ).all()
+        assert {(row.stage, row.priority) for row in downstream} == {
+            ("classify", 0),
+            ("cluster", 0),
+        }
+    finally:
+        await _cleanup(engine, urls, [slug])
+        await engine.dispose()
+        await storage.close()

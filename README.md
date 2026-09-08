@@ -248,6 +248,34 @@ row.
 `news-service` vẫn chạy được nhưng đã deprecated: nó chỉ in cảnh báo, đổi
 `--interval-seconds` thành `--interval` rồi gọi lại `news-worker crawl`.
 
+## Instant crawl
+
+Feed có `priority=0` được worker riêng poll liên tục; feed mặc định có
+`priority=1` và chỉ do `news-worker crawl` định kỳ xử lý. Số nhỏ hơn là ưu
+tiên cao hơn. Đổi tier cho một feed đã seed:
+
+```bash
+uv run news-worker set-feed-priority https://example.com/feed.xml 0
+```
+
+Chạy worker trên host:
+
+```bash
+uv run news-worker instant-crawl --last 12h --interval 30 --poll-interval 30
+```
+
+Hoặc chạy container cùng PostgreSQL và API:
+
+```bash
+docker compose --env-file .env -f deployments/docker-compose.yml up -d --build instant-crawl
+```
+
+`INSTANT_FEED_POLL_INTERVAL_SECONDS` mặc định là 30 giây. Worker này chỉ lấy
+feed và retry crawl có priority 0; worker `crawl` của Airflow chỉ lấy priority
+1. Bài mới tạo job semantic với cùng priority. `news_semantic` vẫn chạy batch
+15 phút một lần và claim priority 0 trước priority 1; instant crawl không khởi
+động semantic DAG cho từng bài.
+
 ## Điều phối bằng Airflow
 
 Thay cho việc chạy tay chuỗi lệnh ở §"Chạy flow Week 2 end-to-end". Thiết kế và
@@ -258,8 +286,8 @@ trong container riêng** (`DockerOperator`):
 
 | DAG | Lịch | Nội dung |
 |---|---|---|
-| `news_ingest` | `*/30 * * * *` | `preflight_db → crawl → queue_gate`, phát Asset khi có job embed pending |
-| `news_semantic` | Asset-triggered | `embed → classify ‖ cluster → merge → refresh → topic invariants` |
+| `news_ingest` | `*/5 * * * *` | `preflight_db → crawl`; chỉ xử lý feed priority 1 |
+| `news_semantic` | `*/15 * * * *` | queue gate → `embed → classify ‖ cluster → merge → refresh`; xử lý mọi priority |
 | `news_maintenance` | `0 3 * * *` | `cluster --repair`, cleanup dry-run, `queue-status --fail-on-alert`; không tự replay poison item |
 | `news_taxonomy_refresh` | Trigger tay | import → rebuild → reclassify; recluster là param mặc định tắt |
 | `news_backfill` | Trigger tay | full flow strict trên cửa sổ `since`/`until` tối đa 31 ngày |

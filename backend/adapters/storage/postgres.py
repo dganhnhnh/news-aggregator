@@ -637,6 +637,7 @@ class PostgresRawStorage:
         *,
         received: int,
         rejected: int,
+        priority: int = 1,
     ) -> StorageWriteSummary:
         written = 0
         written_article_ids: list[int] = []
@@ -666,7 +667,8 @@ class PostgresRawStorage:
                     (row.failure_kind, row.url): row for row in existing_rows
                 }
                 now = datetime.now(timezone.utc)
-                for key, failure in failure_by_key.items():
+                for key in sorted(failure_by_key):
+                    failure = failure_by_key[key]
                     previous = existing.get(key)
                     attempt = (previous.attempt_count if previous else 0) + 1
                     exhausted = failure.permanent or attempt >= MAX_FAILURE_ATTEMPTS
@@ -692,6 +694,10 @@ class PostgresRawStorage:
                             failure.published_at
                             if failure.published_at is not None
                             else previous.published_at if previous else None
+                        ),
+                        "priority": min(
+                            int(previous.priority) if previous else priority,
+                            priority,
                         ),
                         "error_type": failure.error_type[:200],
                         "error_message": failure.error_message[:2000],
@@ -730,7 +736,10 @@ class PostgresRawStorage:
                     )
                 )
 
-            for article in articles:
+            # Concurrent instant and periodic crawl workers can discover the
+            # same URLs. Lock rows in a stable order to avoid deadlocks when
+            # their batches overlap in a different discovery order.
+            for article in sorted(articles, key=lambda item: item.url):
                 stmt = pg_insert(raw_articles).values(
                     url=article.url,
                     url_original=article.url_original,
@@ -812,7 +821,9 @@ class PostgresRawStorage:
                     written_article_ids.append(int(written_id))
 
             if written_article_ids:
-                await self._enqueue_embed_jobs(connection, written_article_ids)
+                await self._enqueue_embed_jobs(
+                    connection, written_article_ids, priority=priority
+                )
 
         deduplicated = max(received - rejected - len(articles), 0)
         unchanged = max(len(articles) - written, 0)
@@ -826,7 +837,10 @@ class PostgresRawStorage:
 
     @staticmethod
     async def _enqueue_embed_jobs(
-        connection: AsyncConnection, article_ids: Sequence[int]
+        connection: AsyncConnection,
+        article_ids: Sequence[int],
+        *,
+        priority: int = 1,
     ) -> None:
         """Queue (or re-queue) the embed stage for articles just written.
 
@@ -840,6 +854,7 @@ class PostgresRawStorage:
             article_ids,
             ("embed",),
             reset_completed=True,
+            priority=priority,
             now=now,
         )
 
@@ -850,6 +865,7 @@ class PostgresRawStorage:
         stages: Sequence[str],
         *,
         reset_completed: bool,
+        priority: int = 1,
         now: datetime | None = None,
     ) -> None:
         if not article_ids or not stages:
@@ -857,37 +873,86 @@ class PostgresRawStorage:
         timestamp = now or datetime.now(timezone.utc)
         stmt = pg_insert(processing_jobs).values(
             [
-                {"article_id": article_id, "stage": stage}
+                {
+                    "article_id": article_id,
+                    "stage": stage,
+                    "priority": priority,
+                }
                 for article_id in article_ids
                 for stage in stages
             ]
         )
-        if not reset_completed:
-            await connection.execute(stmt.on_conflict_do_nothing())
+        resettable = processing_jobs.c.state.in_(("done", "dead_letter"))
+        if reset_completed:
+            await connection.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[
+                        processing_jobs.c.article_id,
+                        processing_jobs.c.stage,
+                    ],
+                    set_={
+                        # A smaller number is a higher priority. An instant
+                        # rediscovery may upgrade an existing normal job, but
+                        # a later normal crawl must never downgrade it.
+                        "priority": func.least(
+                            processing_jobs.c.priority, priority
+                        ),
+                        "state": case(
+                            (resettable, "pending"),
+                            else_=processing_jobs.c.state,
+                        ),
+                        "attempts": case(
+                            (resettable, 0), else_=processing_jobs.c.attempts
+                        ),
+                        "available_at": case(
+                            (resettable, timestamp),
+                            else_=processing_jobs.c.available_at,
+                        ),
+                        "lease_until": case(
+                            (resettable, None),
+                            else_=processing_jobs.c.lease_until,
+                        ),
+                        "locked_by": case(
+                            (resettable, None), else_=processing_jobs.c.locked_by
+                        ),
+                        "last_error": case(
+                            (resettable, None), else_=processing_jobs.c.last_error
+                        ),
+                        "updated_at": timestamp,
+                    },
+                )
+            )
             return
+
+        # Creating a missing downstream job is enough in the common case.
+        # When the row already exists, only upgrade its priority; do not replay
+        # completed work or disturb an active lease.
         await connection.execute(
             stmt.on_conflict_do_update(
                 index_elements=[processing_jobs.c.article_id, processing_jobs.c.stage],
                 set_={
-                    "state": "pending",
-                    "attempts": 0,
-                    "available_at": timestamp,
-                    "lease_until": None,
-                    "locked_by": None,
-                    "last_error": None,
+                    "priority": priority,
                     "updated_at": timestamp,
                 },
-                where=processing_jobs.c.state.in_(("done", "dead_letter")),
+                where=processing_jobs.c.priority > priority,
             )
         )
 
     async def ensure_processing_jobs(
-        self, article_ids: Sequence[int], stages: Sequence[str]
+        self,
+        article_ids: Sequence[int],
+        stages: Sequence[str],
+        *,
+        priority: int = 1,
     ) -> None:
         """Create missing downstream jobs without replaying completed work."""
         async with self._engine.begin() as connection:
             await self._enqueue_processing_jobs(
-                connection, article_ids, stages, reset_completed=False
+                connection,
+                article_ids,
+                stages,
+                reset_completed=False,
+                priority=priority,
             )
 
     async def embeddable_articles(
@@ -967,12 +1032,20 @@ class PostgresRawStorage:
             # This transaction closes the crash gap between storing a vector
             # and making it visible to downstream stages. A changed embedding
             # deliberately replays completed cluster/classify jobs.
-            await self._enqueue_processing_jobs(
-                connection,
-                [record.article_id for record in records],
-                ("classify", "cluster"),
-                reset_completed=True,
-            )
+            # Preserve the priority carried by each claimed embed job. Group
+            # by priority so the shared enqueue helper can still use bulk SQL.
+            for priority in sorted({record.priority for record in records}):
+                await self._enqueue_processing_jobs(
+                    connection,
+                    [
+                        record.article_id
+                        for record in records
+                        if record.priority == priority
+                    ],
+                    ("classify", "cluster"),
+                    reset_completed=True,
+                    priority=priority,
+                )
 
     async def clusterable_articles(
         self, article_ids: Sequence[int]
@@ -2112,17 +2185,22 @@ class PostgresRawStorage:
                 ],
             )
 
-    async def due_failures(self, limit: int) -> list[StoredCrawlFailure]:
+    async def due_failures(
+        self, limit: int, *, priority: int | None = None
+    ) -> list[StoredCrawlFailure]:
         now = datetime.now(timezone.utc)
         async with self._engine.connect() as connection:
+            stmt = select(crawl_failures).where(
+                crawl_failures.c.next_retry_at <= now,
+                crawl_failures.c.dead_lettered_at.is_(None),
+            )
+            if priority is not None:
+                stmt = stmt.where(crawl_failures.c.priority == priority)
             result = await connection.execute(
-                select(crawl_failures)
-                .where(
-                    crawl_failures.c.next_retry_at <= now,
-                    crawl_failures.c.dead_lettered_at.is_(None),
-                )
-                .order_by(crawl_failures.c.next_retry_at)
-                .limit(limit)
+                stmt.order_by(
+                    crawl_failures.c.priority,
+                    crawl_failures.c.next_retry_at,
+                ).limit(limit)
             )
             return [StoredCrawlFailure(**dict(row._mapping)) for row in result]
 
@@ -2368,7 +2446,11 @@ class PostgresRawStorage:
                 pg_insert(feed_state)
                 .values(
                     [
-                        {"feed_url": seed.feed_url, "source_label": seed.source_label}
+                        {
+                            "feed_url": seed.feed_url,
+                            "source_label": seed.source_label,
+                            "priority": seed.priority,
+                        }
                         for seed in seeds
                     ]
                 )
@@ -2383,6 +2465,7 @@ class PostgresRawStorage:
         limit: int,
         feed_urls: Sequence[str] | None = None,
         ignore_schedule: bool = False,
+        priority: int | None = None,
         now: datetime | None = None,
     ) -> list[FeedPollTarget]:
         now = now or datetime.now(timezone.utc)
@@ -2394,7 +2477,10 @@ class PostgresRawStorage:
             feed_state.c.resolved_url,
             feed_state.c.poll_interval_seconds,
             feed_state.c.cadence_checked_at,
+            feed_state.c.priority,
         )
+        if priority is not None:
+            stmt = stmt.where(feed_state.c.priority == priority)
         if feed_urls:
             stmt = stmt.where(feed_state.c.feed_url.in_(list(feed_urls)))
         else:
@@ -2407,6 +2493,26 @@ class PostgresRawStorage:
         async with self._engine.connect() as connection:
             result = await connection.execute(stmt)
             return [FeedPollTarget(**dict(row._mapping)) for row in result]
+
+    async def set_feed_priority(self, feed_url: str, priority: int) -> bool:
+        """Set a feed's crawl tier; smaller values are processed first."""
+        now = datetime.now(timezone.utc)
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                update(feed_state)
+                .where(feed_state.c.feed_url == feed_url)
+                .values(
+                    priority=priority,
+                    # Make the new owner see the feed immediately. Resetting
+                    # cadence also prevents a 30-second instant interval from
+                    # leaking into adaptive normal polling (or vice versa).
+                    next_poll_at=now,
+                    poll_interval_seconds=None,
+                    cadence_checked_at=None,
+                    updated_at=now,
+                )
+            )
+            return bool(result.rowcount)
 
     async def record_feed_poll(
         self,

@@ -9,14 +9,9 @@ from __future__ import annotations
 from datetime import timedelta
 
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.sdk import Asset, dag, task
-from airflow.sdk.exceptions import AirflowSkipException
+from airflow.sdk import dag
 
-from _common import JOBS_ASSET_URI, PG_CONN_ID, dag_defaults, worker
-
-
-JOBS = Asset(JOBS_ASSET_URI)
+from _common import PG_CONN_ID, dag_defaults, worker
 
 
 @dag(
@@ -50,23 +45,7 @@ def news_ingest():
         timeout=timedelta(minutes=8),
     )
 
-    @task(outlets=[JOBS])
-    def queue_gate() -> int:
-        """Emit the asset only when there is actually work downstream.
-
-        Skipping here is what keeps `news_semantic` from loading MiniLM to
-        find an empty queue. A crawl run that wrote nothing new is the normal
-        case at an adaptive cadence, not an error.
-        """
-        pending = PostgresHook(postgres_conn_id=PG_CONN_ID).get_first(
-            "SELECT count(*) FROM processing_jobs "
-            "WHERE stage = 'embed' AND state = 'pending' AND available_at <= now()"
-        )[0]
-        if not pending:
-            raise AirflowSkipException("no embed jobs are pending")
-        return int(pending)
-
-    preflight >> crawl >> queue_gate()
+    preflight >> crawl
 
 
 news_ingest()

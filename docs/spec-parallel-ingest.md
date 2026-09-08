@@ -4,7 +4,8 @@
 > §4, và trả lời câu hỏi còn mở §12.2 của tài liệu đó ("nhịp `*/30` cho crawl
 > là giả định, chưa đo").
 >
-> **Trạng thái: TẦNG 1–2 ĐÃ TRIỂN KHAI, CHỜ ĐO PRODUCTION (2026-09-03).** Các
+> **Trạng thái: TẦNG 1–2 VÀ INSTANT TIER ĐÃ TRIỂN KHAI, CHỜ ĐO PRODUCTION
+> (cập nhật 2026-09-08).** Các
 > baseline đến từ [measurements.md §T11](measurements.md); policy cadence mới
 > được sweep bằng RSS fetch on-demand ở [§T12](measurements.md). Cả hai dùng
 > [`scripts/bench_ingest.py`](../scripts/bench_ingest.py) trên chính database
@@ -17,6 +18,29 @@
 > barrier trong `poll_feeds` và ở lịch poll cố định 30 phút. Tài liệu này xếp
 > lại thứ tự theo giá trị trên chi phí, giữ nguyên thiết kế N worker ở tầng
 > cuối cùng.
+
+---
+
+## 0. Instant tier bổ sung
+
+Tối ưu adaptive trong tài liệu này vẫn là đường normal. Một nhóm feed nhỏ cần
+publication-to-ingestion thấp hơn có `feed_state.priority=0` và được
+`news-worker instant-crawl` trong container riêng poll liên tục với interval
+cố định (mặc định 30 giây). `news-worker crawl` của Airflow chỉ lấy priority
+1; hai worker có advisory lock riêng và cùng upsert idempotent vào
+`raw_articles`.
+
+Priority đi cùng `crawl_failures` và `processing_jobs`; số nhỏ hơn được claim
+trước, nên retry và các stage embed/classify/cluster không làm mất tier của
+bài. Semantic không chạy theo từng lần instant crawl: DAG `news_semantic` có
+lịch 15 phút và queue gate riêng, rồi drain chung cả hai priority. Thiết kế
+không thêm crawl task table, broker, push/WebSub hay một instant semantic
+worker.
+
+Đổi một feed đã seed sang instant bằng
+`news-worker set-feed-priority <url> 0`; đổi lại normal bằng priority 1.
+Khi cập nhật source, chạy compose với `up -d --build instant-crawl`; nếu không,
+Docker có thể tiếp tục dùng tag `news-radar-worker:dev` đã build từ code cũ.
 
 ---
 
@@ -42,8 +66,9 @@ với tổng số lượt poll mỗi ngày **không tăng**.
 - **Không** dùng Airflow dynamic task mapping để fan-out theo article. Giữ
   nguyên nguyên tắc §1 của [orchestration-airflow.md](orchestration-airflow.md):
   một task Airflow = một lệnh `news-worker`.
-- **Không** đổi `raw_articles`, `crawl_failures` hay `worker_runs`. Tầng 2 chỉ
-  thêm cadence state vào `feed_state`; không lấy lịch sử bài từ `raw_articles`.
+- Tầng adaptive ban đầu không đổi `raw_articles`, `crawl_failures` hay
+  `worker_runs`. Instant tier sau đó thêm `priority` vào `crawl_failures`,
+  `feed_state` và `processing_jobs`; không thêm queue crawl mới.
 
 ---
 

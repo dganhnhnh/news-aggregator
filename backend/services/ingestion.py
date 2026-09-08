@@ -57,6 +57,8 @@ def direct_crawl_batch(results: list[CrawlResult]) -> CrawlBatch:
 async def persist_batch(
     storage: PostgresRawStorage,
     batch: CrawlBatch,
+    *,
+    priority: int = 1,
 ) -> StorageWriteSummary:
     articles, rejected = prepare_articles(batch.results)
     return await storage.apply_batch(
@@ -65,6 +67,7 @@ async def persist_batch(
         batch.resolved_failures,
         received=len(batch.results),
         rejected=rejected,
+        priority=priority,
     )
 
 
@@ -96,6 +99,7 @@ async def retry_due_failures(
     limit: int,
     max_concurrent_crawls: int,
     crawl_batch_size: int = 10,
+    priority: int | None = None,
 ) -> tuple[CrawlBatch, int, int]:
     """Compatibility wrapper combining bounded retry batches."""
     combined = CrawlBatch()
@@ -107,6 +111,7 @@ async def retry_due_failures(
         limit=limit,
         max_concurrent_crawls=max_concurrent_crawls,
         crawl_batch_size=crawl_batch_size,
+        priority=priority,
     ):
         _merge_batch(combined, batch)
         attempted += attempted_delta
@@ -121,6 +126,7 @@ async def iter_retry_batches(
     limit: int,
     max_concurrent_crawls: int,
     crawl_batch_size: int,
+    priority: int | None = None,
 ) -> AsyncIterator[tuple[CrawlBatch, int, int]]:
     """Yield retry work in bounded batches with per-batch target counters.
 
@@ -128,7 +134,11 @@ async def iter_retry_batches(
     schedule for feeds (see CrawlWorker), so a feed-kind row in
     crawl_failures is a log entry, not a queue to drain.
     """
-    due = await storage.due_failures(limit)
+    due = (
+        await storage.due_failures(limit)
+        if priority is None
+        else await storage.due_failures(limit, priority=priority)
+    )
     if not due:
         return
 

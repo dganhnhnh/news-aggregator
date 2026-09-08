@@ -24,6 +24,7 @@ class Job:
     article_id: int
     stage: str
     attempts: int
+    priority: int = 1
 
 
 class JobQueue(ABC):
@@ -89,7 +90,10 @@ class PostgresJobQueue(JobQueue):
                     processing_jobs.c.state == "pending",
                     processing_jobs.c.available_at <= now,
                 )
-                .order_by(processing_jobs.c.available_at)
+                .order_by(
+                    processing_jobs.c.priority,
+                    processing_jobs.c.available_at,
+                )
                 .limit(n)
                 .with_for_update(skip_locked=True)
             )
@@ -105,10 +109,19 @@ class PostgresJobQueue(JobQueue):
                     locked_by=locked_by,
                     updated_at=now,
                 )
-                .returning(processing_jobs.c.article_id, processing_jobs.c.attempts)
+                .returning(
+                    processing_jobs.c.article_id,
+                    processing_jobs.c.attempts,
+                    processing_jobs.c.priority,
+                )
             )
             return [
-                Job(article_id=row.article_id, stage=stage, attempts=row.attempts)
+                Job(
+                    article_id=row.article_id,
+                    stage=stage,
+                    attempts=row.attempts,
+                    priority=row.priority,
+                )
                 for row in result
             ]
 

@@ -66,7 +66,7 @@ def _parse(argv: list[str]) -> argparse.Namespace:
 
 
 def test_scheduler_flags_are_available_to_every_worker_command() -> None:
-    for command in ("crawl", "embed", "classify", "cluster"):
+    for command in ("crawl", "instant-crawl", "embed", "classify", "cluster"):
         args = _parse(
             [command, "--once", "--exit-busy", "99", "--summary-json", "-",
              "--max-runtime", "25m",
@@ -101,6 +101,21 @@ def test_adaptive_poll_settings_reject_invalid_order() -> None:
                 "1800",
             ]
         )
+
+
+def test_instant_crawl_has_fixed_short_poll_default() -> None:
+    args = _parse(["instant-crawl", "--interval", "30"])
+
+    assert args.feed_path is None
+    assert args.poll_interval == 30
+
+
+def test_feed_priority_must_be_non_negative() -> None:
+    assert _parse(
+        ["set-feed-priority", "https://example.com/feed.xml", "0"]
+    ).priority == 0
+    with pytest.raises(SystemExit):
+        _parse(["set-feed-priority", "https://example.com/feed.xml", "-1"])
 
 
 def test_exit_busy_defaults_to_success_and_rejects_the_failure_code() -> None:

@@ -43,6 +43,7 @@ class CrawlFailureOccurrence:
 
 @dataclass(frozen=True)
 class StoredCrawlFailure(CrawlFailureOccurrence):
+    priority: int = 1
     attempt_count: int = 1
     first_failed_at: datetime | None = None
     last_failed_at: datetime | None = None
@@ -71,6 +72,7 @@ class FeedSeed:
 
     feed_url: str
     source_label: str
+    priority: int = 1
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,7 @@ class FeedPollTarget:
     resolved_url: str | None = None
     poll_interval_seconds: int | None = None
     cadence_checked_at: datetime | None = None
+    priority: int = 1
 
     @property
     def fetch_url(self) -> str:
@@ -304,6 +307,7 @@ class EmbeddingRecord:
     content_hash: bytes
     embedding: list[float]
     text_kind: TextKind = "content"
+    priority: int = 1
 
 
 @dataclass

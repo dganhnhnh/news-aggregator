@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 from asyncio import to_thread
 from dataclasses import asdict
@@ -13,7 +14,6 @@ from typing import Any
 
 import yaml
 
-from adapters.embedding.fastembed_embedder import FastEmbedEmbedder
 from adapters.storage import PostgresRawStorage, StorageError
 from core.config import Settings
 from core.logger import get_logger, setup_logging
@@ -38,6 +38,7 @@ from workers.classify import ClassifyWorker
 from workers.crawl import CrawlWorker
 from workers.cluster import ClusterWorker
 from workers.embed import EmbedWorker
+from workers.instant_crawl import InstantCrawlWorker
 from workers.window import RunWindow, build_window, parse_duration
 
 
@@ -45,6 +46,7 @@ logger = get_logger(__name__)
 
 WORKERS: dict[str, type[Worker]] = {
     CrawlWorker.name: CrawlWorker,
+    InstantCrawlWorker.name: InstantCrawlWorker,
     EmbedWorker.name: EmbedWorker,
     ClassifyWorker.name: ClassifyWorker,
     ClusterWorker.name: ClusterWorker,
@@ -121,7 +123,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="news-worker", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    crawl = subparsers.add_parser("crawl", help="Ingest RSS/Atom feeds")
+    crawl = argparse.ArgumentParser(add_help=False)
     _add_common_arguments(crawl)
     crawl.add_argument(
         "--feed-path",
@@ -131,8 +133,8 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         default=settings.rss_feed_path,
         help=(
             "TSV or OPML feed source path to seed feed_state from; optional "
-            "once feeds are seeded. Defaults to RSS_FEED_PATH "
-            "(or legacy GOOGLE_NEWS_TSV_PATH)"
+            "once feeds are seeded. Normal crawl defaults to RSS_FEED_PATH "
+            "(or legacy GOOGLE_NEWS_TSV_PATH); instant-crawl defaults to no file"
         ),
     )
     crawl.add_argument(
@@ -221,7 +223,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         type=int,
         metavar="SECONDS",
         default=settings.feed_poll_interval_seconds,
-        help="Medium adaptive feed poll tier (legacy flag name)",
+        help="Medium adaptive crawl tier; fixed interval for instant-crawl",
     )
     crawl.add_argument(
         "--poll-slow-interval",
@@ -261,6 +263,21 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         default=settings.max_retries_per_run,
     )
     crawl.add_argument("--emit-jsonl", action="store_true")
+
+    subparsers.add_parser(
+        "crawl",
+        help="Ingest normal priority-1 RSS/Atom feeds",
+        parents=[crawl],
+    )
+    instant_crawl = subparsers.add_parser(
+        "instant-crawl",
+        help="Continuously ingest only instant priority-0 feeds",
+        parents=[copy.deepcopy(crawl)],
+    )
+    instant_crawl.set_defaults(
+        feed_path=None,
+        poll_interval=settings.instant_feed_poll_interval_seconds,
+    )
 
     embed = subparsers.add_parser(
         "embed", help="Embed articles queued in processing_jobs(stage='embed')"
@@ -500,6 +517,20 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         "--reason", required=True, help="Why the feed is being disabled"
     )
 
+    set_feed_priority = subparsers.add_parser(
+        "set-feed-priority",
+        help="Set a feed's crawl tier (0=instant, 1=normal)",
+    )
+    set_feed_priority.add_argument(
+        "url", help="Feed URL, matching feed_state.feed_url"
+    )
+    set_feed_priority.add_argument(
+        "priority",
+        type=int,
+        choices=(0, 1),
+        help="0 for instant crawl, 1 for normal scheduled crawl",
+    )
+
     return parser
 
 
@@ -513,7 +544,12 @@ def resolve_window(
         parser.error(str(exc))
 
 
-def _validate_crawl(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+def _validate_crawl(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    adaptive: bool,
+) -> None:
     if args.feed_path is not None and not args.feed_path.is_file():
         parser.error(f"RSS feed source file not found: {args.feed_path}")
     if args.max_feeds < 0:
@@ -534,8 +570,11 @@ def _validate_crawl(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         parser.error("--feed-content-min-chars must not be negative")
     if args.feed_fetch_timeout <= 0:
         parser.error("--feed-fetch-timeout must be positive")
-    if not 0 < args.poll_fast_interval < args.poll_interval < args.poll_slow_interval:
-        parser.error("adaptive poll intervals must be positive and increasing")
+    if adaptive:
+        if not 0 < args.poll_fast_interval < args.poll_interval < args.poll_slow_interval:
+            parser.error("adaptive poll intervals must be positive and increasing")
+    elif args.poll_interval <= 0:
+        parser.error("--poll-interval must be positive")
     if args.poll_min_gaps <= 0:
         parser.error("--poll-min-gaps must be positive")
     if not 0 <= args.poll_trim_fraction < 0.5:
@@ -603,8 +642,8 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 parser.error(str(exc))
             if args.interval is not None:
                 parser.error("--max-runtime cannot be combined with --interval")
-        if args.command == "crawl":
-            _validate_crawl(args, parser)
+        if args.command in {"crawl", "instant-crawl"}:
+            _validate_crawl(args, parser, adaptive=args.command == "crawl")
         elif args.command in {"embed", "classify"}:
             _validate_embed(args, parser)
         elif args.command == "cluster":
@@ -710,6 +749,13 @@ async def _dispatch_admin(
             logger.error("Feed not found: %s", args.url)
             return EXIT_FAILED
         logger.info("Disabled feed: %s", args.url)
+        return EXIT_OK
+    if args.command == "set-feed-priority":
+        found = await storage.set_feed_priority(args.url, args.priority)
+        if not found:
+            logger.error("Feed not found: %s", args.url)
+            return EXIT_FAILED
+        logger.info("Set feed priority=%d: %s", args.priority, args.url)
         return EXIT_OK
 
     if args.command == "taxonomy-import":
@@ -885,6 +931,11 @@ async def _rebuild_taxonomy_prototypes(
     with a few dozen exemplars total, so poison-pill isolation (see
     `EmbedWorker._embed_and_store`) is not worth the extra code.
     """
+    # Keep ONNX/FastEmbed out of crawl and administrative CLI startup. Some
+    # container CPUs make onnxruntime print a harmless vendor warning merely
+    # on import, even when no embedding operation is requested.
+    from adapters.embedding.fastembed_embedder import FastEmbedEmbedder
+
     embedder = FastEmbedEmbedder()
     stats = PrototypeRebuildStats()
     exemplar_sets = await storage.topics_for_prototype_rebuild(topic_slug)

@@ -57,6 +57,7 @@ class Settings:
     feed_offset: int
     max_retries_per_run: int
     service_interval_seconds: int
+    instant_feed_poll_interval_seconds: int = 30
     feed_fetch_timeout_seconds: float = 8.0
     feed_poll_fast_interval_seconds: int = 300
     feed_poll_interval_seconds: int = 1800
@@ -115,6 +116,9 @@ class Settings:
             feed_offset=_env_int("RSS_FEED_OFFSET", 0),
             max_retries_per_run=_env_int("MAX_RETRIES_PER_RUN", 50),
             service_interval_seconds=_env_int("SERVICE_INTERVAL_SECONDS", 1800),
+            instant_feed_poll_interval_seconds=_env_int(
+                "INSTANT_FEED_POLL_INTERVAL_SECONDS", 30
+            ),
             feed_fetch_timeout_seconds=_env_float(
                 "FEED_FETCH_TIMEOUT_SECONDS", 8.0
             ),
