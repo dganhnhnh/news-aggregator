@@ -18,6 +18,7 @@ dependencies = [
     "pyyaml>=6,<7",
     "sqlalchemy[asyncio]>=2.0,<3",
     "tavily-python>=0.7.12,<1",
+    "tldextract>=5.3,<6",
     "uvicorn[standard]>=0.34,<1",
     "html2text>=2024.2,<2026",
 ]
@@ -32,6 +33,7 @@ news-pipeline = "pipelines.news:main"
 news-worker = "workers.cli:main"
 news-service = "services.news:main"
 news-api = "api.main:run"
+news-admin-api = "admin_api.main:run"
 
 
 [build-system]

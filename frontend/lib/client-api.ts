@@ -1,6 +1,7 @@
 import type {
   ArticleDetail,
   ArticlePage,
+  ManagedFeed,
   Source,
   StoryDetail,
   StoryPage,
@@ -17,17 +18,44 @@ export class ApiError extends Error {
   }
 }
 
+function apiErrorMessage(body: { detail?: unknown; error?: unknown } | null, status: number) {
+  if (typeof body?.detail === 'string' && body.detail) return body.detail
+  if (typeof body?.error === 'string' && body.error) return body.error
+  if (Array.isArray(body?.detail)) {
+    const first = body.detail[0] as { msg?: unknown } | undefined
+    if (typeof first?.msg === 'string') {
+      return first.msg.replace(/^Value error,\s*/, '')
+    }
+  }
+  return `Request failed (${status})`
+}
+
 export async function fetcher<T>(url: string): Promise<T> {
   const res = await fetch(url)
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as
       | { detail?: unknown; error?: unknown }
       | null
-    const message =
-      (typeof body?.detail === 'string' && body.detail) ||
-      (typeof body?.error === 'string' && body.error) ||
-      `Request failed (${res.status})`
-    throw new ApiError(message, res.status)
+    throw new ApiError(apiErrorMessage(body, res.status), res.status)
+  }
+  return res.json() as Promise<T>
+}
+
+export async function apiRequest<T>(
+  url: string,
+  method: 'POST' | 'PATCH',
+  body: unknown,
+): Promise<T> {
+  const res = await fetch(url, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const responseBody = (await res.json().catch(() => null)) as
+      | { detail?: unknown; error?: unknown }
+      | null
+    throw new ApiError(apiErrorMessage(responseBody, res.status), res.status)
   }
   return res.json() as Promise<T>
 }
@@ -92,4 +120,12 @@ export function buildSourcesKey(params: SourcesParams = {}): string {
   return qs ? `/api/sources?${qs}` : '/api/sources'
 }
 
-export type { ArticleDetail, ArticlePage, Source, StoryDetail, StoryPage, TopicCatalog }
+export type {
+  ArticleDetail,
+  ArticlePage,
+  ManagedFeed,
+  Source,
+  StoryDetail,
+  StoryPage,
+  TopicCatalog,
+}

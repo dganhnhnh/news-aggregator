@@ -65,6 +65,7 @@ from models.storage_models import (
     FailureQueueStatus,
     FeedPollTarget,
     FeedSeed,
+    FeedStateItem,
     FlatTaxonomyNode,
     HistoricalBlockPage,
     QueueStatusSnapshot,
@@ -2458,6 +2459,109 @@ class PostgresRawStorage:
                 .returning(feed_state.c.feed_url)
             )
             return len(result.fetchall())
+
+    async def create_feed(self, seed: FeedSeed) -> FeedStateItem | None:
+        """Insert one operator-managed feed, returning None on duplicate URL."""
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    pg_insert(feed_state)
+                    .values(
+                        feed_url=seed.feed_url,
+                        source_label=seed.source_label,
+                        priority=seed.priority,
+                    )
+                    .on_conflict_do_nothing(index_elements=[feed_state.c.feed_url])
+                    .returning(
+                        feed_state.c.feed_url,
+                        feed_state.c.source_label,
+                        feed_state.c.priority,
+                        feed_state.c.resolved_url,
+                        feed_state.c.last_polled_at,
+                        feed_state.c.last_success_at,
+                        feed_state.c.next_poll_at,
+                        feed_state.c.consecutive_failures,
+                        feed_state.c.disabled_at,
+                        feed_state.c.disabled_reason,
+                        feed_state.c.updated_at,
+                    )
+                )
+            ).first()
+            return FeedStateItem(**dict(row._mapping)) if row is not None else None
+
+    async def list_feeds(self, *, active: bool | None = True) -> list[FeedStateItem]:
+        stmt = select(
+            feed_state.c.feed_url,
+            feed_state.c.source_label,
+            feed_state.c.priority,
+            feed_state.c.resolved_url,
+            feed_state.c.last_polled_at,
+            feed_state.c.last_success_at,
+            feed_state.c.next_poll_at,
+            feed_state.c.consecutive_failures,
+            feed_state.c.disabled_at,
+            feed_state.c.disabled_reason,
+            feed_state.c.updated_at,
+        )
+        if active is True:
+            stmt = stmt.where(feed_state.c.disabled_at.is_(None))
+        elif active is False:
+            stmt = stmt.where(feed_state.c.disabled_at.is_not(None))
+        stmt = stmt.order_by(
+            case((feed_state.c.disabled_at.is_(None), 0), else_=1),
+            feed_state.c.priority,
+            feed_state.c.source_label.asc().nulls_last(),
+            feed_state.c.feed_url,
+        )
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(stmt)).all()
+            return [FeedStateItem(**dict(row._mapping)) for row in rows]
+
+    async def update_feed(
+        self,
+        feed_url: str,
+        *,
+        priority: int | None = None,
+        active: bool | None = None,
+        disabled_reason: str = "Disabled from feed management UI",
+    ) -> FeedStateItem | None:
+        """Atomically update an operator-managed feed and return its new state."""
+        now = datetime.now(timezone.utc)
+        values: dict[str, Any] = {"updated_at": now}
+        if priority is not None:
+            values.update(
+                priority=priority,
+                next_poll_at=now,
+                poll_interval_seconds=None,
+                cadence_checked_at=None,
+            )
+        if active is True:
+            values.update(disabled_at=None, disabled_reason=None)
+        elif active is False:
+            values.update(disabled_at=now, disabled_reason=disabled_reason[:2000])
+
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    update(feed_state)
+                    .where(feed_state.c.feed_url == feed_url)
+                    .values(**values)
+                    .returning(
+                        feed_state.c.feed_url,
+                        feed_state.c.source_label,
+                        feed_state.c.priority,
+                        feed_state.c.resolved_url,
+                        feed_state.c.last_polled_at,
+                        feed_state.c.last_success_at,
+                        feed_state.c.next_poll_at,
+                        feed_state.c.consecutive_failures,
+                        feed_state.c.disabled_at,
+                        feed_state.c.disabled_reason,
+                        feed_state.c.updated_at,
+                    )
+                )
+            ).first()
+            return FeedStateItem(**dict(row._mapping)) if row is not None else None
 
     async def due_feeds(
         self,

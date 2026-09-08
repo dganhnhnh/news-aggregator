@@ -45,6 +45,26 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  admin-api:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.api
+    command:
+      - uv
+      - run
+      - news-admin-api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@db:5432/${POSTGRES_DB:-news_radar}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ADMIN_API_HOST: 0.0.0.0
+      ADMIN_API_PORT: 8001
+    ports:
+      - "127.0.0.1:${ADMIN_API_PORT:-8001}:8001"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
   instant-crawl:
     image: ${NEWS_RADAR_WORKER_IMAGE:-news-radar-worker:dev}
     build:

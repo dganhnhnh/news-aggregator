@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Rss, Newspaper, BookOpen, TrendingUp } from 'lucide-react'
+import { Rss, Newspaper, BookOpen, TrendingUp, ListPlus } from 'lucide-react'
 import { toast } from 'sonner'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -30,6 +30,13 @@ const NAV_ITEMS = [
     href: null,
     available: false,
   },
+  {
+    key: 'feeds',
+    label: 'Feeds',
+    icon: ListPlus,
+    href: '/feeds',
+    available: true,
+  },
 ] as const
 
 export function NavRail() {
@@ -37,6 +44,7 @@ export function NavRail() {
   const isArticlesActive =
     pathname === '/' || pathname.startsWith('/sources') || pathname.startsWith('/articles')
   const isStoriesActive = pathname.startsWith('/stories')
+  const isFeedsActive = pathname.startsWith('/feeds')
 
   return (
     <nav
@@ -56,7 +64,8 @@ export function NavRail() {
           {NAV_ITEMS.map((item) => {
             const isActive =
               (item.key === 'articles' && isArticlesActive) ||
-              (item.key === 'stories' && isStoriesActive)
+              (item.key === 'stories' && isStoriesActive) ||
+              (item.key === 'feeds' && isFeedsActive)
             const Icon = item.icon
 
             const button = (

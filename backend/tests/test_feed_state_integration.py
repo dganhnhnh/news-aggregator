@@ -179,6 +179,63 @@ async def _test_feed_priority_partitions_instant_and_normal_polling() -> None:
         await storage.close()
 
 
+def test_operator_feed_create_list_and_update_lifecycle() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_operator_feed_create_list_and_update_lifecycle())
+
+
+async def _test_operator_feed_create_list_and_update_lifecycle() -> None:
+    feed_url = "https://feed-state.integration.example/operator.xml"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        await _delete_feeds(engine, [feed_url])
+
+        created = await storage.create_feed(
+            FeedSeed(feed_url=feed_url, source_label="Operator", priority=1)
+        )
+        assert created is not None
+        assert created.active is True
+        assert created.priority == 1
+        assert await storage.create_feed(
+            FeedSeed(feed_url=feed_url, source_label="Duplicate", priority=0)
+        ) is None
+
+        active_items = await storage.list_feeds(active=True)
+        assert feed_url in {item.feed_url for item in active_items}
+        normal_due = await storage.due_feeds(limit=0, priority=1)
+        assert feed_url in {item.feed_url for item in normal_due}
+
+        before_priority_change = datetime.now(timezone.utc)
+        updated = await storage.update_feed(feed_url, priority=0, active=False)
+        assert updated is not None
+        assert updated.priority == 0
+        assert updated.active is False
+        assert updated.next_poll_at >= before_priority_change
+
+        inactive_items = await storage.list_feeds(active=False)
+        assert feed_url in {item.feed_url for item in inactive_items}
+        assert feed_url not in {
+            item.feed_url for item in await storage.due_feeds(limit=0, priority=0)
+        }
+
+        enabled = await storage.update_feed(feed_url, active=True)
+        assert enabled is not None
+        assert enabled.active is True
+        assert feed_url in {
+            item.feed_url for item in await storage.due_feeds(limit=0, priority=0)
+        }
+    finally:
+        if ready:
+            await _delete_feeds(engine, [feed_url])
+        await engine.dispose()
+        await storage.close()
+
+
 def test_crawl_failure_keeps_highest_priority_for_retry() -> None:
     if not DATABASE_URL:
         pytest.skip("TEST_DATABASE_URL is not set")

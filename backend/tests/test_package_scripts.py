@@ -12,4 +12,5 @@ def test_public_uv_commands_are_declared() -> None:
         # Deprecated alias for `news-worker crawl`.
         "news-service": "services.news:main",
         "news-api": "api.main:run",
+        "news-admin-api": "admin_api.main:run",
     }

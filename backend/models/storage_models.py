@@ -76,6 +76,27 @@ class FeedSeed:
 
 
 @dataclass(frozen=True)
+class FeedStateItem:
+    """Operator-facing state for one configured feed."""
+
+    feed_url: str
+    source_label: str | None
+    priority: int
+    resolved_url: str | None
+    last_polled_at: datetime | None
+    last_success_at: datetime | None
+    next_poll_at: datetime
+    consecutive_failures: int
+    disabled_at: datetime | None
+    disabled_reason: str | None
+    updated_at: datetime
+
+    @property
+    def active(self) -> bool:
+        return self.disabled_at is None
+
+
+@dataclass(frozen=True)
 class FeedPollTarget:
     """What storage hands back to a worker about to poll a feed."""
 

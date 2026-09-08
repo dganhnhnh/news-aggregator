@@ -4,6 +4,23 @@ export type Source = {
   homepage: string | null
 }
 
+export type FeedPriority = 'instant' | 'normal'
+
+export type ManagedFeed = {
+  feed_url: string
+  source_label: string
+  priority: FeedPriority
+  active: boolean
+  resolved_url: string | null
+  last_polled_at: string | null
+  last_success_at: string | null
+  next_poll_at: string
+  consecutive_failures: number
+  disabled_at: string | null
+  disabled_reason: string | null
+  updated_at: string
+}
+
 export type SourceRef = {
   slug: string
   name: string

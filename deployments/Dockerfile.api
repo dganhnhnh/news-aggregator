@@ -1,5 +1,6 @@
-# Runs the news-api FastAPI service used by the development compose stack.
-# The API depends on the same pyproject.toml as the crawler jobs, so this
+# Runs either FastAPI service used by the development compose stack. The
+# default command is the read-only news-api; compose overrides it for the
+# operator-only news-admin-api. Both depend on the same pyproject.toml, so this
 # image currently installs the full dependency set (including crawl4ai).
 # Build from the repo root: docker build -f deployments/Dockerfile.api -t news-radar-api .
 FROM python:3.12-slim
@@ -16,6 +17,6 @@ RUN uv sync --frozen --no-dev
 ENV API_HOST=0.0.0.0
 ENV API_PORT=8000
 ENV PYTHONUNBUFFERED=1
-EXPOSE 8000
+EXPOSE 8000 8001
 
 CMD ["uv", "run", "news-api"]

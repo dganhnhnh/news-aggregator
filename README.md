@@ -384,11 +384,26 @@ mặc định `http://localhost:3000` cho frontend dev. Endpoint hiện có:
 - `GET /api/stories?limit=&cursor=&source=&topic=&min_sources=&min_articles=`
 - `GET /api/stories/{id}`
 
+Admin API chạy ở process riêng để giữ `news-api` public hoàn toàn read-only:
+
+```bash
+uv run news-admin-api
+```
+
+Mặc định service lắng nghe `ADMIN_API_HOST`/`ADMIN_API_PORT`
+(`0.0.0.0:8001`). Service này chưa có authentication và chỉ nên được expose
+trong môi trường private/trusted. Endpoint quản lý feed:
+
+- `GET /api/admin/feeds?status=active|inactive|all`
+- `POST /api/admin/feeds`
+- `PATCH /api/admin/feeds`
+
 ## Frontend
 
 `frontend/` là Next.js app. Browser gọi route `/api/*` cùng origin; Next.js
-server proxy request tới FastAPI theo `API_URL`, nên không expose URL nội bộ ra
-client. Xem [frontend/README.md](frontend/README.md) cho cấu hình local.
+server proxy request đọc tới FastAPI theo `API_URL` và request quản trị theo
+`ADMIN_API_URL`, nên không expose các URL nội bộ ra client. Xem
+[frontend/README.md](frontend/README.md) cho cấu hình local.
 
 ## Kiểm thử
 
