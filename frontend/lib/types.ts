@@ -71,6 +71,7 @@ export type ArticleDetail = {
   url_original: string | null
   title: string | null
   content: string
+  feed_summary: string
   source: SourceRef | null
   published_at: string | null
   crawled_at: string

@@ -153,6 +153,7 @@ class ArticleDetailItem:
     url_original: str | None
     title: str | None
     content: str
+    feed_summary: str
     source_slug: str | None
     source_name: str | None
     published_at: datetime | None

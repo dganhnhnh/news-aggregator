@@ -64,6 +64,7 @@ class ArticleDetail(BaseModel):
     url_original: str | None
     title: str | None
     content: str
+    feed_summary: str
     source: SourceRef | None
     published_at: datetime | None
     crawled_at: datetime

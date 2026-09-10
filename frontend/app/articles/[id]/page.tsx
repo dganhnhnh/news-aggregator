@@ -17,9 +17,10 @@ export async function generateMetadata({
   const { id } = await params
   const article = await getArticle(id)
   if (!article) return { title: 'Article not found — News' }
+  const description = article.content || article.feed_summary
   return {
     title: `${article.title ?? article.url} — News`,
-    description: article.content.slice(0, 160),
+    description: description.slice(0, 160),
   }
 }
 
@@ -71,7 +72,7 @@ export default async function ArticlePage({
         </h1>
 
         <div className="mt-8">
-          <MarkdownContent content={article.content} />
+          <MarkdownContent content={article.content || article.feed_summary} />
         </div>
       </article>
     </div>

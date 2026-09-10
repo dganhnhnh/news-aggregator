@@ -123,7 +123,7 @@ export function DetailPanel({ articleId }: { articleId: number | null }) {
         <TopicBadgeGroup topics={article.topics} className="mt-3" />
 
         <div className="mt-6">
-          <MarkdownContent content={article.content} />
+          <MarkdownContent content={article.content || article.feed_summary} />
         </div>
       </article>
     </ScrollArea>

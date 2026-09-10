@@ -88,7 +88,7 @@ export function ArticlePreviewPanel({ articleId }: { articleId: number | null })
         <TopicBadgeGroup topics={article.topics} className="mt-2" />
 
         <div className="mt-4 text-xs leading-relaxed text-muted-foreground">
-          <MarkdownContent content={article.content} />
+          <MarkdownContent content={article.content || article.feed_summary} />
         </div>
       </article>
     </ScrollArea>

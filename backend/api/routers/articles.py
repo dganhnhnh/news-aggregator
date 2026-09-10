@@ -79,6 +79,7 @@ async def get_article(
         url_original=article.url_original,
         title=article.title,
         content=article.content,
+        feed_summary=article.feed_summary,
         source=source,
         published_at=article.published_at,
         crawled_at=article.crawled_at,

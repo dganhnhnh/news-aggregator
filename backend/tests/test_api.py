@@ -47,6 +47,7 @@ class FakeStorage:
             url_original="https://example.com/a",
             title="Article A",
             content="full markdown body",
+            feed_summary="Article A summary",
             source_slug="example.com",
             source_name="Example",
             published_at=now,
@@ -214,6 +215,7 @@ def test_get_article_found() -> None:
     response = client.get("/api/articles/1")
     assert response.status_code == 200
     assert response.json()["content"] == "full markdown body"
+    assert response.json()["feed_summary"] == "Article A summary"
     assert response.json()["topics"] == [
         {"id": 7, "slug": "artificial-intelligence", "name": "AI"}
     ]

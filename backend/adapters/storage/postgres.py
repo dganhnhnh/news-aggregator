@@ -1962,6 +1962,7 @@ class PostgresRawStorage:
                     raw_articles.c.url_original,
                     raw_articles.c.title,
                     raw_articles.c.content,
+                    raw_articles.c.feed_summary,
                     raw_articles.c.published_at,
                     raw_articles.c.crawled_at,
                     raw_articles.c.event_at,
