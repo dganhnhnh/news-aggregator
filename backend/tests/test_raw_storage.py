@@ -125,10 +125,21 @@ NORMALIZE_URL_CASES = [
         "https://example.com/example-amp",
     ),
     (
-        "Reddit challenge state is not article identity",
+        "Reddit query strings are not article identity",
         "https://www.reddit.com/r/python/comments/abc/story/"
         "?token=second&solution=new&js_challenge=1&sort=new",
-        "https://www.reddit.com/r/python/comments/abc/story?sort=new",
+        "https://www.reddit.com/r/python/comments/abc/story",
+    ),
+    (
+        "future Reddit query parameters cannot create a new identity",
+        "https://www.reddit.com/r/programming/comments/1wa0ja2/story"
+        "?jsc_orig_r=&jsc_token=fresh&unknown_future_parameter=value",
+        "https://www.reddit.com/r/programming/comments/1wa0ja2/story",
+    ),
+    (
+        "Reddit subdomains use the same path-only identity",
+        "https://old.reddit.com/r/python/comments/abc/story?context=3&share_id=xyz",
+        "https://old.reddit.com/r/python/comments/abc/story",
     ),
     (
         "generic token parameters remain meaningful outside Reddit",

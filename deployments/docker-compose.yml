@@ -78,6 +78,10 @@ services:
       - ${INSTANT_FEED_POLL_INTERVAL_SECONDS:-30}
       - --poll-interval
       - ${INSTANT_FEED_POLL_INTERVAL_SECONDS:-30}
+      - --max-concurrent-crawls
+      - ${INSTANT_MAX_CONCURRENT_CRAWLS:-3}
+      - --crawl-batch-size
+      - ${INSTANT_CRAWL_BATCH_SIZE:-5}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@db:5432/${POSTGRES_DB:-news_radar}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

@@ -354,17 +354,18 @@ async def _test_record_feed_failure_backoff_and_disable_threshold_then_poll_rese
         await storage.close()
 
 
-def test_known_urls_matches_stored_and_pending_but_not_due_failures() -> None:
+def test_known_urls_matches_stored_pending_and_dead_lettered_but_not_due() -> None:
     if not DATABASE_URL:
         pytest.skip("TEST_DATABASE_URL is not set")
-    asyncio.run(_test_known_urls_matches_stored_and_pending_but_not_due_failures())
+    asyncio.run(_test_known_urls_matches_stored_pending_and_dead_lettered_but_not_due())
 
 
-async def _test_known_urls_matches_stored_and_pending_but_not_due_failures() -> None:
+async def _test_known_urls_matches_stored_pending_and_dead_lettered_but_not_due() -> None:
     stored_url = "https://feed-state.integration.example/stored"
     stored_original = stored_url + "?utm_source=rss"
     pending_failure_url = "https://feed-state.integration.example/pending-failure"
     due_failure_url = "https://feed-state.integration.example/due-failure"
+    dead_lettered_url = "https://feed-state.integration.example/dead-lettered"
     unrelated_url = "https://feed-state.integration.example/never-seen"
     source_slug = "feed-state.integration.example"
 
@@ -381,7 +382,9 @@ async def _test_known_urls_matches_stored_and_pending_but_not_due_failures() -> 
             )
             await connection.execute(
                 delete(crawl_failures).where(
-                    crawl_failures.c.url.in_([pending_failure_url, due_failure_url])
+                    crawl_failures.c.url.in_(
+                        [pending_failure_url, due_failure_url, dead_lettered_url]
+                    )
                 )
             )
             await connection.execute(delete(sources).where(sources.c.slug == source_slug))
@@ -413,18 +416,32 @@ async def _test_known_urls_matches_stored_and_pending_but_not_due_failures() -> 
                     error_type="TimeoutError",
                     error_message="timeout",
                 ),
+                CrawlFailureOccurrence(
+                    failure_kind="article",
+                    url=dead_lettered_url,
+                    error_type="TimeoutError",
+                    error_message="timeout",
+                ),
             ],
             [],
-            received=3,
+            received=4,
             rejected=0,
         )
-        # apply_batch always sets next_retry_at in the future; force one
-        # failure back into "already due" so the filter has both cases.
+        # apply_batch sets next_retry_at in the future. Make one failure due,
+        # and make another dead-lettered with an expired retry timestamp.
         async with engine.begin() as connection:
             await connection.execute(
                 update(crawl_failures)
                 .where(crawl_failures.c.url == due_failure_url)
                 .values(next_retry_at=now - timedelta(minutes=1))
+            )
+            await connection.execute(
+                update(crawl_failures)
+                .where(crawl_failures.c.url == dead_lettered_url)
+                .values(
+                    next_retry_at=now - timedelta(minutes=1),
+                    dead_lettered_at=now,
+                )
             )
 
         candidates = [
@@ -432,11 +449,17 @@ async def _test_known_urls_matches_stored_and_pending_but_not_due_failures() -> 
             stored_original,
             pending_failure_url,
             due_failure_url,
+            dead_lettered_url,
             unrelated_url,
         ]
         known = await storage.known_urls(candidates, now=now)
 
-        assert known == {stored_url, stored_original, pending_failure_url}
+        assert known == {
+            stored_url,
+            stored_original,
+            pending_failure_url,
+            dead_lettered_url,
+        }
     finally:
         if ready:
             async with engine.begin() as connection:
@@ -445,7 +468,9 @@ async def _test_known_urls_matches_stored_and_pending_but_not_due_failures() -> 
                 )
                 await connection.execute(
                     delete(crawl_failures).where(
-                        crawl_failures.c.url.in_([pending_failure_url, due_failure_url])
+                        crawl_failures.c.url.in_(
+                            [pending_failure_url, due_failure_url, dead_lettered_url]
+                        )
                     )
                 )
                 await connection.execute(

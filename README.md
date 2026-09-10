@@ -270,11 +270,13 @@ Hoặc chạy container cùng PostgreSQL và API:
 docker compose --env-file .env -f deployments/docker-compose.yml up -d --build instant-crawl
 ```
 
-`INSTANT_FEED_POLL_INTERVAL_SECONDS` mặc định là 30 giây. Worker này chỉ lấy
-feed và retry crawl có priority 0; worker `crawl` của Airflow chỉ lấy priority
-1. Bài mới tạo job semantic với cùng priority. `news_semantic` vẫn chạy batch
-15 phút một lần và claim priority 0 trước priority 1; instant crawl không khởi
-động semantic DAG cho từng bài.
+`INSTANT_FEED_POLL_INTERVAL_SECONDS` mặc định là 30 giây. Để giới hạn peak RAM
+của Chromium, container dùng `INSTANT_MAX_CONCURRENT_CRAWLS=3` và
+`INSTANT_CRAWL_BATCH_SIZE=5`; có thể override hai biến này trong `.env`.
+Worker này chỉ lấy feed và retry crawl có priority 0; worker `crawl` của Airflow
+chỉ lấy priority 1. Bài mới tạo job semantic với cùng priority. `news_semantic`
+vẫn chạy batch 15 phút một lần và claim priority 0 trước priority 1; instant
+crawl không khởi động semantic DAG cho từng bài.
 
 ## Điều phối bằng Airflow
 

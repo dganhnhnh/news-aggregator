@@ -2718,13 +2718,13 @@ class PostgresRawStorage:
         *,
         now: datetime | None = None,
     ) -> set[str]:
-        """Return the subset of `candidates` already stored or in backoff.
+        """Return candidates already stored, in backoff, or dead-lettered.
 
         Checks both `raw_articles` columns because a feed's entry URL often
-        differs from the final URL after redirects, and includes
-        `crawl_failures` still in backoff so the exponential delay in
-        `retry_delay()` is actually honored instead of being defeated by a
-        fresh discovery pass rediscovering the same broken URL every poll.
+        differs from the final URL after redirects. Failures still in backoff
+        and dead-lettered failures are also treated as known so a fresh feed
+        discovery cannot bypass either retry policy and crawl the same broken
+        URL on every poll.
         """
         if not candidates:
             return set()
@@ -2737,7 +2737,10 @@ class PostgresRawStorage:
             ),
             select(crawl_failures.c.url).where(
                 crawl_failures.c.url.in_(urls),
-                crawl_failures.c.next_retry_at > now,
+                or_(
+                    crawl_failures.c.next_retry_at > now,
+                    crawl_failures.c.dead_lettered_at.is_not(None),
+                ),
             ),
         )
         async with self._engine.connect() as connection:
