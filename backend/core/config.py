@@ -93,6 +93,9 @@ class Settings:
     api_default_window_days: int = 30
     admin_api_host: str = "0.0.0.0"
     admin_api_port: int = 8001
+    openrouter_api_key: str | None = None
+    news_agent_model: str = "nvidia/nemotron-3.5-lightning:free"
+    openrouter_site_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -163,6 +166,14 @@ class Settings:
             api_default_window_days=_env_int("API_DEFAULT_WINDOW_DAYS", 30),
             admin_api_host=os.getenv("ADMIN_API_HOST", "0.0.0.0"),
             admin_api_port=_env_int("ADMIN_API_PORT", 8001),
+            openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip() or None,
+            news_agent_model=(
+                os.getenv("OPENROUTER_MODEL", "").strip()
+                or "anthropic/claude-haiku-4.5"
+            ),
+            openrouter_site_url=(
+                os.getenv("OPENROUTER_SITE_URL", "").strip() or None
+            ),
         )
 
     @property

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from models.storage_models import ArticleFeedItem, StoryFeedItem, TopicRefItem
 
@@ -154,3 +154,25 @@ class CursorPage(BaseModel, Generic[T]):
     items: list[T]
     next_cursor: str | None
     window: FeedWindow
+
+
+class ResearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def trim_query(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+
+class ResearchCitation(BaseModel):
+    article_id: int
+    title: str | None
+    url: str
+    source: SourceRef | None
+    published_at: datetime | None
+
+
+class ResearchResponse(BaseModel):
+    answer: str
+    citations: list[ResearchCitation]

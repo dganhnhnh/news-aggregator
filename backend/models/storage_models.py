@@ -163,6 +163,18 @@ class ArticleDetailItem:
 
 
 @dataclass(frozen=True)
+class ArticleSearchHit:
+    id: int
+    url: str
+    title: str | None
+    snippet: str
+    source_slug: str | None
+    source_name: str | None
+    published_at: datetime | None
+    event_at: datetime
+
+
+@dataclass(frozen=True)
 class StorySourceRef:
     slug: str
     name: str
@@ -201,6 +213,38 @@ class StoryDetailItem:
     source_count: int
     members: list[StoryMember]
     topics: tuple[TopicRefItem, ...] = ()
+
+
+@dataclass(frozen=True)
+class StorylineMemberEvidence:
+    article_id: int
+    title: str | None
+    url: str
+    source_slug: str | None
+    source_name: str | None
+    published_at: datetime | None
+    event_at: datetime
+    snippet: str
+
+
+@dataclass(frozen=True)
+class StorylineSearchHit:
+    id: int
+    title: str | None
+    updated_at: datetime
+    article_count: int
+    member_preview: tuple[StorylineMemberEvidence, ...]
+
+
+@dataclass(frozen=True)
+class StorylineDetailEvidence:
+    id: int
+    title: str | None
+    first_seen_at: datetime
+    updated_at: datetime
+    article_count: int
+    source_count: int
+    members: tuple[StorylineMemberEvidence, ...]
 
 
 @dataclass(frozen=True)

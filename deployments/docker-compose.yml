@@ -28,11 +28,17 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: 8000
       CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:3000}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      NEWS_AGENT_MODEL: ${NEWS_AGENT_MODEL:-anthropic/claude-haiku-4.5}
+      OPENROUTER_SITE_URL: ${OPENROUTER_SITE_URL:-}
+      FASTEMBED_CACHE_PATH: /models
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - model_cache:/models
     healthcheck:
       test:
         - CMD
@@ -95,3 +101,5 @@ services:
 volumes:
   news_radar_postgres_data:
     name: news_radar_postgres_data
+  model_cache:
+    name: news_radar_model_cache

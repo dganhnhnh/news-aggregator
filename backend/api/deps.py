@@ -9,6 +9,7 @@ from functools import lru_cache
 from fastapi import FastAPI, Request
 
 from adapters.storage import PostgresRawStorage, StorageError
+from agent.service import ResearchService
 from core.config import Settings
 
 
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     storage = PostgresRawStorage(settings.database_url)
     await storage.check_ready()
     app.state.storage = storage
+    app.state.research_service = ResearchService.from_settings(settings, storage)
     try:
         yield
     finally:
@@ -33,3 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def get_storage(request: Request) -> PostgresRawStorage:
     return request.app.state.storage
+
+
+def get_research_service(request: Request) -> ResearchService:
+    return request.app.state.research_service

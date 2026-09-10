@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -49,6 +50,7 @@ from core.content_quality import historical_summary_title_reason
 from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
+    ArticleSearchHit,
     ClassifiableArticle,
     CrawlFailureOccurrence,
     ClusterArticle,
@@ -77,6 +79,9 @@ from models.storage_models import (
     StorageWriteSummary,
     StoryDetailItem,
     StoryFeedItem,
+    StorylineDetailEvidence,
+    StorylineMemberEvidence,
+    StorylineSearchHit,
     StoryMember,
     StorySourceRef,
     TaxonomyCatalogItem,
@@ -114,6 +119,37 @@ MAX_FAILURE_ATTEMPTS = 5
 # How many representative sources a story summary carries for its avatar
 # strip; the full distinct-source count is a separate, already-cached field.
 STORY_SOURCE_LIMIT = 3
+ARTICLE_SEARCH_CANDIDATE_LIMIT = 50
+ARTICLE_SEARCH_LIMIT = 8
+STORYLINE_SEARCH_LIMIT = 5
+STORYLINE_PREVIEW_LIMIT = 3
+RRF_K = 60
+
+
+def reciprocal_rank_fusion(
+    lexical_ids: Sequence[int],
+    semantic_ids: Sequence[int],
+    *,
+    limit: int,
+    k: int = RRF_K,
+    tie_break: Mapping[int, tuple[datetime, int]] | None = None,
+) -> list[int]:
+    """Fuse two ranked lists without comparing incomparable raw scores."""
+    scores: dict[int, float] = defaultdict(float)
+    for ranked_ids in (lexical_ids, semantic_ids):
+        for rank, article_id in enumerate(ranked_ids, start=1):
+            scores[int(article_id)] += 1.0 / (k + rank)
+    tie_break = tie_break or {}
+    return sorted(
+        scores,
+        key=lambda article_id: (
+            scores[article_id],
+            *tie_break.get(
+                article_id, (datetime.min.replace(tzinfo=timezone.utc), article_id)
+            ),
+        ),
+        reverse=True,
+    )[:limit]
 
 
 def _vector_list(value: Any) -> list[float]:
@@ -1778,6 +1814,192 @@ class PostgresRawStorage:
                 for row in rows
             ]
 
+    @staticmethod
+    def _research_article_filters(
+        *,
+        since: datetime | None,
+        until: datetime | None,
+        source: str | None,
+    ) -> list[Any]:
+        filters: list[Any] = []
+        if since is not None:
+            filters.append(raw_articles.c.event_at >= since)
+        if until is not None:
+            filters.append(raw_articles.c.event_at < until)
+        if source:
+            normalized = source.casefold()
+            filters.append(
+                or_(
+                    func.lower(sources.c.slug) == normalized,
+                    func.lower(sources.c.name) == normalized,
+                )
+            )
+        return filters
+
+    async def _lexical_article_candidates(
+        self,
+        query: str,
+        *,
+        since: datetime | None,
+        until: datetime | None,
+        source: str | None,
+        limit: int,
+    ) -> list[Any]:
+        tsquery = func.websearch_to_tsquery("english", query)
+        rank = func.ts_rank_cd(raw_articles.c.search_tsv, tsquery)
+        stmt = (
+            select(
+                raw_articles.c.id,
+                raw_articles.c.url,
+                raw_articles.c.title,
+                self._excerpt_source().label("snippet_raw"),
+                raw_articles.c.published_at,
+                raw_articles.c.event_at,
+                sources.c.slug.label("source_slug"),
+                sources.c.name.label("source_name"),
+            )
+            .select_from(
+                raw_articles.outerjoin(
+                    sources, raw_articles.c.source_id == sources.c.id
+                )
+            )
+            .where(
+                raw_articles.c.search_tsv.op("@@")(tsquery),
+                *self._research_article_filters(
+                    since=since, until=until, source=source
+                ),
+            )
+            .order_by(
+                rank.desc(), raw_articles.c.event_at.desc(), raw_articles.c.id.desc()
+            )
+            .limit(limit)
+        )
+        async with self._engine.connect() as connection:
+            return list((await connection.execute(stmt)).all())
+
+    async def _semantic_article_candidates(
+        self,
+        embedding: Sequence[float],
+        *,
+        model: str,
+        since: datetime | None,
+        until: datetime | None,
+        source: str | None,
+        limit: int,
+    ) -> list[Any]:
+        base = (
+            select(
+                raw_articles.c.id,
+                raw_articles.c.url,
+                raw_articles.c.title,
+                self._excerpt_source().label("snippet_raw"),
+                raw_articles.c.published_at,
+                raw_articles.c.event_at,
+                sources.c.slug.label("source_slug"),
+                sources.c.name.label("source_name"),
+                article_embeddings.c.embedding,
+            )
+            .select_from(
+                article_embeddings.join(
+                    raw_articles,
+                    article_embeddings.c.article_id == raw_articles.c.id,
+                ).outerjoin(sources, raw_articles.c.source_id == sources.c.id)
+            )
+            .where(
+                article_embeddings.c.model == model,
+                article_embeddings.c.dim == len(embedding),
+                *self._research_article_filters(
+                    since=since, until=until, source=source
+                ),
+            )
+        )
+        if source or since is not None or until is not None:
+            # pgvector applies ordinary WHERE filters after an approximate HNSW
+            # scan, which can under-return for a selective source/time window.
+            # Materializing the filtered subset makes that case exact; the
+            # common unfiltered path below still uses the HNSW index.
+            filtered = base.cte("filtered_article_embeddings").prefix_with(
+                "MATERIALIZED"
+            )
+            distance = filtered.c.embedding.cosine_distance(list(embedding))
+            stmt = (
+                select(
+                    filtered.c.id,
+                    filtered.c.url,
+                    filtered.c.title,
+                    filtered.c.snippet_raw,
+                    filtered.c.published_at,
+                    filtered.c.event_at,
+                    filtered.c.source_slug,
+                    filtered.c.source_name,
+                )
+                .order_by(distance, filtered.c.event_at.desc(), filtered.c.id.desc())
+                .limit(limit)
+            )
+        else:
+            distance = article_embeddings.c.embedding.cosine_distance(list(embedding))
+            stmt = base.order_by(
+                distance, raw_articles.c.event_at.desc(), raw_articles.c.id.desc()
+            ).limit(limit)
+        async with self._engine.connect() as connection:
+            return list((await connection.execute(stmt)).all())
+
+    async def search_articles(
+        self,
+        query: str,
+        embedding: Sequence[float],
+        *,
+        model: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        source: str | None = None,
+        limit: int = ARTICLE_SEARCH_LIMIT,
+        candidate_limit: int = ARTICLE_SEARCH_CANDIDATE_LIMIT,
+    ) -> list[ArticleSearchHit]:
+        """Hybrid full-text/vector search merged with reciprocal-rank fusion."""
+        lexical_rows, semantic_rows = await asyncio.gather(
+            self._lexical_article_candidates(
+                query,
+                since=since,
+                until=until,
+                source=source,
+                limit=candidate_limit,
+            ),
+            self._semantic_article_candidates(
+                embedding,
+                model=model,
+                since=since,
+                until=until,
+                source=source,
+                limit=candidate_limit,
+            ),
+        )
+        rows_by_id = {
+            int(row.id): row for row in [*lexical_rows, *semantic_rows]
+        }
+        ranked_ids = reciprocal_rank_fusion(
+            [int(row.id) for row in lexical_rows],
+            [int(row.id) for row in semantic_rows],
+            limit=limit,
+            tie_break={
+                article_id: (row.event_at, article_id)
+                for article_id, row in rows_by_id.items()
+            },
+        )
+        return [
+            ArticleSearchHit(
+                id=article_id,
+                url=rows_by_id[article_id].url,
+                title=rows_by_id[article_id].title,
+                snippet=build_excerpt(rows_by_id[article_id].snippet_raw or ""),
+                source_slug=rows_by_id[article_id].source_slug,
+                source_name=rows_by_id[article_id].source_name,
+                published_at=rows_by_id[article_id].published_at,
+                event_at=rows_by_id[article_id].event_at,
+            )
+            for article_id in ranked_ids
+        ]
+
     async def source_articles(
         self,
         slug: str,
@@ -2185,6 +2407,147 @@ class PostgresRawStorage:
                     )
                     for member in member_rows
                 ],
+            )
+
+    async def _storyline_member_evidence(
+        self,
+        connection: AsyncConnection,
+        story_ids: Sequence[int],
+        *,
+        per_story_limit: int | None,
+    ) -> dict[int, tuple[StorylineMemberEvidence, ...]]:
+        if not story_ids:
+            return {}
+        ranked = (
+            select(
+                cluster_members.c.cluster_id,
+                raw_articles.c.id.label("article_id"),
+                raw_articles.c.title,
+                raw_articles.c.url,
+                raw_articles.c.published_at,
+                raw_articles.c.event_at,
+                sources.c.slug.label("source_slug"),
+                sources.c.name.label("source_name"),
+                self._excerpt_source().label("snippet_raw"),
+                func.row_number()
+                .over(
+                    partition_by=cluster_members.c.cluster_id,
+                    order_by=(
+                        raw_articles.c.event_at.desc(),
+                        raw_articles.c.id.desc(),
+                    ),
+                )
+                .label("rn"),
+            )
+            .select_from(
+                cluster_members.join(
+                    raw_articles,
+                    cluster_members.c.article_id == raw_articles.c.id,
+                ).outerjoin(sources, raw_articles.c.source_id == sources.c.id)
+            )
+            .where(cluster_members.c.cluster_id.in_(story_ids))
+            .subquery()
+        )
+        stmt = select(ranked).order_by(
+            ranked.c.cluster_id, ranked.c.event_at.desc(), ranked.c.article_id.desc()
+        )
+        if per_story_limit is not None:
+            stmt = stmt.where(ranked.c.rn <= per_story_limit)
+        rows = (await connection.execute(stmt)).all()
+        grouped: dict[int, list[StorylineMemberEvidence]] = defaultdict(list)
+        for row in rows:
+            grouped[int(row.cluster_id)].append(
+                StorylineMemberEvidence(
+                    article_id=int(row.article_id),
+                    title=row.title,
+                    url=row.url,
+                    source_slug=row.source_slug,
+                    source_name=row.source_name,
+                    published_at=row.published_at,
+                    event_at=row.event_at,
+                    snippet=build_excerpt(row.snippet_raw or ""),
+                )
+            )
+        return {
+            story_id: tuple(members) for story_id, members in grouped.items()
+        }
+
+    async def search_storylines(
+        self,
+        embedding: Sequence[float],
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = STORYLINE_SEARCH_LIMIT,
+        preview_limit: int = STORYLINE_PREVIEW_LIMIT,
+    ) -> list[StorylineSearchHit]:
+        """Semantic search over canonical event clusters exposed as storylines."""
+        filters: list[Any] = [clusters.c.status != "merged"]
+        if since is not None:
+            filters.append(clusters.c.last_seen_at >= since)
+        if until is not None:
+            filters.append(clusters.c.last_seen_at < until)
+        distance = clusters.c.centroid.cosine_distance(list(embedding))
+        stmt = (
+            select(
+                clusters.c.id,
+                clusters.c.headline,
+                clusters.c.last_seen_at,
+                clusters.c.n_articles,
+            )
+            .where(*filters)
+            .order_by(distance, clusters.c.last_seen_at.desc(), clusters.c.id.desc())
+            .limit(limit)
+        )
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(stmt)).all()
+            previews = await self._storyline_member_evidence(
+                connection,
+                [int(row.id) for row in rows],
+                per_story_limit=preview_limit,
+            )
+            return [
+                StorylineSearchHit(
+                    id=int(row.id),
+                    title=row.headline,
+                    updated_at=row.last_seen_at,
+                    article_count=int(row.n_articles),
+                    member_preview=previews.get(int(row.id), ()),
+                )
+                for row in rows
+            ]
+
+    async def get_storyline_evidence(
+        self, storyline_id: int
+    ) -> StorylineDetailEvidence | None:
+        """Return one canonical cluster and all member previews for research."""
+        async with self._engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    select(clusters).where(clusters.c.id == storyline_id)
+                )
+            ).first()
+            if row is None:
+                return None
+            if row.merged_into_id is not None:
+                row = (
+                    await connection.execute(
+                        select(clusters).where(clusters.c.id == row.merged_into_id)
+                    )
+                ).first()
+                if row is None:
+                    return None
+            members = await self._storyline_member_evidence(
+                connection, [int(row.id)], per_story_limit=None
+            )
+            return StorylineDetailEvidence(
+                id=int(row.id),
+                title=row.headline,
+                first_seen_at=row.first_seen_at,
+                updated_at=row.last_seen_at,
+                article_count=int(row.n_articles),
+                source_count=int(row.n_distinct_sources),
+                members=members.get(int(row.id), ()),
             )
 
     async def due_failures(

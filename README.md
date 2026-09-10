@@ -385,6 +385,14 @@ mặc định `http://localhost:3000` cho frontend dev. Endpoint hiện có:
 - `GET /api/topics?taxonomy=default`
 - `GET /api/stories?limit=&cursor=&source=&topic=&min_sources=&min_articles=`
 - `GET /api/stories/{id}`
+- `POST /api/research` với body `{"query":"..."}` — research agent trả Markdown
+  cùng article citations; cần `OPENROUTER_API_KEY`, còn query embedding dùng cùng
+  FastEmbed model với article embeddings.
+
+Research agent chạy stateless và read-only. Cấu hình model bằng
+`NEWS_AGENT_MODEL` (mặc định `anthropic/claude-haiku-4.5` qua OpenRouter) và có
+thể đặt `OPENROUTER_SITE_URL` để gửi attribution header. Nếu không có key, các
+endpoint đọc khác vẫn hoạt động và riêng `/api/research` trả `503`.
 
 Admin API chạy ở process riêng để giữ `news-api` public hoàn toàn read-only:
 
