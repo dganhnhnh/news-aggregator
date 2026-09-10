@@ -143,6 +143,9 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
 
 # ─── Adapter: crawl4ai ───────────────────────────────────────────────────────
 
+DEFAULT_EXCLUDED_TAGS: tuple[str, ...] = ("nav", "header", "footer", "aside", "form")
+
+
 class Crawl4aiProvider(CrawlerProvider):
     """
     crawl4ai-powered implementation of the CrawlerProvider port.
@@ -162,8 +165,11 @@ class Crawl4aiProvider(CrawlerProvider):
         per_host_delay_seconds: float = 1.0,
     ) -> None:
         self._browser_config = browser_config or BrowserConfig()
-        # Default: extract plain text/markdown, skip raw HTML
-        self._run_config = run_config or CrawlerRunConfig(only_text=True)
+        # Default: extract plain text/markdown, skip raw HTML and navigational/boilerplate tags
+        self._run_config = run_config or CrawlerRunConfig(
+            only_text=True,
+            excluded_tags=list(DEFAULT_EXCLUDED_TAGS),
+        )
         # A global concurrency cap says nothing about how hard one publisher is
         # hit: ten URLs from one feed are usually ten URLs from one host, which
         # is what trips rate limits and bot filters. These bound per-host load.

@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from adapters.retrieve_news_data import crawler as crawler_module
-from adapters.retrieve_news_data.crawler import Crawl4aiProvider, _build_crawl_result
+from adapters.retrieve_news_data.crawler import (
+    DEFAULT_EXCLUDED_TAGS,
+    Crawl4aiProvider,
+    _build_crawl_result,
+)
 from core.content_quality import BLOCK_PAGE_CONTEXT_KEY
 from core.urls import URL_ERROR_CONTEXT_KEY
 
@@ -358,3 +362,11 @@ def test_waves_keep_results_aligned_with_the_input(monkeypatch) -> None:
 
     assert [result.url for result in results] == urls
     assert [result.success for result in results] == [True, True, True, False]
+
+
+def test_crawl4ai_provider_default_excluded_tags() -> None:
+    provider = Crawl4aiProvider()
+    assert DEFAULT_EXCLUDED_TAGS == ("nav", "header", "footer", "aside", "form")
+    assert provider._run_config.excluded_tags == ["nav", "header", "footer", "aside", "form"]
+    assert provider._run_config.only_text is True
+
