@@ -30,13 +30,15 @@ async function backendFetch(
 ): Promise<Response> {
   const method = request?.method ?? 'GET'
   const contentType = request?.headers.get('content-type')
+  const accept = request?.headers.get('accept')
   try {
     return await fetch(`${baseUrl}${path}`, {
       method,
       body: method === 'GET' || method === 'HEAD' ? undefined : await request?.arrayBuffer(),
       cache: 'no-store',
+      signal: request?.signal,
       headers: {
-        accept: 'application/json',
+        accept: accept || 'application/json',
         ...(contentType ? { 'content-type': contentType } : {}),
       },
     })
@@ -49,8 +51,14 @@ async function responseError(response: Response): Promise<BackendApiError> {
   const body = (await response.json().catch(() => null)) as
     | { detail?: unknown; error?: unknown }
     | null
+  const detail = body?.detail
   const message =
-    (typeof body?.detail === 'string' && body.detail) ||
+    (typeof detail === 'string' && detail) ||
+    (typeof detail === 'object' &&
+      detail !== null &&
+      'reason' in detail &&
+      typeof detail.reason === 'string' &&
+      detail.reason) ||
     (typeof body?.error === 'string' && body.error) ||
     `Request failed (${response.status})`
   return new BackendApiError(message, response.status)
@@ -62,15 +70,20 @@ async function backendJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>
 }
 
-export async function proxyBackend(path: string): Promise<NextResponse> {
+export async function proxyBackend(path: string, request?: Request): Promise<NextResponse> {
   try {
-    const response = await backendFetch(path)
+    const response = await backendFetch(path, { request })
+    const headers: Record<string, string> = {
+      'cache-control': response.headers.get('cache-control') ?? 'no-store',
+      'content-type': response.headers.get('content-type') ?? 'application/json',
+    }
+    for (const name of ['x-request-id', 'x-accel-buffering']) {
+      const value = response.headers.get(name)
+      if (value) headers[name] = value
+    }
     return new NextResponse(response.body, {
       status: response.status,
-      headers: {
-        'cache-control': 'no-store',
-        'content-type': response.headers.get('content-type') ?? 'application/json',
-      },
+      headers,
     })
   } catch (error) {
     if (error instanceof BackendApiError) {

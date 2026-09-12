@@ -388,11 +388,19 @@ mặc định `http://localhost:3000` cho frontend dev. Endpoint hiện có:
 - `POST /api/research` với body `{"query":"..."}` — research agent trả Markdown
   cùng article citations; cần `OPENROUTER_API_KEY`, còn query embedding dùng cùng
   FastEmbed model với article embeddings.
+- `POST /api/research/stream` với body `{"query":"...","thread_id":"<uuid>"}` —
+  stream trạng thái, answer và citations bằng Server-Sent Events.
+- `DELETE /api/research/threads/{thread_id}` — xoá conversation memory trong
+  process của một chat session.
 
-Research agent chạy stateless và read-only. Cấu hình model bằng
-`NEWS_AGENT_MODEL` (mặc định `anthropic/claude-haiku-4.5` qua OpenRouter) và có
-thể đặt `OPENROUTER_SITE_URL` để gửi attribution header. Nếu không có key, các
-endpoint đọc khác vẫn hoạt động và riêng `/api/research` trả `503`.
+Endpoint JSON mặc định vẫn stateless; endpoint stream dùng LangGraph in-process
+memory theo `thread_id` và không ghi PostgreSQL. Cấu hình model bằng
+`OPENROUTER_MODEL` (mặc định `nvidia/nemotron-3.5-lightning:free` qua OpenRouter) và có
+thể đặt `OPENROUTER_SITE_URL` để gửi attribution header. OpenRouter prompt cache
+được bật cho Anthropic sessions. `OPENROUTER_TIMEOUT_SECONDS` giới hạn mỗi HTTP
+request tới model (mặc định 60 giây); `NEWS_AGENT_RUN_TIMEOUT_SECONDS` giới hạn
+toàn bộ vòng LangGraph gồm nhiều model/tool call (mặc định 90 giây). Nếu không
+có key, các endpoint đọc khác vẫn hoạt động và các endpoint research trả `503`.
 
 Admin API chạy ở process riêng để giữ `news-api` public hoàn toàn read-only:
 
@@ -413,7 +421,8 @@ trong môi trường private/trusted. Endpoint quản lý feed:
 `frontend/` là Next.js app. Browser gọi route `/api/*` cùng origin; Next.js
 server proxy request đọc tới FastAPI theo `API_URL` và request quản trị theo
 `ADMIN_API_URL`, nên không expose các URL nội bộ ra client. Xem
-[frontend/README.md](frontend/README.md) cho cấu hình local.
+[frontend/README.md](frontend/README.md) cho cấu hình local. Tab **Ask AI** hỗ
+trợ chat nhiều lượt, streaming và article citations.
 
 ## Kiểm thử
 

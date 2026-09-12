@@ -23,4 +23,5 @@ pnpm dev
 
 Frontend mặc định chạy tại `http://localhost:3000`. API backend cần được khởi
 động riêng. Trang `/feeds` cần cả `news-api` và `news-admin-api`; xem
-[README chính](../README.md).
+[README chính](../README.md). Tab `/ask` gọi research agent qua SSE; conversation
+memory nằm trong process `news-api` và được reset khi API restart.

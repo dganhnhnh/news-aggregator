@@ -96,6 +96,8 @@ class Settings:
     openrouter_api_key: str | None = None
     news_agent_model: str = "nvidia/nemotron-3.5-lightning:free"
     openrouter_site_url: str | None = None
+    openrouter_timeout_seconds: float = 60.0
+    news_agent_run_timeout_seconds: float = 90.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -169,10 +171,16 @@ class Settings:
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip() or None,
             news_agent_model=(
                 os.getenv("OPENROUTER_MODEL", "").strip()
-                or "anthropic/claude-haiku-4.5"
+                or "nvidia/nemotron-3.5-lightning:free"
             ),
             openrouter_site_url=(
                 os.getenv("OPENROUTER_SITE_URL", "").strip() or None
+            ),
+            openrouter_timeout_seconds=_env_float(
+                "OPENROUTER_TIMEOUT_SECONDS", 60.0
+            ),
+            news_agent_run_timeout_seconds=_env_float(
+                "NEWS_AGENT_RUN_TIMEOUT_SECONDS", 90.0
             ),
         )
 

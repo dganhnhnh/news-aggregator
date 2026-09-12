@@ -26,6 +26,26 @@ export type SourceRef = {
   name: string
 }
 
+export type ResearchCitation = {
+  article_id: number
+  title: string | null
+  url: string
+  source: SourceRef | null
+  published_at: string | null
+}
+
+export type ResearchStreamEvent =
+  | { event: 'start'; data: { request_id: string; thread_id: string } }
+  | { event: 'status'; data: { phase: 'searching' | 'reading' | 'synthesizing'; tool?: string } }
+  | { event: 'delta'; data: { text: string } }
+  | { event: 'reset'; data: Record<string, never> }
+  | { event: 'citations'; data: { citations: ResearchCitation[] } }
+  | { event: 'done'; data: { request_id: string; thread_id: string } }
+  | {
+      event: 'error'
+      data: { message: string; error_type: string; reason: string; request_id: string }
+    }
+
 export type TopicRef = {
   id: number
   slug: string

@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Rss, Newspaper, BookOpen, TrendingUp, ListPlus } from 'lucide-react'
+import { Rss, Newspaper, BookOpen, TrendingUp, ListPlus, Sparkles } from 'lucide-react'
 import { toast } from 'sonner'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -45,6 +45,7 @@ export function NavRail() {
     pathname === '/' || pathname.startsWith('/sources') || pathname.startsWith('/articles')
   const isStoriesActive = pathname.startsWith('/stories')
   const isFeedsActive = pathname.startsWith('/feeds')
+  const isAskActive = pathname.startsWith('/ask')
 
   return (
     <nav
@@ -120,7 +121,27 @@ export function NavRail() {
         </div>
       </div>
 
-      <ThemeToggle />
+      <div className="flex flex-col items-center gap-1">
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Link href="/ask" aria-label="Ask AI" aria-current={isAskActive ? 'page' : undefined}>
+                <span
+                  className={cn(
+                    'flex size-10 items-center justify-center rounded-lg text-sidebar-foreground/60 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+                    isAskActive &&
+                      'bg-primary/15 text-primary hover:bg-primary/15 hover:text-primary',
+                  )}
+                >
+                  <Sparkles className="size-[18px]" />
+                </span>
+              </Link>
+            }
+          />
+          <TooltipContent side="right">Ask AI</TooltipContent>
+        </Tooltip>
+        <ThemeToggle />
+      </div>
     </nav>
   )
 }

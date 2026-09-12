@@ -20,6 +20,14 @@ export class ApiError extends Error {
 
 function apiErrorMessage(body: { detail?: unknown; error?: unknown } | null, status: number) {
   if (typeof body?.detail === 'string' && body.detail) return body.detail
+  if (
+    typeof body?.detail === 'object' &&
+    body.detail !== null &&
+    'reason' in body.detail &&
+    typeof body.detail.reason === 'string'
+  ) {
+    return body.detail.reason
+  }
   if (typeof body?.error === 'string' && body.error) return body.error
   if (Array.isArray(body?.detail)) {
     const first = body.detail[0] as { msg?: unknown } | undefined

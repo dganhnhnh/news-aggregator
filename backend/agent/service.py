@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import monotonic
@@ -12,6 +13,8 @@ from typing import Any
 from uuid import uuid4
 
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Overwrite
 from sqlalchemy.exc import SQLAlchemyError
 
 from adapters.storage import PostgresRawStorage, StorageError
@@ -99,6 +102,19 @@ class ResearchResult:
     request_id: str = ""
 
 
+@dataclass(frozen=True)
+class ResearchStreamEvent:
+    event: str
+    data: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ResearchStreamSession:
+    request_id: str
+    thread_id: str
+    events: AsyncIterator[ResearchStreamEvent]
+
+
 def _message_text(message: Any) -> str:
     content = getattr(message, "content", "")
     if isinstance(content, str):
@@ -112,6 +128,21 @@ def _message_text(message: Any) -> str:
                 parts.append(block["text"])
         return "".join(parts).strip()
     return str(content).strip()
+
+
+def _message_delta_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "".join(parts)
+    return str(content)
 
 
 def _root_exception(exc: BaseException) -> BaseException:
@@ -204,6 +235,27 @@ def _log_new_messages(
     return len(messages)
 
 
+def _tool_status(tool_name: str) -> str:
+    return "searching" if tool_name.startswith("search_") else "reading"
+
+
+def _cached_tokens(messages: list[Any]) -> int:
+    total = 0
+    for message in messages:
+        usage = getattr(message, "usage_metadata", None) or {}
+        input_details = usage.get("input_token_details") or {}
+        cached = input_details.get("cache_read") or input_details.get("cached_tokens")
+        if cached:
+            total += int(cached)
+            continue
+        response = getattr(message, "response_metadata", None) or {}
+        prompt_details = (response.get("token_usage") or {}).get(
+            "prompt_tokens_details"
+        ) or {}
+        total += int(prompt_details.get("cached_tokens") or 0)
+    return total
+
+
 def citations_from_evidence(
     answer: str, evidence: list[Evidence]
 ) -> tuple[ResearchCitation, ...]:
@@ -248,11 +300,13 @@ class ResearchService:
         model: Any | None,
         embedder: QueryEmbedderProtocol | None = None,
         timeout_seconds: float = RUN_TIMEOUT_SECONDS,
+        checkpointer: InMemorySaver | None = None,
     ) -> None:
         self._storage = storage
         self._model = model
         self._embedder = embedder or QueryEmbedder()
         self._timeout_seconds = timeout_seconds
+        self._checkpointer = checkpointer or InMemorySaver()
 
     @classmethod
     def from_settings(
@@ -264,12 +318,31 @@ class ResearchService:
                 api_key=settings.openrouter_api_key,
                 model=settings.news_agent_model,
                 site_url=settings.openrouter_site_url,
+                timeout_seconds=settings.openrouter_timeout_seconds,
             )
-        return cls(storage=storage, model=model)
+        return cls(
+            storage=storage,
+            model=model,
+            timeout_seconds=settings.news_agent_run_timeout_seconds,
+        )
 
-    async def research(self, query: str) -> ResearchResult:
+    def _configured_model(self, thread_id: str) -> Any:
+        if self._model is None:
+            return None
+        if not hasattr(self._model, "extra_body"):
+            return self._model
+        extra_body = dict(getattr(self._model, "extra_body", None) or {})
+        extra_body["session_id"] = thread_id
+        model_name = str(
+            getattr(self._model, "model_name", None)
+            or getattr(self._model, "model", "")
+        )
+        if model_name.startswith("anthropic/"):
+            extra_body["cache_control"] = {"type": "ephemeral"}
+        return self._model.model_copy(update={"extra_body": extra_body})
+
+    def start_stream(self, query: str, *, thread_id: str) -> ResearchStreamSession:
         request_id = uuid4().hex
-        started = monotonic()
         if self._model is None:
             reason = "OPENROUTER_API_KEY is not configured"
             logger.warning(
@@ -284,55 +357,191 @@ class ResearchService:
                 error_type="ConfigurationError",
                 reason=reason,
             )
+        try:
+            graph = build_graph(
+                self._configured_model(thread_id),
+                checkpointer=self._checkpointer,
+            )
+        except Exception as exc:
+            error_type, reason = _diagnostic(exc)
+            logger.exception(
+                "Research failed request_id=%s phase=graph_setup error_type=%s "
+                "reason=%s",
+                request_id,
+                error_type,
+                reason,
+            )
+            raise ResearchUpstreamError(
+                "Research agent setup failed",
+                request_id=request_id,
+                error_type=error_type,
+                reason=reason,
+            ) from exc
+        return ResearchStreamSession(
+            request_id=request_id,
+            thread_id=thread_id,
+            events=self._stream_graph(
+                graph,
+                query=query,
+                thread_id=thread_id,
+                request_id=request_id,
+            ),
+        )
+
+    async def _stream_graph(
+        self,
+        graph: Any,
+        *,
+        query: str,
+        thread_id: str,
+        request_id: str,
+    ) -> AsyncIterator[ResearchStreamEvent]:
+        started = monotonic()
         now = datetime.now(timezone.utc)
-        graph = build_graph(self._model, now=now)
         context = ResearchContext(
             storage=self._storage,
             embedder=self._embedder,
             now=now,
             request_id=request_id,
         )
+        config = {
+            "recursion_limit": RECURSION_LIMIT,
+            "configurable": {"thread_id": thread_id},
+        }
+        snapshot = await graph.aget_state(config)
+        baseline_messages = len((snapshot.values or {}).get("messages") or [])
+        logged_messages = baseline_messages
+        observed_messages = baseline_messages
+        emitted_tool_calls: set[str] = set()
+        current_generation: str | None = None
+        current_generation_uses_tools = False
+        visible_answer = ""
         result: dict[str, Any] | None = None
-        logged_messages = 0
+
         logger.info(
-            "Research started request_id=%s query_chars=%d timeout_seconds=%s",
+            "Research started request_id=%s thread_id=%s query_chars=%d "
+            "history_messages=%d timeout_seconds=%s",
             request_id,
+            thread_id,
             len(query),
+            baseline_messages,
             self._timeout_seconds,
+        )
+        yield ResearchStreamEvent(
+            "start", {"request_id": request_id, "thread_id": thread_id}
+        )
+
+        turn_message = (
+            f"[Turn context: current UTC time is {now.isoformat()}]\n\n{query}"
         )
         try:
             async with asyncio.timeout(self._timeout_seconds):
-                async for state in graph.astream(
+                async for part in graph.astream(
                     {
-                        "messages": [{"role": "user", "content": query}],
-                        "evidence": [],
+                        "messages": [HumanMessage(content=turn_message)],
+                        "evidence": Overwrite([]),
                     },
-                    config={"recursion_limit": RECURSION_LIMIT},
+                    config=config,
                     context=context,
-                    stream_mode="values",
+                    stream_mode=["messages", "values"],
+                    version="v2",
                 ):
+                    part_type = part.get("type")
+                    if part_type == "messages":
+                        message, metadata = part["data"]
+                        if metadata.get("langgraph_node") != "model":
+                            continue
+                        generation = str(getattr(message, "id", None) or "model")
+                        if generation != current_generation:
+                            current_generation = generation
+                            current_generation_uses_tools = False
+                        calls = list(getattr(message, "tool_calls", None) or [])
+                        call_chunks = list(
+                            getattr(message, "tool_call_chunks", None) or []
+                        )
+                        if calls or call_chunks:
+                            if not current_generation_uses_tools and visible_answer:
+                                visible_answer = ""
+                                yield ResearchStreamEvent("reset", {})
+                            current_generation_uses_tools = True
+                            for call in [*calls, *call_chunks]:
+                                tool_name = str(call.get("name") or "")
+                                call_id = str(
+                                    call.get("id")
+                                    or f"{generation}:{tool_name or 'tool'}"
+                                )
+                                if tool_name and call_id not in emitted_tool_calls:
+                                    emitted_tool_calls.add(call_id)
+                                    yield ResearchStreamEvent(
+                                        "status",
+                                        {
+                                            "phase": _tool_status(tool_name),
+                                            "tool": tool_name,
+                                        },
+                                    )
+                            continue
+                        if current_generation_uses_tools:
+                            continue
+                        delta = _message_delta_text(message)
+                        if delta:
+                            visible_answer += delta
+                            yield ResearchStreamEvent("delta", {"text": delta})
+                        continue
+
+                    if part_type != "values":
+                        continue
+                    state = part["data"]
                     result = state
+                    messages = list(state.get("messages") or [])
                     logged_messages = _log_new_messages(
-                        request_id,
-                        list(state.get("messages") or []),
-                        logged_messages,
+                        request_id, messages, logged_messages
                     )
+                    for message in messages[observed_messages:]:
+                        if isinstance(message, AIMessage):
+                            for call in message.tool_calls:
+                                tool_name = str(call.get("name") or "")
+                                call_id = str(call.get("id") or tool_name)
+                                if tool_name and call_id not in emitted_tool_calls:
+                                    emitted_tool_calls.add(call_id)
+                                    if visible_answer:
+                                        visible_answer = ""
+                                        yield ResearchStreamEvent("reset", {})
+                                    yield ResearchStreamEvent(
+                                        "status",
+                                        {
+                                            "phase": _tool_status(tool_name),
+                                            "tool": tool_name,
+                                        },
+                                    )
+                        elif isinstance(message, ToolMessage):
+                            yield ResearchStreamEvent(
+                                "status", {"phase": "synthesizing"}
+                            )
+                    observed_messages = len(messages)
         except TimeoutError as exc:
-            error_type, reason = _diagnostic(exc)
+            reason = f"Agent exceeded the {self._timeout_seconds:g}s run timeout"
             logger.exception(
-                "Research failed request_id=%s phase=graph error_type=%s reason=%s "
-                "duration_ms=%d",
+                "Research failed request_id=%s thread_id=%s phase=graph "
+                "error_type=TimeoutError reason=%s duration_ms=%d",
                 request_id,
-                error_type,
+                thread_id,
                 reason,
                 int((monotonic() - started) * 1000),
             )
             raise ResearchUpstreamError(
                 "Research request timed out",
                 request_id=request_id,
-                error_type=error_type,
+                error_type="TimeoutError",
                 reason=reason,
             ) from exc
+        except asyncio.CancelledError:
+            logger.info(
+                "Research cancelled request_id=%s thread_id=%s duration_ms=%d",
+                request_id,
+                thread_id,
+                int((monotonic() - started) * 1000),
+            )
+            raise
         except Exception as exc:
             error_type, reason = _diagnostic(exc)
             duration_ms = int((monotonic() - started) * 1000)
@@ -340,9 +549,10 @@ class ResearchService:
                 exc, (StorageError, QueryEmbeddingError, SQLAlchemyError)
             ):
                 logger.exception(
-                    "Research failed request_id=%s phase=retrieval error_type=%s "
-                    "reason=%s duration_ms=%d",
+                    "Research failed request_id=%s thread_id=%s phase=retrieval "
+                    "error_type=%s reason=%s duration_ms=%d",
                     request_id,
+                    thread_id,
                     error_type,
                     reason,
                     duration_ms,
@@ -354,9 +564,10 @@ class ResearchService:
                     reason=reason,
                 ) from exc
             logger.exception(
-                "Research failed request_id=%s phase=graph error_type=%s reason=%s "
-                "duration_ms=%d",
+                "Research failed request_id=%s thread_id=%s phase=graph "
+                "error_type=%s reason=%s duration_ms=%d",
                 request_id,
+                thread_id,
                 error_type,
                 reason,
                 duration_ms,
@@ -370,12 +581,6 @@ class ResearchService:
 
         if result is None:
             reason = "The agent graph completed without emitting any state"
-            logger.error(
-                "Research failed request_id=%s phase=graph error_type=EmptyGraphResult "
-                "reason=%s",
-                request_id,
-                reason,
-            )
             raise ResearchUpstreamError(
                 "Research model returned no result",
                 request_id=request_id,
@@ -387,26 +592,20 @@ class ResearchService:
         final = next(
             (
                 message
-                for message in reversed(messages)
+                for message in reversed(messages[baseline_messages:])
                 if isinstance(message, AIMessage) and not message.tool_calls
             ),
             None,
         )
         if final is None or not _message_text(final):
-            reason = "The agent graph did not produce a non-empty final AI message"
-            logger.error(
-                "Research failed request_id=%s phase=validation "
-                "error_type=MissingFinalAnswer reason=%s messages=%d",
-                request_id,
-                reason,
-                len(messages),
-            )
+            reason = "The current turn did not produce a non-empty final AI message"
             raise ResearchUpstreamError(
                 "Research model returned no final answer",
                 request_id=request_id,
                 error_type="MissingFinalAnswer",
                 reason=reason,
             )
+
         answer = _message_text(final)
         evidence = list(result.get("evidence") or [])
         try:
@@ -414,9 +613,10 @@ class ResearchService:
         except InvalidResearchCitation as exc:
             reason = _safe_text(exc, limit=1_000)
             logger.warning(
-                "Research failed request_id=%s phase=citation_validation "
-                "error_type=%s reason=%s evidence=%d",
+                "Research failed request_id=%s thread_id=%s "
+                "phase=citation_validation error_type=%s reason=%s evidence=%d",
                 request_id,
+                thread_id,
                 type(exc).__name__,
                 reason,
                 len(evidence),
@@ -428,32 +628,74 @@ class ResearchService:
                 reason=reason,
             ) from exc
 
+        if visible_answer != answer:
+            if visible_answer:
+                yield ResearchStreamEvent("reset", {})
+            yield ResearchStreamEvent("delta", {"text": answer})
+        yield ResearchStreamEvent("citations", {"citations": citations})
+        yield ResearchStreamEvent(
+            "done", {"request_id": request_id, "thread_id": thread_id}
+        )
+
+        current_messages = messages[baseline_messages:]
         tool_calls = sum(
             len(message.tool_calls)
-            for message in messages
+            for message in current_messages
             if isinstance(message, AIMessage)
         )
-        tool_messages = sum(isinstance(message, ToolMessage) for message in messages)
+        tool_messages = sum(
+            isinstance(message, ToolMessage) for message in current_messages
+        )
         total_tokens = sum(
             int((getattr(message, "usage_metadata", None) or {}).get("total_tokens", 0))
-            for message in messages
+            for message in current_messages
             if isinstance(message, AIMessage)
         )
         logger.info(
-            "Research completed request_id=%s duration_ms=%d model_calls=%d "
-            "tool_calls=%d tool_messages=%d evidence=%d citations=%d "
-            "total_tokens=%d",
+            "Research completed request_id=%s thread_id=%s duration_ms=%d "
+            "model_calls=%d tool_calls=%d tool_messages=%d evidence=%d "
+            "citations=%d total_tokens=%d cached_tokens=%d",
             request_id,
+            thread_id,
             int((monotonic() - started) * 1000),
-            sum(isinstance(message, AIMessage) for message in messages),
+            sum(isinstance(message, AIMessage) for message in current_messages),
             tool_calls,
             tool_messages,
             len(evidence),
             len(citations),
             total_tokens,
+            _cached_tokens(current_messages),
         )
+
+    async def research(self, query: str) -> ResearchResult:
+        thread_id = uuid4().hex
+        session = self.start_stream(query, thread_id=thread_id)
+        answer = ""
+        citations: tuple[ResearchCitation, ...] = ()
+        completed = False
+        try:
+            async for event in session.events:
+                if event.event == "delta":
+                    answer += str(event.data.get("text") or "")
+                elif event.event == "reset":
+                    answer = ""
+                elif event.event == "citations":
+                    citations = tuple(event.data.get("citations") or ())
+                elif event.event == "done":
+                    completed = True
+        finally:
+            await self.delete_thread(thread_id)
+        if not completed:
+            raise ResearchUpstreamError(
+                "Research stream ended before completion",
+                request_id=session.request_id,
+                error_type="IncompleteResearchStream",
+            )
         return ResearchResult(
             answer=answer,
             citations=citations,
-            request_id=request_id,
+            request_id=session.request_id,
         )
+
+    async def delete_thread(self, thread_id: str) -> None:
+        await self._checkpointer.adelete_thread(thread_id)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Generic, TypeVar
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -163,6 +164,10 @@ class ResearchRequest(BaseModel):
     @classmethod
     def trim_query(cls, value: object) -> object:
         return value.strip() if isinstance(value, str) else value
+
+
+class ResearchStreamRequest(ResearchRequest):
+    thread_id: UUID
 
 
 class ResearchCitation(BaseModel):

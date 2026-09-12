@@ -10,7 +10,13 @@ RUN_TIMEOUT_SECONDS = 90
 RECURSION_LIMIT = 20
 
 
-def build_openrouter_model(*, api_key: str, model: str, site_url: str | None):
+def build_openrouter_model(
+    *,
+    api_key: str,
+    model: str,
+    site_url: str | None,
+    timeout_seconds: float = MODEL_TIMEOUT_SECONDS,
+):
     """Build the OpenAI-compatible LangChain client used through OpenRouter."""
     from langchain_openai import ChatOpenAI
 
@@ -22,9 +28,10 @@ def build_openrouter_model(*, api_key: str, model: str, site_url: str | None):
         base_url=OPENROUTER_BASE_URL,
         api_key=api_key,
         temperature=0,
-        timeout=MODEL_TIMEOUT_SECONDS,
+        timeout=timeout_seconds,
         max_retries=MODEL_MAX_RETRIES,
-        streaming=False,
+        streaming=True,
+        stream_usage=True,
         default_headers=headers,
         max_tokens=3000,
     )
