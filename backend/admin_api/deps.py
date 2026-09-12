@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 
+from adapters.retrieve_news_data import GoogleNewsFeedDiscovery
 from adapters.storage import PostgresRawStorage, StorageError
 from core.config import Settings
 
@@ -31,3 +32,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def get_storage(request: Request) -> PostgresRawStorage:
     return request.app.state.storage
+
+
+def get_feed_discovery() -> GoogleNewsFeedDiscovery:
+    """Build a stateless discovery adapter for one admin request."""
+    return GoogleNewsFeedDiscovery()

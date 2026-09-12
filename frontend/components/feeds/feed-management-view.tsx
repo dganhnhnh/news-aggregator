@@ -16,6 +16,7 @@ import type { FeedPriority, ManagedFeed } from '@/lib/types'
 import { formatAbsolute, relativeTime } from '@/lib/time'
 import { useFeeds } from '@/hooks/use-feeds'
 import { useMinuteNow } from '@/hooks/use-minute-now'
+import { CustomAddFeeds } from '@/components/feeds/custom-add-feeds'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -48,9 +49,11 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 type FeedTab = 'active' | 'inactive'
+type FeedSection = 'management' | 'custom-add'
 
 export function FeedManagementView() {
   const { feeds, error, isLoading, refresh } = useFeeds()
+  const [section, setSection] = useState<FeedSection>('management')
   const [tab, setTab] = useState<FeedTab>('active')
   const [feedUrl, setFeedUrl] = useState('')
   const [sourceLabel, setSourceLabel] = useState('')
@@ -121,123 +124,144 @@ export function FeedManagementView() {
             <Rss className="size-4" />
           </span>
           <div>
-            <h1 className="text-base font-semibold">Feed management</h1>
-            <p className="text-sm text-muted-foreground">Add feeds and control their crawl tier.</p>
+            <h1 className="text-base font-semibold">Feeds</h1>
+            <p className="text-sm text-muted-foreground">
+              Discover, add, and control feed crawl tiers.
+            </p>
           </div>
         </div>
       </header>
 
       <div className="scrollbar-thin flex-1 overflow-y-auto">
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-5 sm:px-6 sm:py-7">
-          <section className="rounded-xl border border-border bg-card p-4 sm:p-5">
-            <form onSubmit={addFeed} className="grid gap-4 lg:grid-cols-[minmax(18rem,2fr)_minmax(12rem,1fr)_10rem_auto] lg:items-end">
-              <label className="flex min-w-0 flex-col gap-1.5 text-sm font-medium">
-                Feed URL
-                <Input
-                  type="url"
-                  required
-                  value={feedUrl}
-                  onChange={(event) => {
-                    setFeedUrl(event.target.value)
-                    setFormError(null)
-                  }}
-                  placeholder="https://example.com/feed.xml"
-                  disabled={isAdding}
-                  aria-invalid={Boolean(formError)}
-                />
-              </label>
+          <Tabs
+            value={section}
+            onValueChange={(value) => setSection(value as FeedSection)}
+          >
+            <TabsList>
+              <TabsTrigger value="management">Feed management</TabsTrigger>
+              <TabsTrigger value="custom-add">Custom Add feeds</TabsTrigger>
+            </TabsList>
 
-              <label className="flex min-w-0 flex-col gap-1.5 text-sm font-medium">
-                Source label
-                <Input
-                  value={sourceLabel}
-                  onChange={(event) => setSourceLabel(event.target.value)}
-                  placeholder="Inferred from domain"
-                  disabled={isAdding}
-                />
-              </label>
-
-              <label className="flex flex-col gap-1.5 text-sm font-medium">
-                Priority
-                <Select
-                  value={priority}
-                  onValueChange={(value) => setPriority(value as FeedPriority)}
-                  disabled={isAdding}
+            <TabsContent value="management" className="mt-4 flex flex-col gap-6">
+              <section className="rounded-xl border border-border bg-card p-4 sm:p-5">
+                <form
+                  onSubmit={addFeed}
+                  className="grid gap-4 lg:grid-cols-[minmax(18rem,2fr)_minmax(12rem,1fr)_10rem_auto] lg:items-end"
                 >
-                  <SelectTrigger className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      <SelectItem value="normal">Normal</SelectItem>
-                      <SelectItem value="instant">Instant</SelectItem>
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-              </label>
+                  <label className="flex min-w-0 flex-col gap-1.5 text-sm font-medium">
+                    Feed URL
+                    <Input
+                      type="url"
+                      required
+                      value={feedUrl}
+                      onChange={(event) => {
+                        setFeedUrl(event.target.value)
+                        setFormError(null)
+                      }}
+                      placeholder="https://example.com/feed.xml"
+                      disabled={isAdding}
+                      aria-invalid={Boolean(formError)}
+                    />
+                  </label>
 
-              <Button type="submit" disabled={isAdding} className="w-full lg:w-auto">
-                {isAdding && <LoaderCircle className="animate-spin" />}
-                Add feed
-              </Button>
-            </form>
-            <div className="mt-2 min-h-5 text-sm">
-              {formError ? (
-                <p className="text-destructive" role="alert">{formError}</p>
-              ) : (
-                <p className="text-muted-foreground">
-                  Leave the source label blank to use the feed&apos;s registrable domain.
-                </p>
-              )}
-            </div>
-          </section>
+                  <label className="flex min-w-0 flex-col gap-1.5 text-sm font-medium">
+                    Source label
+                    <Input
+                      value={sourceLabel}
+                      onChange={(event) => setSourceLabel(event.target.value)}
+                      placeholder="Inferred from domain"
+                      disabled={isAdding}
+                    />
+                  </label>
 
-          <section className="min-h-0">
-            <Tabs value={tab} onValueChange={(value) => setTab(value as FeedTab)}>
-              <TabsList>
-                <TabsTrigger value="active">Active {activeFeeds.length}</TabsTrigger>
-                <TabsTrigger value="inactive">Inactive {inactiveFeeds.length}</TabsTrigger>
-              </TabsList>
-              <TabsContent value="active" className="mt-2">
-                <FeedList
-                  feeds={activeFeeds}
-                  state="active"
-                  isLoading={isLoading}
-                  error={error}
-                  pendingUrl={pendingUrl}
-                  onRetry={() => void refresh()}
-                  onPriorityChange={(feed, nextPriority) =>
-                    void updateFeed(
-                      feed.feed_url,
-                      { priority: nextPriority },
-                      `Priority changed to ${nextPriority}`,
-                    )
-                  }
-                  onToggle={(feed) => setDisableTarget(feed)}
-                />
-              </TabsContent>
-              <TabsContent value="inactive" className="mt-2">
-                <FeedList
-                  feeds={inactiveFeeds}
-                  state="inactive"
-                  isLoading={isLoading}
-                  error={error}
-                  pendingUrl={pendingUrl}
-                  onRetry={() => void refresh()}
-                  onPriorityChange={(feed, nextPriority) =>
-                    void updateFeed(
-                      feed.feed_url,
-                      { priority: nextPriority },
-                      `Priority changed to ${nextPriority}`,
-                    )
-                  }
-                  onToggle={(feed) =>
-                    void updateFeed(feed.feed_url, { active: true }, 'Feed enabled')
-                  }
-                />
-              </TabsContent>
-            </Tabs>
-          </section>
+                  <label className="flex flex-col gap-1.5 text-sm font-medium">
+                    Priority
+                    <Select
+                      value={priority}
+                      onValueChange={(value) => setPriority(value as FeedPriority)}
+                      disabled={isAdding}
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectItem value="normal">Normal</SelectItem>
+                          <SelectItem value="instant">Instant</SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </label>
+
+                  <Button type="submit" disabled={isAdding} className="w-full lg:w-auto">
+                    {isAdding && <LoaderCircle className="animate-spin" />}
+                    Add feed
+                  </Button>
+                </form>
+                <div className="mt-2 min-h-5 text-sm">
+                  {formError ? (
+                    <p className="text-destructive" role="alert">{formError}</p>
+                  ) : (
+                    <p className="text-muted-foreground">
+                      Leave the source label blank to use the feed&apos;s registrable domain.
+                    </p>
+                  )}
+                </div>
+              </section>
+
+              <section className="min-h-0">
+                <Tabs value={tab} onValueChange={(value) => setTab(value as FeedTab)}>
+                  <TabsList>
+                    <TabsTrigger value="active">Active {activeFeeds.length}</TabsTrigger>
+                    <TabsTrigger value="inactive">Inactive {inactiveFeeds.length}</TabsTrigger>
+                  </TabsList>
+                  <TabsContent value="active" className="mt-2">
+                    <FeedList
+                      feeds={activeFeeds}
+                      state="active"
+                      isLoading={isLoading}
+                      error={error}
+                      pendingUrl={pendingUrl}
+                      onRetry={() => void refresh()}
+                      onPriorityChange={(feed, nextPriority) =>
+                        void updateFeed(
+                          feed.feed_url,
+                          { priority: nextPriority },
+                          `Priority changed to ${nextPriority}`,
+                        )
+                      }
+                      onToggle={(feed) => setDisableTarget(feed)}
+                    />
+                  </TabsContent>
+                  <TabsContent value="inactive" className="mt-2">
+                    <FeedList
+                      feeds={inactiveFeeds}
+                      state="inactive"
+                      isLoading={isLoading}
+                      error={error}
+                      pendingUrl={pendingUrl}
+                      onRetry={() => void refresh()}
+                      onPriorityChange={(feed, nextPriority) =>
+                        void updateFeed(
+                          feed.feed_url,
+                          { priority: nextPriority },
+                          `Priority changed to ${nextPriority}`,
+                        )
+                      }
+                      onToggle={(feed) =>
+                        void updateFeed(feed.feed_url, { active: true }, 'Feed enabled')
+                      }
+                    />
+                  </TabsContent>
+                </Tabs>
+              </section>
+            </TabsContent>
+
+            <TabsContent value="custom-add" className="mt-4">
+              <CustomAddFeeds onFeedsAdded={refresh} />
+            </TabsContent>
+          </Tabs>
         </div>
       </div>
 

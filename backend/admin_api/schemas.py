@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Self
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from core.feed_urls import validate_feed_url
+from models.discovery_models import FeedDiscoveryResult
 from models.storage_models import FeedStateItem
 
 
@@ -37,6 +38,101 @@ class FeedCreate(BaseModel):
     @classmethod
     def clean_source_label(cls, value: str | None) -> str | None:
         return value.strip() or None if value is not None else None
+
+
+class FeedDiscoveryRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=300)
+    language: str = Field(default="en", pattern=r"^[A-Za-z]{2,8}$")
+    country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
+    limit: int = Field(default=12, ge=1, le=25)
+
+    @field_validator("query")
+    @classmethod
+    def clean_query(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("query must not be blank")
+        return cleaned
+
+
+class FeedDiscoveryCandidateResponse(BaseModel):
+    feed_url: str
+    source_label: str
+    website_url: str
+    matched_articles: int
+    sample_titles: list[str]
+    subscribed: bool
+
+
+class FeedDiscoveryResponse(BaseModel):
+    query: str
+    search_feed_url: str
+    candidates: list[FeedDiscoveryCandidateResponse]
+    articles_considered: int
+    publishers_considered: int
+
+    @classmethod
+    def from_domain(
+        cls,
+        result: FeedDiscoveryResult,
+        *,
+        subscribed_urls: set[str],
+    ) -> "FeedDiscoveryResponse":
+        return cls(
+            query=result.query,
+            search_feed_url=result.search_feed_url,
+            candidates=[
+                FeedDiscoveryCandidateResponse(
+                    feed_url=item.feed_url,
+                    source_label=item.source_label,
+                    website_url=item.website_url,
+                    matched_articles=item.matched_articles,
+                    sample_titles=list(item.sample_titles),
+                    subscribed=item.feed_url in subscribed_urls,
+                )
+                for item in result.candidates
+            ],
+            articles_considered=result.articles_considered,
+            publishers_considered=result.publishers_considered,
+        )
+
+
+class FeedBatchItem(BaseModel):
+    feed_url: str
+    source_label: str | None = None
+
+    @field_validator("feed_url")
+    @classmethod
+    def valid_feed_url(cls, value: str) -> str:
+        return validate_feed_url(value)
+
+    @field_validator("source_label")
+    @classmethod
+    def clean_source_label(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
+
+class FeedBatchCreate(BaseModel):
+    feeds: list[FeedBatchItem] = Field(min_length=1, max_length=50)
+    priority: FeedPriority = "normal"
+
+    @field_validator("feeds")
+    @classmethod
+    def unique_feeds(cls, value: list[FeedBatchItem]) -> list[FeedBatchItem]:
+        unique: list[FeedBatchItem] = []
+        seen: set[str] = set()
+        for item in value:
+            if item.feed_url in seen:
+                continue
+            seen.add(item.feed_url)
+            unique.append(item)
+        return unique
+
+
+class FeedBatchCreateResponse(BaseModel):
+    requested_count: int
+    created_count: int
+    skipped_count: int
 
 
 class FeedUpdate(BaseModel):

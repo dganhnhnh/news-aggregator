@@ -178,6 +178,22 @@ def test_load_queries_from_tsv(tmp_path: Path) -> None:
     ]
 
 
+def test_google_news_source_url_is_preserved_for_feed_discovery() -> None:
+    parsed = _parse_rss_entry(
+        {
+            "title": "Story",
+            "link": "https://news.google.com/rss/articles/token",
+            "source": {
+                "title": "Publisher",
+                "href": "https://publisher.example/news",
+            },
+        }
+    )
+
+    assert parsed["source"] == "Publisher"
+    assert parsed["source_url"] == "https://publisher.example/news"
+
+
 def test_load_queries_from_opml_normalizes_required_fields(tmp_path: Path) -> None:
     path = tmp_path / "feeds.opml"
     path.write_text(

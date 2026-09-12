@@ -21,6 +21,29 @@ export type ManagedFeed = {
   updated_at: string
 }
 
+export type FeedDiscoveryCandidate = {
+  feed_url: string
+  source_label: string
+  website_url: string
+  matched_articles: number
+  sample_titles: string[]
+  subscribed: boolean
+}
+
+export type FeedDiscoveryResponse = {
+  query: string
+  search_feed_url: string
+  candidates: FeedDiscoveryCandidate[]
+  articles_considered: number
+  publishers_considered: number
+}
+
+export type FeedBatchCreateResponse = {
+  requested_count: number
+  created_count: number
+  skipped_count: number
+}
+
 export type SourceRef = {
   slug: string
   name: string

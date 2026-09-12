@@ -258,8 +258,17 @@ def _parse_rss_entry(entry: dict, base_url: str = "") -> dict:
 
     # Source / publisher
     raw_source: str = ""
+    raw_source_url: str = ""
     if entry.get("source"):
         raw_source = (entry["source"].get("title") or "").strip()
+        source_href = (
+            entry["source"].get("href") or entry["source"].get("url") or ""
+        ).strip()
+        if source_href:
+            try:
+                raw_source_url = resolve_crawl_url(source_href, base_url=base_url)
+            except UnusableUrl:
+                pass
     elif entry.get("author"):
         raw_source = (entry.get("author") or "").strip()
 
@@ -285,6 +294,7 @@ def _parse_rss_entry(entry: dict, base_url: str = "") -> dict:
         "title": raw_title,
         "feed_entry_url": raw_link,
         "source": raw_source,
+        "source_url": raw_source_url,
         "published_date": pub_date,
         "content_html": _select_entry_content(entry),
         "summary_html": _select_entry_summary(entry),
@@ -592,6 +602,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                         title=entry["title"],
                         source=entry["source"],
                         published_at=entry["published_date"],
+                        source_url=entry.get("source_url", ""),
                         content_html=entry.get("content_html", ""),
                         summary_html=entry.get("summary_html", ""),
                     )
@@ -1190,6 +1201,11 @@ class GoogleNewsRssSearcher(CrawlerProvider):
 
 # Preferred generic name; retain GoogleNewsRssSearcher for compatibility.
 RssFeedSearcher = GoogleNewsRssSearcher
+
+
+async def decode_google_news_url(url: str) -> str:
+    """Resolve a Google News article redirect for discovery integrations."""
+    return await _decode_google_news_url_async(url)
 
 
 def create_google_news_searcher(

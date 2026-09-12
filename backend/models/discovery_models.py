@@ -36,6 +36,32 @@ class DiscoveredEntry:
     # for every article as a preview and as a fallback for embedding, and it is
     # unrecoverable once the entry scrolls out of the feed.
     summary_html: str = ""
+    # Publisher website advertised by an RSS item (Google News exposes this
+    # on its ``<source url=\"...\">`` element). Kept last so existing positional
+    # constructors retain their meaning.
+    source_url: str = ""
+
+
+@dataclass(frozen=True)
+class FeedDiscoveryCandidate:
+    """A validated publisher feed discovered from a keyword search."""
+
+    feed_url: str
+    source_label: str
+    website_url: str
+    matched_articles: int
+    sample_titles: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FeedDiscoveryResult:
+    """Bounded, ranked feed candidates for one keyword query."""
+
+    query: str
+    search_feed_url: str
+    candidates: tuple[FeedDiscoveryCandidate, ...]
+    articles_considered: int
+    publishers_considered: int
 
 
 FeedPollStatus = Literal["fetched", "not_modified", "failed"]
