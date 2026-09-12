@@ -103,6 +103,34 @@ def observe_feed_cadence(
     )
 
 
+def staleness_reason(
+    latest_published_at: datetime | None,
+    *,
+    observed_at: datetime,
+    stale_after_seconds: float,
+) -> str | None:
+    """Describe why a feed should be retired, or None if it is still live.
+
+    `poll_interval_for_gap` tiers a feed by the gap *between* its entries, so
+    a feed whose last few posts landed close together keeps a fast tier
+    forever even if that burst was years ago. This checks the complementary
+    gap: from the newest entry to now. A feed with no dated entries at all is
+    left to the entry-gap logic instead of being retired here.
+    """
+    if latest_published_at is None:
+        return None
+    if latest_published_at.tzinfo is None:
+        latest_published_at = latest_published_at.replace(tzinfo=timezone.utc)
+    staleness_seconds = (observed_at - latest_published_at).total_seconds()
+    if staleness_seconds <= stale_after_seconds:
+        return None
+    stale_days = int(stale_after_seconds // 86400)
+    return (
+        f"No new entries since {latest_published_at.date().isoformat()} "
+        f"(older than {stale_days} days)"
+    )
+
+
 def poll_interval_for_gap(
     gap_seconds: float | None,
     *,

@@ -66,6 +66,11 @@ class Settings:
     feed_poll_trim_fraction: float = 0.1
     feed_poll_future_tolerance_seconds: float = 300.0
     feed_disable_after_failures: int = 10
+    # A feed whose newest entry (as observed in its own body) is older than
+    # this is retired outright: a short publication gap between its last few
+    # posts otherwise keeps it on a fast adaptive tier forever, because that
+    # tier is chosen from gaps between entries, not from gap-to-now.
+    feed_stale_after_days: int = 365
     # Per-host politeness. max_concurrent_crawls bounds total browser load;
     # these bound how hard any single publisher is hit, which is what actually
     # trips rate limits and bot filters.
@@ -142,6 +147,7 @@ class Settings:
                 "FEED_POLL_FUTURE_TOLERANCE_SECONDS", 300.0
             ),
             feed_disable_after_failures=_env_int("FEED_DISABLE_AFTER_FAILURES", 10),
+            feed_stale_after_days=_env_int("FEED_STALE_AFTER_DAYS", 365),
             max_crawls_per_host=_env_int("MAX_CRAWLS_PER_HOST", 1),
             crawl_delay_per_host_seconds=_env_float(
                 "CRAWL_DELAY_PER_HOST_SECONDS", 1.0

@@ -643,6 +643,63 @@ async def _test_record_feed_poll_stores_the_resolved_url() -> None:
         await storage.close()
 
 
+def test_record_feed_poll_with_a_disabled_reason_retires_the_feed() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_record_feed_poll_with_a_disabled_reason_retires_the_feed())
+
+
+async def _test_record_feed_poll_with_a_disabled_reason_retires_the_feed() -> None:
+    feed_url = "https://feed-state.integration.example/stale.xml"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        await _delete_feeds(engine, [feed_url])
+        await storage.seed_feeds([FeedSeed(feed_url=feed_url, source_label="Stale")])
+
+        # A successful fetch can still prove the feed stale: the poll's
+        # cadence evidence (last_entry_published_at, gap stats) is recorded
+        # in the same write that retires it.
+        await storage.record_feed_poll(
+            feed_url,
+            next_poll_at=datetime.now(timezone.utc) + timedelta(hours=6),
+            poll_interval_seconds=21600,
+            observed_publish_gap_seconds=120,
+            observed_publish_gap_count=4,
+            disabled_reason="No new entries since 2015-04-28 (older than 365 days)",
+        )
+
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    select(
+                        feed_state.c.disabled_at,
+                        feed_state.c.disabled_reason,
+                        feed_state.c.poll_interval_seconds,
+                    ).where(feed_state.c.feed_url == feed_url)
+                )
+            ).one()
+        assert row.disabled_at is not None
+        assert row.disabled_reason == (
+            "No new entries since 2015-04-28 (older than 365 days)"
+        )
+        assert row.poll_interval_seconds == 21600
+
+        # A retired feed drops out of the default (undirected) due_feeds
+        # scan, same as any other disabled feed; explicitly naming it still
+        # works, by design, for inspecting a specific feed.
+        due = await storage.due_feeds(limit=0, ignore_schedule=True)
+        assert feed_url not in {target.feed_url for target in due}
+    finally:
+        if ready:
+            await _delete_feeds(engine, [feed_url])
+        await engine.dispose()
+        await storage.close()
+
+
 def test_purge_stale_feed_failures_drops_rows_a_later_success_disproved() -> None:
     if not DATABASE_URL:
         pytest.skip("TEST_DATABASE_URL is not set")

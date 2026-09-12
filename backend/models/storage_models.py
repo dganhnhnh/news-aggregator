@@ -313,6 +313,7 @@ class IngestRunStats:
     feeds_not_modified: int = 0
     feeds_failed: int = 0
     feeds_disabled: int = 0
+    feeds_retired: int = 0
     entries_skipped_out_of_window: int = 0
     entries_skipped_undated: int = 0
     entries_skipped_known: int = 0

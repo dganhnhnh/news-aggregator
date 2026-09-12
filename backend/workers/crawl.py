@@ -9,7 +9,11 @@ from typing import Any
 
 from adapters.retrieve_news_data.google_news_rss_searcher import RssFeedSearcher
 from adapters.retrieve_news_data.rss_discovery import RssDiscovery
-from core.feed_schedule import observe_feed_cadence, poll_interval_for_gap
+from core.feed_schedule import (
+    observe_feed_cadence,
+    poll_interval_for_gap,
+    staleness_reason,
+)
 from core.logger import get_logger
 from models.discovery_models import DiscoveredEntry
 from models.storage_models import CrawlBatch, FailureTarget, FeedSeed, IngestRunStats
@@ -58,6 +62,7 @@ class CrawlWorker(Worker):
             "poll_trim_fraction": args.poll_trim_fraction,
             "poll_future_tolerance": args.poll_future_tolerance,
             "disable_after_failures": args.disable_after_failures,
+            "feed_stale_after_days": args.feed_stale_after_days,
             "max_retries_per_run": args.max_retries_per_run,
         }
 
@@ -265,56 +270,68 @@ class CrawlWorker(Worker):
                     ),
                 )
 
-                bounded = (
-                    poll.entries[: args.max_articles_per_feed]
-                    if args.max_articles_per_feed > 0
-                    else poll.entries
+                stale_reason = staleness_reason(
+                    cadence.latest_published_at,
+                    observed_at=cadence_observed_at,
+                    stale_after_seconds=args.feed_stale_after_days * 86400,
                 )
-                selected: list[DiscoveredEntry] = []
-                for entry in bounded:
-                    if entry.published_at is None:
-                        stats.entries_skipped_undated += 1
-                    if not ctx.window.contains(entry.published_at):
-                        stats.entries_skipped_out_of_window += 1
-                        continue
-                    selected.append(entry)
-
-                if selected:
-                    candidates: set[str] = set()
-                    for entry in selected:
-                        candidates.add(entry.entry_url)
-                        try:
-                            candidates.add(normalize_url(entry.entry_url))
-                        except ValueError:
-                            pass
-                    known = await storage.known_urls(list(candidates))
-                    still_new = []
-                    for entry in selected:
-                        try:
-                            normalized = normalize_url(entry.entry_url)
-                        except ValueError:
-                            normalized = entry.entry_url
-                        if entry.entry_url in known or normalized in known:
-                            stats.entries_skipped_known += 1
-                            continue
-                        still_new.append(entry)
-                    selected = still_new
-
-                for chunk in _chunks(selected, args.crawl_batch_size):
-                    batch = await discovery.crawl_entries(chunk)
-                    summary = await persist_batch(
-                        storage, batch, priority=poll.target.priority
+                if stale_reason is not None:
+                    stats.feeds_retired += 1
+                    logger.warning(
+                        "Feed retired — %s: %s", stale_reason, poll.target.feed_url
                     )
-                    stats.add_batch(batch)
-                    stats.articles_written += summary.written
-                    stats.articles_unchanged += summary.unchanged
-                    has_failures = has_failures or bool(batch.failures)
-                    await ctx.checkpoint(stats)
-                    if args.emit_jsonl:
-                        emit_results(batch.results)
-                    if ctx.shutdown.is_set():
-                        interrupted = True
-                        break
+
+                if stale_reason is None:
+                    bounded = (
+                        poll.entries[: args.max_articles_per_feed]
+                        if args.max_articles_per_feed > 0
+                        else poll.entries
+                    )
+                    selected: list[DiscoveredEntry] = []
+                    for entry in bounded:
+                        if entry.published_at is None:
+                            stats.entries_skipped_undated += 1
+                        if not ctx.window.contains(entry.published_at):
+                            stats.entries_skipped_out_of_window += 1
+                            continue
+                        selected.append(entry)
+
+                    if selected:
+                        candidates: set[str] = set()
+                        for entry in selected:
+                            candidates.add(entry.entry_url)
+                            try:
+                                candidates.add(normalize_url(entry.entry_url))
+                            except ValueError:
+                                pass
+                        known = await storage.known_urls(list(candidates))
+                        still_new = []
+                        for entry in selected:
+                            try:
+                                normalized = normalize_url(entry.entry_url)
+                            except ValueError:
+                                normalized = entry.entry_url
+                            if entry.entry_url in known or normalized in known:
+                                stats.entries_skipped_known += 1
+                                continue
+                            still_new.append(entry)
+                        selected = still_new
+
+                    for chunk in _chunks(selected, args.crawl_batch_size):
+                        batch = await discovery.crawl_entries(chunk)
+                        summary = await persist_batch(
+                            storage, batch, priority=poll.target.priority
+                        )
+                        stats.add_batch(batch)
+                        stats.articles_written += summary.written
+                        stats.articles_unchanged += summary.unchanged
+                        has_failures = has_failures or bool(batch.failures)
+                        await ctx.checkpoint(stats)
+                        if args.emit_jsonl:
+                            emit_results(batch.results)
+                        if ctx.shutdown.is_set():
+                            interrupted = True
+                            break
 
                 if interrupted:
                     # Don't record the poll: a fresh fetch next run is
@@ -329,6 +346,7 @@ class CrawlWorker(Worker):
                     last_modified=poll.last_modified,
                     last_entry_published_at=cadence.latest_published_at,
                     poll_interval_seconds=interval,
+                    disabled_reason=stale_reason,
                     observed_publish_gap_seconds=(
                         cadence.trimmed_mean_gap_seconds
                     ),
@@ -338,7 +356,7 @@ class CrawlWorker(Worker):
 
         logger.info(
             "Crawl run %d: feeds=%d not_modified=%d failed=%d disabled=%d "
-            "redirected=%d purged=%d "
+            "retired=%d redirected=%d purged=%d "
             "discovered=%d crawled=%d from_feed=%d failed_crawls=%d retries=%d/%d "
             "written=%d unchanged=%d "
             "skipped(window=%d undated=%d known=%d non_article=%d)",
@@ -347,6 +365,7 @@ class CrawlWorker(Worker):
             stats.feeds_not_modified,
             stats.feeds_failed,
             stats.feeds_disabled,
+            stats.feeds_retired,
             stats.feeds_redirected,
             stats.stale_failures_purged,
             stats.articles_discovered,

@@ -52,6 +52,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "poll_trim_fraction": 0.1,
         "poll_future_tolerance": 300.0,
         "disable_after_failures": 3,
+        "feed_stale_after_days": 365,
         "max_retries_per_run": 50,
         "emit_jsonl": False,
     }
@@ -148,6 +149,7 @@ class FakeStorage:
         observed_publish_gap_seconds: float | None = None,
         observed_publish_gap_count: int = 0,
         resolved_url: str | None = None,
+        disabled_reason: str | None = None,
     ) -> None:
         self.calls.append(
             (
@@ -158,10 +160,13 @@ class FakeStorage:
                 poll_interval_seconds,
                 observed_publish_gap_seconds,
                 observed_publish_gap_count,
+                disabled_reason,
                 resolved_url,
             )
         )
         self._consecutive_failures[feed_url] = 0
+        if disabled_reason:
+            self._disabled.add(feed_url)
 
     async def record_feed_failure(
         self,
@@ -465,6 +470,65 @@ def test_permanently_missing_feed_is_disabled_on_its_first_failure(
 
     assert outcome.stats.feeds_disabled == 1
     assert asyncio.run(storage.due_feeds(limit=0)) == []
+
+
+def test_feed_with_only_stale_entries_is_retired_without_crawling_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _target()
+    stale = _entry(
+        entry_url="https://article.example/ancient",
+        published_at=NOW - timedelta(days=400),
+    )
+    storage = FakeStorage()
+    storage.set_due_feeds([target])
+    discovery = FakeDiscovery(
+        [FeedPoll(target=target, status="fetched", entries=[stale])]
+    )
+
+    outcome = _run(
+        storage,
+        discovery,
+        _args(feed_stale_after_days=365),
+        window=_window(days=1000),
+        monkeypatch=monkeypatch,
+    )
+
+    assert outcome.stats.feeds_retired == 1
+    assert discovery.crawl_entries_calls == []
+    poll_call = next(call for call in storage.calls if call[0] == "record_feed_poll")
+    disabled_reason = poll_call[7]
+    assert disabled_reason is not None
+    assert "365 days" in disabled_reason
+    assert asyncio.run(storage.due_feeds(limit=0)) == []
+
+
+def test_feed_with_a_recent_entry_alongside_an_old_one_is_not_retired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _target()
+    recent = _entry(entry_url="https://article.example/fresh", published_at=NOW)
+    stale = _entry(
+        entry_url="https://article.example/ancient",
+        published_at=NOW - timedelta(days=400),
+    )
+    storage = FakeStorage()
+    storage.set_due_feeds([target])
+    discovery = FakeDiscovery(
+        [FeedPoll(target=target, status="fetched", entries=[recent, stale])]
+    )
+
+    outcome = _run(
+        storage,
+        discovery,
+        _args(feed_stale_after_days=365),
+        window=_window(days=1000),
+        monkeypatch=monkeypatch,
+    )
+
+    assert outcome.stats.feeds_retired == 0
+    assert len(discovery.crawl_entries_calls) == 1
+    assert asyncio.run(storage.due_feeds(limit=0)) == [target]
 
 
 def test_a_redirect_proved_by_a_failed_poll_is_still_persisted(

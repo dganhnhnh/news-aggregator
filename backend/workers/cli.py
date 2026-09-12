@@ -258,6 +258,15 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Consecutive feed failures before a feed is auto-disabled",
     )
     crawl.add_argument(
+        "--feed-stale-after-days",
+        type=int,
+        default=settings.feed_stale_after_days,
+        help=(
+            "Retire (disable) a feed whose newest entry is older than this "
+            "many days, instead of only tiering it by inter-entry gaps"
+        ),
+    )
+    crawl.add_argument(
         "--max-retries-per-run",
         type=int,
         default=settings.max_retries_per_run,

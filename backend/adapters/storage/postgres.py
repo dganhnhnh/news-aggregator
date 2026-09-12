@@ -2995,6 +2995,7 @@ class PostgresRawStorage:
         observed_publish_gap_seconds: float | None = None,
         observed_publish_gap_count: int = 0,
         resolved_url: str | None = None,
+        disabled_reason: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc)
         values: dict[str, Any] = {
@@ -3004,6 +3005,11 @@ class PostgresRawStorage:
             "next_poll_at": next_poll_at,
             "updated_at": now,
         }
+        if disabled_reason:
+            # A successful poll that also proves the feed stale: retire it in
+            # the same write instead of leaving it due for another poll.
+            values["disabled_at"] = now
+            values["disabled_reason"] = disabled_reason[:2000]
         if resolved_url:
             # Remember where a permanent redirect lands so the next poll goes
             # straight there; `feed_url` keeps matching the OPML/TSV entry.
