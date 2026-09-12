@@ -1,6 +1,6 @@
 import Link from 'next/link'
 import { Radio, ChevronRight } from 'lucide-react'
-import { SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar'
+import { SidebarProvider } from '@/components/ui/sidebar'
 import { AppSidebar } from '@/components/app-sidebar'
 import { NavRail } from '@/components/nav-rail'
 import { getSources } from '@/lib/server-api'
@@ -17,7 +17,6 @@ export default async function SourcesPage() {
         <AppSidebar />
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-            <SidebarTrigger />
             <h1 className="text-sm font-semibold">Sources</h1>
           </div>
           <div className="mx-auto w-full max-w-2xl flex-1 overflow-y-auto px-4 py-6">

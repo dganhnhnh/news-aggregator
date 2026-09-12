@@ -1,5 +1,5 @@
 import { Suspense } from 'react'
-import { SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar'
+import { SidebarProvider } from '@/components/ui/sidebar'
 import { AppSidebar } from '@/components/app-sidebar'
 import { NavRail } from '@/components/nav-rail'
 import { FeedView } from '@/components/feed/feed-view'
@@ -12,7 +12,6 @@ export default function Page() {
       <SidebarProvider className="min-h-0 flex-1">
         <AppSidebar />
         <div className="flex min-w-0 flex-1">
-          <SidebarTrigger className="absolute left-2 top-3 z-10" />
           <Suspense fallback={<FeedFallback />}>
             <FeedView />
           </Suspense>

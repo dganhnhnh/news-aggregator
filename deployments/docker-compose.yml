@@ -40,6 +40,9 @@ services:
       db:
         condition: service_healthy
     volumes:
+      - type: bind
+        source: ../backend
+        target: /app/backend
       - model_cache:/models
     healthcheck:
       test:
@@ -71,6 +74,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - type: bind
+        source: ../backend
+        target: /app/backend
     restart: unless-stopped
 
   instant-crawl:
@@ -97,6 +104,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - type: bind
+        source: ../backend
+        target: /app/backend
     shm_size: 1gb
     restart: unless-stopped
 

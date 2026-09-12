@@ -37,6 +37,13 @@ const NAV_ITEMS = [
     href: '/feeds',
     available: true,
   },
+  {
+    key: 'ask',
+    label: 'Ask AI',
+    icon: Sparkles,
+    href: '/ask',
+    available: true,
+  },
 ] as const
 
 export function NavRail() {
@@ -66,7 +73,8 @@ export function NavRail() {
             const isActive =
               (item.key === 'articles' && isArticlesActive) ||
               (item.key === 'stories' && isStoriesActive) ||
-              (item.key === 'feeds' && isFeedsActive)
+              (item.key === 'feeds' && isFeedsActive) ||
+              (item.key === 'ask' && isAskActive)
             const Icon = item.icon
 
             const button = (
@@ -122,24 +130,6 @@ export function NavRail() {
       </div>
 
       <div className="flex flex-col items-center gap-1">
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Link href="/ask" aria-label="Ask AI" aria-current={isAskActive ? 'page' : undefined}>
-                <span
-                  className={cn(
-                    'flex size-10 items-center justify-center rounded-lg text-sidebar-foreground/60 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
-                    isAskActive &&
-                      'bg-primary/15 text-primary hover:bg-primary/15 hover:text-primary',
-                  )}
-                >
-                  <Sparkles className="size-[18px]" />
-                </span>
-              </Link>
-            }
-          />
-          <TooltipContent side="right">Ask AI</TooltipContent>
-        </Tooltip>
         <ThemeToggle />
       </div>
     </nav>
