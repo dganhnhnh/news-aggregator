@@ -1,0 +1,218 @@
+{
+  "annotations": {"list": []},
+  "description": "Infrastructure metrics for labelled News Radar app, Airflow, worker and monitoring containers.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [{"options": {"0": {"color": "red", "index": 1, "text": "DOWN"}, "1": {"color": "green", "index": 0, "text": "UP"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "up{job=~\"prometheus|node-exporter|cadvisor\"}", "legendFormat": "{{job}}", "range": true, "refId": "A"}],
+      "title": "Scrape targets",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 50000}, {"color": "red", "value": 100000}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "prometheus_tsdb_head_series{job=\"prometheus\"}", "legendFormat": "Head series", "range": true, "refId": "A"}],
+      "title": "Prometheus active series",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 5}, {"color": "red", "value": 10}]}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "scrape_duration_seconds{job=~\"prometheus|node-exporter|cadvisor\"}", "legendFormat": "{{job}}", "range": true, "refId": "A"}],
+      "title": "Scrape duration",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "unit": "cores"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "id": 4,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": true, "mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (container_label_news_radar_group, container_label_news_radar_service, name) (rate(container_cpu_usage_seconds_total{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"}[$__rate_interval]))", "legendFormat": "{{container_label_news_radar_service}} / {{name}}", "range": true, "refId": "A"}],
+      "title": "Container CPU",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "line"}}, "max": 100, "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 80}, {"color": "red", "value": 90}]}, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+      "id": 5,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": true, "mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "100 * sum by (container_label_news_radar_group, container_label_news_radar_service, name) (container_memory_working_set_bytes{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"}) / sum by (container_label_news_radar_group, container_label_news_radar_service, name) (container_spec_memory_limit_bytes{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"} > 0)", "legendFormat": "{{container_label_news_radar_service}} / {{name}}", "range": true, "refId": "A"}],
+      "title": "Container memory limit usage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "id": 6,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": true, "mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (container_label_news_radar_group, container_label_news_radar_service, name) (container_memory_working_set_bytes{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"})", "legendFormat": "{{container_label_news_radar_service}} / {{name}}", "range": true, "refId": "A"}],
+      "title": "Container memory working set",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "unit": "Bps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+      "id": 7,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": true, "mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"editorMode": "code", "expr": "sum by (container_label_news_radar_group, container_label_news_radar_service, name) (rate(container_network_receive_bytes_total{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"}[$__rate_interval]))", "legendFormat": "{{container_label_news_radar_service}} / {{name}} receive", "range": true, "refId": "A"},
+        {"editorMode": "code", "expr": "sum by (container_label_news_radar_group, container_label_news_radar_service, name) (rate(container_network_transmit_bytes_total{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"}[$__rate_interval]))", "legendFormat": "{{container_label_news_radar_service}} / {{name}} transmit", "range": true, "refId": "B"}
+      ],
+      "title": "Container network throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "unit": "Bps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+      "id": 8,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": true, "mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"editorMode": "code", "expr": "sum by (container_label_news_radar_group, container_label_news_radar_service, name) (rate(container_fs_reads_bytes_total{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"}[$__rate_interval]))", "legendFormat": "{{container_label_news_radar_service}} / {{name}} read", "range": true, "refId": "A"},
+        {"editorMode": "code", "expr": "sum by (container_label_news_radar_group, container_label_news_radar_service, name) (rate(container_fs_writes_bytes_total{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"}[$__rate_interval]))", "legendFormat": "{{container_label_news_radar_service}} / {{name}} write", "range": true, "refId": "B"}
+      ],
+      "title": "Container filesystem throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}, "filterable": true, "inspect": false}},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "OOM events"},
+            "properties": [
+              {"id": "unit", "value": "short"},
+              {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}},
+              {"id": "custom.cellOptions", "value": {"type": "color-text"}}
+            ]
+          }
+        ]
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
+      "id": 9,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": false, "displayName": "Service"}]},
+      "targets": [{"editorMode": "code", "expr": "round(sum by (container_label_news_radar_service, name) (increase(container_oom_events_total{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"}[$__range])))", "format": "table", "instant": true, "legendFormat": "{{container_label_news_radar_service}} / {{name}}", "range": false, "refId": "A"}],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {"container_label_news_radar_service": 0, "name": 1, "Value": 2}, "renameByName": {"container_label_news_radar_service": "Service", "name": "Container", "Value": "OOM events"}}}],
+      "title": "OOM events in selected range",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}, "filterable": true, "inspect": false}},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Last seen ago"},
+            "properties": [
+              {"id": "unit", "value": "s"},
+              {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 30}, {"color": "red", "value": 60}]}},
+              {"id": "custom.cellOptions", "value": {"type": "color-text"}}
+            ]
+          }
+        ]
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 29},
+      "id": 10,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Last seen ago"}]},
+      "targets": [{"editorMode": "code", "expr": "time() - max by (container_label_news_radar_service, name) (container_last_seen{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"})", "format": "table", "instant": true, "legendFormat": "{{container_label_news_radar_service}} / {{name}}", "range": false, "refId": "A"}],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {"container_label_news_radar_service": 0, "name": 1, "Value": 2}, "renameByName": {"container_label_news_radar_service": "Service", "name": "Container", "Value": "Last seen ago"}}}],
+      "title": "Seconds since last seen",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}, "filterable": true, "inspect": false}},
+        "overrides": [{"matcher": {"id": "byName", "options": "Uptime"}, "properties": [{"id": "unit", "value": "s"}]}]
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 29},
+      "id": 11,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": false, "displayName": "Service"}]},
+      "targets": [{"editorMode": "code", "expr": "time() - max by (container_label_news_radar_group, container_label_news_radar_service, name) (container_start_time_seconds{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\",name=~\"$container\"})", "format": "table", "instant": true, "legendFormat": "{{container_label_news_radar_service}} / {{name}}", "range": false, "refId": "A"}],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "container_label_news_radar_group": true}, "indexByName": {"container_label_news_radar_service": 0, "name": 1, "Value": 2}, "renameByName": {"container_label_news_radar_service": "Service", "name": "Container", "Value": "Uptime"}}}],
+      "title": "Container uptime",
+      "type": "table"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 41,
+  "tags": ["news-radar", "infrastructure", "containers"],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {"text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+        "definition": "label_values(container_last_seen{container_label_news_radar_project=\"news-radar\"}, container_label_news_radar_group)",
+        "includeAll": true,
+        "label": "Group",
+        "multi": true,
+        "name": "group",
+        "options": [],
+        "query": {"query": "label_values(container_last_seen{container_label_news_radar_project=\"news-radar\"}, container_label_news_radar_group)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {"text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+        "definition": "label_values(container_last_seen{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\"}, container_label_news_radar_service)",
+        "includeAll": true,
+        "label": "Service",
+        "multi": true,
+        "name": "service",
+        "options": [],
+        "query": {"query": "label_values(container_last_seen{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\"}, container_label_news_radar_service)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {"text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "news-radar-prometheus"},
+        "definition": "label_values(container_last_seen{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\"}, name)",
+        "includeAll": true,
+        "label": "Container",
+        "multi": true,
+        "name": "container",
+        "options": [],
+        "query": {"query": "label_values(container_last_seen{container_label_news_radar_project=\"news-radar\",container_label_news_radar_group=~\"$group\",container_label_news_radar_service=~\"$service\"}, name)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "News Radar — Containers",
+  "uid": "news-radar-containers",
+  "version": 2
+}

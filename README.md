@@ -368,6 +368,97 @@ Lệnh này read-only, gộp `processing_jobs` (theo stage/state), `crawl_failur
   **không** phải alert — nó cần lịch sử nhiều lần đo, không đọc được từ một
   snapshot.
 
+### Monitoring hạ tầng với Prometheus và Grafana
+
+Overlay `deployments/docker-compose.monitoring.yml` dành cho **Linux
+single-host**. Node Exporter đo CPU, RAM, filesystem và network của host;
+cAdvisor đo tài nguyên của các container News Radar. Prometheus scrape mỗi 15
+giây và giữ dữ liệu tối đa 15 ngày hoặc 5 GB, điều kiện nào đến trước. Grafana
+provision sẵn hai dashboard **News Radar — Host** và **News Radar —
+Containers**.
+
+Trên Docker Desktop, các host metric mô tả Linux VM của Docker Desktop chứ
+không phải toàn bộ máy macOS. cAdvisor cần quyền `privileged` và các host mount
+read-only, vì vậy chỉ chạy overlay này trên Docker host tin cậy. Docker Desktop
+không hỗ trợ `rslave` trên root bind mount; thêm compatibility override khi
+smoke-test local:
+
+```bash
+docker compose --env-file .env \
+  -f deployments/docker-compose.yml \
+  -f deployments/docker-compose.airflow.yml \
+  -f deployments/docker-compose.monitoring.yml \
+  -f deployments/docker-compose.monitoring.docker-desktop.yml up -d
+```
+
+Node Exporter trên Docker Desktop có thể log `Failed to open directory` cho
+`/run/udev/data`. LinuxKit không expose udev metadata ở đường dẫn đó; exporter
+chỉ bỏ phần enrich tên thiết bị, còn `node_disk_*` metrics vẫn được thu. Đây
+không phải lỗi startup.
+
+Đặt mật khẩu Grafana trong `.env` trước khi khởi động; Compose cố ý không có
+mật khẩu mặc định:
+
+```dotenv
+GRAFANA_ADMIN_USER=admin
+GRAFANA_ADMIN_PASSWORD=replace-with-a-strong-password
+```
+
+Chạy app và monitoring:
+
+```bash
+docker compose --env-file .env \
+  -f deployments/docker-compose.yml \
+  -f deployments/docker-compose.monitoring.yml up -d
+```
+
+Chạy app, Airflow và monitoring:
+
+```bash
+docker compose --env-file .env \
+  -f deployments/docker-compose.yml \
+  -f deployments/docker-compose.airflow.yml \
+  -f deployments/docker-compose.monitoring.yml up -d
+```
+
+Sau lần thêm label đầu tiên, Compose sẽ recreate các container liên quan;
+named volume PostgreSQL, model cache và Airflow metadata không bị xóa. Mở
+Grafana tại `http://127.0.0.1:3001`; Prometheus chỉ nghe tại
+`http://127.0.0.1:9090`. Node Exporter (`9100`) và cAdvisor (`18080`) cũng chỉ
+nghe trên loopback.
+
+Kiểm tra nhanh sau khi start:
+
+```bash
+curl --fail http://127.0.0.1:9090/-/ready
+curl --fail http://127.0.0.1:3001/api/health
+curl --fail --get http://127.0.0.1:9090/api/v1/query \
+  --data-urlencode 'query=up{job=~"prometheus|node-exporter|cadvisor"}'
+curl --fail --get http://127.0.0.1:9090/api/v1/query \
+  --data-urlencode 'query=node_uname_info'
+```
+
+Container Airflow worker do `DockerOperator` tạo mang group `worker`; time
+series của nó vẫn còn sau khi container thành công được auto-remove. Dashboard
+container chỉ hiển thị container có label dự án `news-radar`, dù cAdvisor nhìn
+thấy Docker host rộng hơn.
+
+Để rollback mà không xóa lịch sử hoặc volume ứng dụng, chỉ stop và remove bốn
+service monitoring; không chạy `down -v`:
+
+```bash
+docker compose --env-file .env \
+  -f deployments/docker-compose.monitoring.yml stop \
+  grafana prometheus cadvisor node-exporter
+docker compose --env-file .env \
+  -f deployments/docker-compose.monitoring.yml rm -f \
+  grafana prometheus cadvisor node-exporter
+```
+
+Stack này chưa cung cấp application `/metrics`, Postgres internals, HTTP probe,
+alert rule hoặc notification. `news-worker queue-status` vẫn là cách kiểm tra
+queue/worker nghiệp vụ cho đến phase instrument ứng dụng tiếp theo.
+
 ## Chạy API
 
 `backend/api/` là FastAPI app read-only trên cùng schema, dùng chung

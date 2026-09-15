@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    stack: news-radar
+
+storage:
+  tsdb:
+    retention:
+      time: 15d
+      size: 5GB
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - 127.0.0.1:9090
+
+  - job_name: node-exporter
+    static_configs:
+      - targets:
+          - 127.0.0.1:9100
+
+  - job_name: cadvisor
+    static_configs:
+      - targets:
+          - 127.0.0.1:18080
+    metric_relabel_configs:
+      - source_labels:
+          - container_label_news_radar_project
+        regex: news-radar
+        action: keep

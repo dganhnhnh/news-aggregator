@@ -1,0 +1,123 @@
+# Linux-only, single-host infrastructure monitoring for the news-radar stack.
+# Node Exporter needs the host network/PID namespaces to report the Docker
+# host rather than its own container. All HTTP listeners stay on loopback.
+
+name: news-radar
+
+services:
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=127.0.0.1:9100
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/containers/storage/.+)($|/)
+    network_mode: host
+    pid: host
+    volumes:
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+        bind:
+          propagation: rslave
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: monitoring
+      news-radar.service: node-exporter
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.5
+    command:
+      - --listen_ip=127.0.0.1
+      - --port=18080
+      - --docker_only=true
+      - --store_container_labels=false
+      - --whitelisted_container_labels=news-radar.project,news-radar.group,news-radar.service
+    network_mode: host
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: monitoring
+      news-radar.service: cadvisor
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:18080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.listen-address=127.0.0.1:9090
+    network_mode: host
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: monitoring
+      news-radar.service: prometheus
+    depends_on:
+      - node-exporter
+      - cadvisor
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  grafana:
+    image: grafana/grafana:13.2.1
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3001"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      PROMETHEUS_URL: http://127.0.0.1:9090
+    network_mode: host
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: monitoring
+      news-radar.service: grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  prometheus_data:
+    name: news_radar_prometheus_data
+  grafana_data:
+    name: news_radar_grafana_data

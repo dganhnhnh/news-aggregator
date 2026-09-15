@@ -3,6 +3,10 @@ name: news-radar
 services:
   db:
     image: pgvector/pgvector:pg16
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: app
+      news-radar.service: db
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-news_radar}
       POSTGRES_USER: ${POSTGRES_USER:-news_radar}
@@ -26,6 +30,10 @@ services:
     build:
       context: ..
       dockerfile: deployments/Dockerfile.api
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: app
+      news-radar.service: api
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@db:5432/${POSTGRES_DB:-news_radar}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -68,6 +76,10 @@ services:
     build:
       context: ..
       dockerfile: deployments/Dockerfile.api
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: app
+      news-radar.service: admin-api
     command:
       - uv
       - run
@@ -94,6 +106,10 @@ services:
 
   instant-crawl:
     image: ${NEWS_RADAR_WORKER_IMAGE:-news-radar-worker:dev}
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: app
+      news-radar.service: instant-crawl
     build:
       context: ..
       dockerfile: deployments/Dockerfile.worker

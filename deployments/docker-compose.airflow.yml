@@ -62,6 +62,10 @@ x-airflow-common: &airflow-common
 services:
   airflow-db:
     image: postgres:16
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: airflow
+      news-radar.service: airflow-db
     environment:
       POSTGRES_DB: airflow
       POSTGRES_USER: airflow
@@ -81,6 +85,10 @@ services:
 
   airflow-init:
     <<: *airflow-common
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: airflow
+      news-radar.service: airflow-init
     # Root, because it has to chown the mounted log volume and install the
     # provider packages before the long-running services start.
     user: "0:0"
@@ -106,6 +114,10 @@ services:
 
   airflow-scheduler:
     <<: *airflow-common
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: airflow
+      news-radar.service: airflow-scheduler
     # The docker.sock group differs per host (docker on Linux, staff/0 on
     # Docker Desktop); override AIRFLOW_DOCKER_GID when the socket is not
     # readable by the container's supplementary groups.
@@ -138,6 +150,10 @@ services:
 
   airflow-apiserver:
     <<: *airflow-common
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: airflow
+      news-radar.service: airflow-apiserver
     environment:
       <<: *airflow-common-env
     command: api-server
@@ -157,6 +173,10 @@ services:
 
   airflow-dag-processor:
     <<: *airflow-common
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: airflow
+      news-radar.service: airflow-dag-processor
     environment:
       <<: *airflow-common-env
     command: dag-processor

@@ -71,6 +71,9 @@ COMMON = dict(
     auto_remove="force",
     labels={
         "io.news-radar.airflow-worker": "true",
+        "news-radar.project": "news-radar",
+        "news-radar.group": "worker",
+        "news-radar.service": "airflow-worker",
         # The dev image is also built by Compose for instant-crawl, so it can
         # carry these image labels. Override them to keep ephemeral Airflow
         # workers out of Compose's news-radar service inventory.

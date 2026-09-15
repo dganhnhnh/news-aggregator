@@ -1,0 +1,49 @@
+# Compatibility override for local Docker Desktop smoke tests.
+# Docker Desktop does not support rslave propagation on the root bind mount.
+# Node Exporter reports the LinuxKit VM, not the macOS host.
+
+services:
+  node-exporter:
+    command: !override
+      - --path.rootfs=/host
+      - --web.listen-address=0.0.0.0:9100
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/containers/storage/.+)($|/)
+    network_mode: !reset null
+    ports:
+      - 127.0.0.1:9100:9100
+    volumes: !override
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+
+  cadvisor:
+    command: !override
+      - --listen_ip=0.0.0.0
+      - --port=18080
+      - --docker_only=true
+      - --store_container_labels=false
+      - --whitelisted_container_labels=news-radar.project,news-radar.group,news-radar.service
+    network_mode: !reset null
+    ports:
+      - 127.0.0.1:18080:18080
+
+  prometheus:
+    command: !override
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.listen-address=0.0.0.0:9090
+    network_mode: !reset null
+    ports:
+      - 127.0.0.1:9090:9090
+    volumes: !override
+      - ./monitoring/prometheus/prometheus.docker-desktop.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
+  grafana:
+    environment:
+      GF_SERVER_HTTP_ADDR: 0.0.0.0
+      PROMETHEUS_URL: http://prometheus:9090
+    network_mode: !reset null
+    ports:
+      - 127.0.0.1:3001:3001
