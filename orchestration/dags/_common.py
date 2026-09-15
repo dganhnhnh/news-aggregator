@@ -63,9 +63,21 @@ COMMON = dict(
     image=WORKER_IMAGE,
     docker_url="unix://var/run/docker.sock",
     network_mode=DOCKER_NETWORK,
-    # Preserve failed containers for diagnosis. A separate cleanup policy can
-    # remove them after logs and the image revision have been captured.
-    auto_remove="success",
+    mem_limit="2g",
+    # Airflow keeps the task logs, so worker containers are disposable. Force
+    # removal also covers task cancellation while the container is running.
+    # The scheduler startup hook handles the harder case where Docker/Airflow
+    # disappeared before DockerOperator's finally block could run.
+    auto_remove="force",
+    labels={
+        "io.news-radar.airflow-worker": "true",
+        # The dev image is also built by Compose for instant-crawl, so it can
+        # carry these image labels. Override them to keep ephemeral Airflow
+        # workers out of Compose's news-radar service inventory.
+        "com.docker.compose.project": "",
+        "com.docker.compose.service": "",
+        "com.docker.compose.version": "",
+    },
     mount_tmp_dir=False,
     # Chromium dies at random on the 64MB default; crawl4ai is the reason this
     # is set for every task rather than only for crawl.

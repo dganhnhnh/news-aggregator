@@ -321,6 +321,11 @@ thêm `AIRFLOW_DOCKER_GID`.
 đã tự loại trừ nhau bằng advisory lock, pool chỉ để Airflow không phải khởi
 động container rồi nhận về một task `skipped`.
 
+Mỗi lần `airflow-scheduler` start (kể cả khi Docker Desktop bật lại nhờ policy
+`unless-stopped`), scheduler dọn các container DockerOperator còn sót từ phiên
+trước rồi mới nhận task mới. Task kết thúc bình thường cũng luôn tự xóa
+container; log chẩn đoán vẫn nằm trong Airflow UI.
+
 ## Nguồn TSV và OPML
 
 File TSV cần tối thiểu 4 cột. Pipeline dùng cột thứ 3 làm `query_label` và cột

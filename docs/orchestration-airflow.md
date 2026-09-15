@@ -223,7 +223,8 @@ COMMON = dict(
     image="news-radar-worker:<git-sha>",
     docker_url="unix://var/run/docker.sock",
     network_mode="news-radar_default",
-    auto_remove="success",       # giữ container lỗi để điều tra
+    auto_remove="force",         # log đã nằm trong Airflow; container là disposable
+    labels={"io.news-radar.airflow-worker": "true"},
     mount_tmp_dir=False,
     shm_size=1024 * 1024 * 1024,
     mounts=[
@@ -318,6 +319,23 @@ uv pip install "apache-airflow==${AF}" \
 xử lý đúng như thiết kế cần — `StatusCode in skip_on_exit_code` được kiểm tra
 **trước** nhánh coi exit code khác 0 là lỗi, nên exit 99 cho ra `skipped` chứ
 không phải `failed`.
+
+### 5.6 Vòng đời container worker
+
+`DockerOperator` của provider 4.5.9 tạo container với daemon-side
+`AutoRemove=false`; giá trị `auto_remove` được Airflow thực hiện trong khối
+`finally` sau khi task kết thúc. Vì vậy, nếu Docker Desktop hoặc scheduler dừng
+giữa task, container có thể còn lại ở trạng thái `exited` sau lần bật kế tiếp.
+
+Factory dùng `auto_remove="force"` để dọn cả task thành công, lỗi và task bị
+Airflow hủy trong điều kiện bình thường. Trường hợp tiến trình Airflow không còn
+cơ hội chạy `finally` được xử lý bởi
+`orchestration/scripts/cleanup_airflow_workers.py`: scheduler chạy script này
+trước mỗi lần start rồi mới bắt đầu schedule. Worker mới có label
+`io.news-radar.airflow-worker=true`; script vẫn nhận ra worker cũ bằng biến môi
+trường `NEWS_RADAR_AIRFLOW_DAG_ID`, nên lần khởi động đầu sau khi nâng cấp cũng
+dọn được container tồn đọng. Container `instant-crawl` không có marker này và
+không bị xóa.
 
 ---
 

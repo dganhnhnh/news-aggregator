@@ -45,6 +45,7 @@ x-airflow-common: &airflow-common
     NEWS_RADAR_DOCKER_NETWORK: ${NEWS_RADAR_DOCKER_NETWORK:-news-radar_default}
   volumes:
     - ../orchestration/dags:/opt/airflow/dags:ro
+    - ../orchestration/scripts:/opt/news-radar/scripts:ro
     - airflow_logs:/opt/airflow/logs
     # DockerOperator starts sibling containers on the host daemon; it does not
     # run Docker inside this one.
@@ -53,6 +54,10 @@ x-airflow-common: &airflow-common
     airflow-db:
       condition: service_healthy
   restart: unless-stopped
+  deploy:
+    resources:
+      limits:
+        memory: 1g
 
 services:
   airflow-db:
@@ -69,6 +74,10 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
 
   airflow-init:
     <<: *airflow-common
@@ -104,7 +113,17 @@ services:
       - ${AIRFLOW_DOCKER_GID:-999}
     environment:
       <<: *airflow-common-env
-    command: scheduler
+    # DockerOperator cannot run its cleanup finally block if Docker Desktop or
+    # Airflow disappears mid-task. On every scheduler start (including daemon
+    # restart via `unless-stopped`), remove workers owned by the prior process
+    # before Airflow can schedule replacements.
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        python /opt/news-radar/scripts/cleanup_airflow_workers.py
+        exec airflow scheduler
     depends_on:
       airflow-db:
         condition: service_healthy
