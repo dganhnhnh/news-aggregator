@@ -8,6 +8,7 @@ from .google_news_rss_searcher import (
     RssFeedSource,
 )
 from .searcher import SearchFetcher, TavilySearcher
+from .topic_feed_discovery import TopicFeedDiscovery
 
 __all__ = [
     "Crawl4aiProvider",
@@ -19,4 +20,5 @@ __all__ = [
     "RssFeedSource",
     "SearchFetcher",
     "TavilySearcher",
+    "TopicFeedDiscovery",
 ]

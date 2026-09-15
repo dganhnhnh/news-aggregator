@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from adapters.retrieve_news_data import FeedDiscoveryError, GoogleNewsFeedDiscovery
+from adapters.retrieve_news_data import FeedDiscoveryError, TopicFeedDiscovery
 from adapters.storage import PostgresRawStorage
 from admin_api.deps import get_feed_discovery, get_storage
 from admin_api.schemas import (
@@ -39,7 +39,7 @@ async def list_feeds(
 async def discover_feeds(
     payload: FeedDiscoveryRequest,
     storage: PostgresRawStorage = Depends(get_storage),
-    discovery: GoogleNewsFeedDiscovery = Depends(get_feed_discovery),
+    discovery: TopicFeedDiscovery = Depends(get_feed_discovery),
 ) -> FeedDiscoveryResponse:
     try:
         result = await discovery.discover(
@@ -51,7 +51,7 @@ async def discover_feeds(
     except FeedDiscoveryError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Google News feed discovery failed: {exc}",
+            detail=f"Feed discovery failed: {exc}",
         ) from exc
 
     configured = await storage.list_feeds(active=None)

@@ -179,7 +179,7 @@ export function CustomAddFeeds({ onFeedsAdded }: CustomAddFeedsProps) {
             <p className="text-destructive" role="alert">{error}</p>
           ) : (
             <p className="text-muted-foreground">
-              Searches Google News for relevant publishers, then validates their RSS or Atom feeds.
+              Searches topic-focused feed pages and specialist publishers, then validates and ranks their RSS or Atom feeds.
             </p>
           )}
         </div>
@@ -200,7 +200,7 @@ export function CustomAddFeeds({ onFeedsAdded }: CustomAddFeedsProps) {
                   {result.candidates.length} feed candidate(s)
                 </p>
                 <p className="truncate text-xs text-muted-foreground">
-                  From {result.publishers_considered} publishers and {result.articles_considered} articles
+                  {result.stats.publishers_inspected} publishers · {result.stats.pages_inspected} pages inspected · {result.stats.feeds_validated} feeds validated
                 </p>
               </div>
             </div>
@@ -229,13 +229,21 @@ export function CustomAddFeeds({ onFeedsAdded }: CustomAddFeedsProps) {
             </div>
           </div>
 
+          {result.warnings.length > 0 && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+              {result.warnings.map((warning) => (
+                <p key={warning}>{warning}</p>
+              ))}
+            </div>
+          )}
+
           {result.candidates.length === 0 ? (
             <Empty className="min-h-64 border">
               <EmptyHeader>
                 <EmptyMedia variant="icon"><Rss /></EmptyMedia>
                 <EmptyTitle>No valid feeds found</EmptyTitle>
                 <EmptyDescription>
-                  Google News found publishers, but none exposed a valid RSS or Atom feed.
+                  No topic-focused, active RSS or Atom feeds passed validation.
                 </EmptyDescription>
               </EmptyHeader>
             </Empty>
@@ -285,8 +293,9 @@ function CandidateRow({
           {candidate.subscribed ? (
             <Badge variant="secondary"><CheckCircle2 />Subscribed</Badge>
           ) : (
-            <Badge variant="outline">{candidate.matched_articles} matching article(s)</Badge>
+            <Badge variant="outline">{feedScopeLabel(candidate.feed_scope)}</Badge>
           )}
+          <Badge variant="outline">{discoverySourceLabel(candidate.discovery_source)}</Badge>
         </div>
         <a
           href={candidate.feed_url}
@@ -300,7 +309,17 @@ function CandidateRow({
         </a>
         {candidate.sample_titles[0] && (
           <p className="mt-2 line-clamp-1 text-xs text-muted-foreground">
-            Example: {candidate.sample_titles[0]}
+            Recent: {candidate.sample_titles[0]}
+          </p>
+        )}
+        {candidate.relevance_reasons.length > 0 && (
+          <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+            {candidate.relevance_reasons.join(' · ')}
+          </p>
+        )}
+        {candidate.last_published_at && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Latest dated entry: {new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(candidate.last_published_at))}
           </p>
         )}
       </div>
@@ -315,4 +334,16 @@ function CandidateRow({
       </a>
     </article>
   )
+}
+
+function feedScopeLabel(scope: FeedDiscoveryCandidate['feed_scope']) {
+  if (scope === 'category') return 'Category feed'
+  if (scope === 'tag') return 'Topic feed'
+  return 'Specialist publisher'
+}
+
+function discoverySourceLabel(source: FeedDiscoveryCandidate['discovery_source']) {
+  if (source === 'tavily_direct') return 'Direct feed search'
+  if (source === 'tavily_publisher') return 'Publisher discovery'
+  return 'Google fallback'
 }

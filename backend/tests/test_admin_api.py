@@ -10,7 +10,11 @@ from fastapi.testclient import TestClient
 from adapters.retrieve_news_data import FeedDiscoveryError
 from admin_api.deps import get_feed_discovery, get_storage
 from admin_api.main import create_app
-from models.discovery_models import FeedDiscoveryCandidate, FeedDiscoveryResult
+from models.discovery_models import (
+    FeedDiscoveryCandidate,
+    FeedDiscoveryResult,
+    FeedDiscoveryStats,
+)
 from models.storage_models import FeedSeed, FeedStateItem
 
 
@@ -92,25 +96,34 @@ class FakeDiscovery:
             raise FeedDiscoveryError("upstream unavailable")
         return FeedDiscoveryResult(
             query=query,
-            search_feed_url="https://news.google.com/rss/search?q=ai",
             candidates=(
                 FeedDiscoveryCandidate(
                     feed_url="https://example.com/feed.xml",
                     source_label="Existing",
                     website_url="https://example.com/",
-                    matched_articles=3,
+                    feed_scope="category",
+                    discovery_source="tavily_direct",
+                    relevance_reasons=("Feed metadata matches AI",),
                     sample_titles=("One", "Two"),
+                    last_published_at=NOW,
                 ),
                 FeedDiscoveryCandidate(
                     feed_url="https://new.example/rss.xml",
                     source_label="New source",
                     website_url="https://new.example/",
-                    matched_articles=1,
+                    feed_scope="sitewide",
+                    discovery_source="tavily_publisher",
+                    relevance_reasons=("Specialist publisher",),
                     sample_titles=("Three",),
                 ),
             ),
-            articles_considered=4,
-            publishers_considered=2,
+            stats=FeedDiscoveryStats(
+                search_results=4,
+                publishers_inspected=2,
+                pages_inspected=3,
+                feeds_validated=2,
+            ),
+            warnings=("Partial discovery",),
         )
 
 
@@ -202,7 +215,18 @@ def test_discover_feeds_marks_existing_candidates() -> None:
     assert response.status_code == 200
     assert discovery.called_with == ("AI news", "vi", "VN", 8)
     body = response.json()
-    assert body["articles_considered"] == 4
+    assert body["stats"] == {
+        "search_results": 4,
+        "publishers_inspected": 2,
+        "pages_inspected": 3,
+        "feeds_validated": 2,
+        "google_fallback_used": False,
+    }
+    assert body["warnings"] == ["Partial discovery"]
+    assert body["candidates"][0]["feed_scope"] == "category"
+    assert body["candidates"][0]["last_published_at"] == NOW.isoformat().replace(
+        "+00:00", "Z"
+    )
     assert body["candidates"][0]["subscribed"] is True
     assert body["candidates"][1]["subscribed"] is False
     assert storage.list_active is None
@@ -218,6 +242,19 @@ def test_discover_feeds_maps_upstream_failure_to_bad_gateway() -> None:
 
     assert response.status_code == 502
     assert "upstream unavailable" in response.json()["detail"]
+
+
+def test_discover_feeds_requires_tavily_configuration(monkeypatch) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    client, _ = _client()
+
+    response = client.post(
+        "/api/admin/feeds/discover",
+        json={"query": "AI"},
+    )
+
+    assert response.status_code == 503
+    assert "TAVILY_API_KEY" in response.json()["detail"]
 
 
 def test_batch_create_feeds_uses_one_priority_and_ignores_duplicates() -> None:

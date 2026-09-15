@@ -44,24 +44,39 @@ class DiscoveredEntry:
 
 @dataclass(frozen=True)
 class FeedDiscoveryCandidate:
-    """A validated publisher feed discovered from a keyword search."""
+    """A validated feed with explainable topic-discovery evidence."""
 
     feed_url: str
     source_label: str
     website_url: str
-    matched_articles: int
+    feed_scope: Literal["category", "tag", "sitewide"]
+    discovery_source: Literal[
+        "tavily_direct", "tavily_publisher", "google_fallback"
+    ]
+    relevance_reasons: tuple[str, ...]
     sample_titles: tuple[str, ...] = ()
+    last_published_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class FeedDiscoveryStats:
+    """Bounded operational counts for one topic-discovery request."""
+
+    search_results: int = 0
+    publishers_inspected: int = 0
+    pages_inspected: int = 0
+    feeds_validated: int = 0
+    google_fallback_used: bool = False
 
 
 @dataclass(frozen=True)
 class FeedDiscoveryResult:
-    """Bounded, ranked feed candidates for one keyword query."""
+    """Bounded, ranked feed candidates for one topic query."""
 
     query: str
-    search_feed_url: str
     candidates: tuple[FeedDiscoveryCandidate, ...]
-    articles_considered: int
-    publishers_considered: int
+    stats: FeedDiscoveryStats = field(default_factory=FeedDiscoveryStats)
+    warnings: tuple[str, ...] = ()
 
 
 FeedPollStatus = Literal["fetched", "not_modified", "failed"]

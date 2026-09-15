@@ -90,14 +90,17 @@ def test_discover_finds_validated_publisher_feed_without_tsv() -> None:
     result = asyncio.run(run())
 
     assert result.query == "artificial intelligence"
-    assert result.articles_considered == 2
-    assert result.publishers_considered == 1
+    assert result.stats.search_results == 2
+    assert result.stats.publishers_inspected == 1
+    assert result.stats.google_fallback_used is True
     assert len(result.candidates) == 1
     candidate = result.candidates[0]
     assert candidate.feed_url == "https://publisher.example/news.xml"
     assert candidate.source_label == "Publisher News"
     assert candidate.website_url == "https://publisher.example/"
-    assert candidate.matched_articles == 2
+    assert candidate.discovery_source == "google_fallback"
+    assert candidate.feed_scope == "sitewide"
+    assert "2 matching Google News article(s)" in candidate.relevance_reasons[0]
     assert candidate.sample_titles == ("First AI story", "Second AI story")
     assert not any(path.endswith(".tsv") for path in requested)
 
@@ -150,7 +153,7 @@ def test_discover_decodes_article_when_google_omits_source_url(monkeypatch) -> N
 
     result = asyncio.run(run())
     assert result.candidates[0].feed_url == "https://decoded.example/atom.xml"
-    assert result.candidates[0].matched_articles == 1
+    assert result.candidates[0].discovery_source == "google_fallback"
 
 
 def test_discover_uses_bounded_conventional_path_fallback() -> None:

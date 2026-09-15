@@ -18,7 +18,10 @@ uv sync --extra dev
 uv run crawl4ai-setup
 ```
 
-Điền `TAVILY_API_KEY` trong `.env` nếu dùng lệnh `search`.
+Điền `TAVILY_API_KEY` trong `.env` nếu dùng lệnh `search` hoặc tính năng
+**Feeds → Custom Add feeds**. Admin API chạy hai Tavily `basic` searches cho
+mỗi yêu cầu discovery; nếu để trống, endpoint trả `503` thay vì âm thầm quay
+về kết quả Google News chất lượng thấp hơn.
 
 ## Khởi động PostgreSQL và API
 

@@ -46,10 +46,24 @@ class TavilySearcher(Searcher):
 
     # ── search ────────────────────────────────────────────────────────────────
 
-    async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
+    async def search(
+        self,
+        query: str,
+        max_results: int = 10,
+        *,
+        search_depth: str = "basic",
+        topic: str = "general",
+        country: str | None = None,
+    ) -> list[SearchResult]:
         t0 = time.monotonic()
         try:
-            raw = await self._client.search(query=query, max_results=max_results)
+            raw = await self._client.search(
+                query=query,
+                max_results=max_results,
+                search_depth=search_depth,
+                topic=topic,
+                country=country,
+            )
             elapsed = time.monotonic() - t0
             results = [self._normalize(item) for item in raw.get("results", [])]
             self._logger.info(

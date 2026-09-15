@@ -11,23 +11,30 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from html.parser import HTMLParser
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
 import feedparser
 import httpx
 
+from adapters.retrieve_news_data.feed_http import (
+    UnsafeFeedUrl,
+    fetch_discovery_url,
+    validate_public_url,
+)
 from adapters.retrieve_news_data.google_news_rss_searcher import (
     RssFeedSearcher,
     decode_google_news_url,
 )
 from core.config import DEFAULT_USER_AGENT
-from core.feed_urls import infer_feed_source_label, validate_feed_url
+from core.feed_urls import infer_feed_source_label
 from core.logger import get_logger
 from models.discovery_models import (
     DiscoveredEntry,
     FeedDiscoveryCandidate,
     FeedDiscoveryResult,
+    FeedDiscoveryStats,
 )
 from models.storage_models import FeedPollTarget
 
@@ -75,6 +82,7 @@ class _Publisher:
     matched_articles: int
     sample_titles: list[str]
     first_seen: int
+    last_published_at: datetime | None
 
 
 class GoogleNewsFeedDiscovery:
@@ -111,6 +119,7 @@ class GoogleNewsFeedDiscovery:
         self._max_feeds_per_publisher = max_feeds_per_publisher
         self._request_timeout_seconds = request_timeout_seconds
         self._user_agent = user_agent or DEFAULT_USER_AGENT
+        self._resolve_dns = http_client is None
 
     @staticmethod
     def build_search_feed_url(
@@ -167,7 +176,7 @@ class GoogleNewsFeedDiscovery:
             )
             candidates.sort(
                 key=lambda item: (
-                    -item[0].matched_articles,
+                    -item[2],
                     item[1],
                     item[0].source_label.casefold(),
                     item[0].feed_url,
@@ -175,7 +184,7 @@ class GoogleNewsFeedDiscovery:
             )
             unique: list[FeedDiscoveryCandidate] = []
             seen_urls: set[str] = set()
-            for candidate, _ in candidates:
+            for candidate, _, _ in candidates:
                 key = candidate.feed_url.casefold()
                 if key in seen_urls:
                     continue
@@ -185,10 +194,14 @@ class GoogleNewsFeedDiscovery:
                     break
             return FeedDiscoveryResult(
                 query=query.strip(),
-                search_feed_url=search_url,
                 candidates=tuple(unique),
-                articles_considered=len(entries),
-                publishers_considered=len(selected_publishers),
+                stats=FeedDiscoveryStats(
+                    search_results=len(entries),
+                    publishers_inspected=len(selected_publishers),
+                    pages_inspected=len(selected_publishers),
+                    feeds_validated=len(unique),
+                    google_fallback_used=True,
+                ),
             )
         finally:
             if own_client:
@@ -258,25 +271,34 @@ class GoogleNewsFeedDiscovery:
                     matched_articles=1,
                     sample_titles=[entry.title] if entry.title else [],
                     first_seen=index,
+                    last_published_at=entry.published_at,
                 )
                 continue
             current.matched_articles += 1
             if entry.title and len(current.sample_titles) < 3:
                 current.sample_titles.append(entry.title)
+            if entry.published_at is not None and (
+                current.last_published_at is None
+                or entry.published_at > current.last_published_at
+            ):
+                current.last_published_at = entry.published_at
         return sorted(grouped.values(), key=lambda item: item.first_seen)
 
     async def _discover_publishers(
         self,
         publishers: list[_Publisher],
         client: httpx.AsyncClient,
-    ) -> list[tuple[FeedDiscoveryCandidate, int]]:
+    ) -> list[tuple[FeedDiscoveryCandidate, int, int]]:
         publisher_iterator = iter(publishers)
-        results: list[tuple[FeedDiscoveryCandidate, int]] = []
+        results: list[tuple[FeedDiscoveryCandidate, int, int]] = []
 
         async def worker() -> None:
             for publisher in publisher_iterator:
                 found = await self._discover_publisher(publisher, client)
-                results.extend((candidate, publisher.first_seen) for candidate in found)
+                results.extend(
+                    (candidate, publisher.first_seen, publisher.matched_articles)
+                    for candidate in found
+                )
 
         workers = [
             asyncio.create_task(worker())
@@ -298,27 +320,30 @@ class GoogleNewsFeedDiscovery:
         )
         for page_url in page_urls:
             try:
-                response = await client.get(
-                    page_url, timeout=self._request_timeout_seconds
+                response = await fetch_discovery_url(
+                    client,
+                    page_url,
+                    timeout_seconds=self._request_timeout_seconds,
+                    user_agent=self._user_agent,
+                    resolve_dns=self._resolve_dns,
                 )
-                response.raise_for_status()
-            except (httpx.HTTPError, ValueError) as exc:
+            except (httpx.HTTPError, ValueError, UnsafeFeedUrl) as exc:
                 logger.debug(
                     "Feed discovery page fetch failed for %s: %s",
                     page_url,
                     exc,
                 )
                 continue
-            if self._feed_version(self._parsed_feed(response.text)):
-                candidate_urls.append(str(response.url))
+            if self._feed_version(self._parsed_feed(response.body)):
+                candidate_urls.append(response.url)
                 break
             parser = _FeedLinkParser()
             try:
-                parser.feed(response.text[:1_000_000])
+                parser.feed(response.body.decode("utf-8", errors="replace"))
             except ValueError:
                 continue
             candidate_urls.extend(
-                urljoin(str(response.url), href) for href in parser.links
+                urljoin(response.url, href) for href in parser.links
             )
             if parser.links:
                 break
@@ -337,8 +362,13 @@ class GoogleNewsFeedDiscovery:
                     feed_url=feed_url,
                     source_label=feed_title or publisher.source_label,
                     website_url=publisher.website_url,
-                    matched_articles=publisher.matched_articles,
+                    feed_scope="sitewide",
+                    discovery_source="google_fallback",
+                    relevance_reasons=(
+                        f"Publisher appeared in {publisher.matched_articles} matching Google News article(s)",
+                    ),
                     sample_titles=tuple(publisher.sample_titles),
+                    last_published_at=publisher.last_published_at,
                 )
             )
             if len(found) >= self._max_feeds_per_publisher:
@@ -349,16 +379,19 @@ class GoogleNewsFeedDiscovery:
         self, url: str, client: httpx.AsyncClient
     ) -> tuple[str, str] | None:
         try:
-            validated_url = validate_feed_url(url)
-            response = await client.get(
-                validated_url, timeout=self._request_timeout_seconds
+            validated_url = validate_public_url(url)
+            response = await fetch_discovery_url(
+                client,
+                validated_url,
+                timeout_seconds=self._request_timeout_seconds,
+                user_agent=self._user_agent,
+                resolve_dns=self._resolve_dns,
             )
-            response.raise_for_status()
-            parsed = self._parsed_feed(response.text)
-            if not self._feed_version(parsed):
+            parsed = self._parsed_feed(response.body)
+            if not self._feed_version(parsed) or not parsed.entries:
                 return None
-            final_url = validate_feed_url(str(response.url))
-        except (httpx.HTTPError, ValueError):
+            final_url = validate_public_url(response.url)
+        except (httpx.HTTPError, ValueError, UnsafeFeedUrl):
             return None
         title = (parsed.feed.get("title") or "").strip() if parsed.feed else ""
         return final_url, title
@@ -390,8 +423,8 @@ class GoogleNewsFeedDiscovery:
     @staticmethod
     def _external_url(url: str) -> str:
         try:
-            validated = validate_feed_url(url)
-        except ValueError:
+            validated = validate_public_url(url)
+        except (ValueError, UnsafeFeedUrl):
             return ""
         parts = urlsplit(validated)
         if parts.hostname in {"news.google.com", "google.com", "www.google.com"}:

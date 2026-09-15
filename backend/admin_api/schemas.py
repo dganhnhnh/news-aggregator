@@ -59,17 +59,29 @@ class FeedDiscoveryCandidateResponse(BaseModel):
     feed_url: str
     source_label: str
     website_url: str
-    matched_articles: int
+    feed_scope: Literal["category", "tag", "sitewide"]
+    discovery_source: Literal[
+        "tavily_direct", "tavily_publisher", "google_fallback"
+    ]
+    relevance_reasons: list[str]
     sample_titles: list[str]
+    last_published_at: datetime | None
     subscribed: bool
+
+
+class FeedDiscoveryStatsResponse(BaseModel):
+    search_results: int
+    publishers_inspected: int
+    pages_inspected: int
+    feeds_validated: int
+    google_fallback_used: bool
 
 
 class FeedDiscoveryResponse(BaseModel):
     query: str
-    search_feed_url: str
     candidates: list[FeedDiscoveryCandidateResponse]
-    articles_considered: int
-    publishers_considered: int
+    stats: FeedDiscoveryStatsResponse
+    warnings: list[str]
 
     @classmethod
     def from_domain(
@@ -80,20 +92,28 @@ class FeedDiscoveryResponse(BaseModel):
     ) -> "FeedDiscoveryResponse":
         return cls(
             query=result.query,
-            search_feed_url=result.search_feed_url,
             candidates=[
                 FeedDiscoveryCandidateResponse(
                     feed_url=item.feed_url,
                     source_label=item.source_label,
                     website_url=item.website_url,
-                    matched_articles=item.matched_articles,
+                    feed_scope=item.feed_scope,
+                    discovery_source=item.discovery_source,
+                    relevance_reasons=list(item.relevance_reasons),
                     sample_titles=list(item.sample_titles),
+                    last_published_at=item.last_published_at,
                     subscribed=item.feed_url in subscribed_urls,
                 )
                 for item in result.candidates
             ],
-            articles_considered=result.articles_considered,
-            publishers_considered=result.publishers_considered,
+            stats=FeedDiscoveryStatsResponse(
+                search_results=result.stats.search_results,
+                publishers_inspected=result.stats.publishers_inspected,
+                pages_inspected=result.stats.pages_inspected,
+                feeds_validated=result.stats.feeds_validated,
+                google_fallback_used=result.stats.google_fallback_used,
+            ),
+            warnings=list(result.warnings),
         )
 
 

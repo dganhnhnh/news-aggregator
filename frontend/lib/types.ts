@@ -25,17 +25,25 @@ export type FeedDiscoveryCandidate = {
   feed_url: string
   source_label: string
   website_url: string
-  matched_articles: number
+  feed_scope: 'category' | 'tag' | 'sitewide'
+  discovery_source: 'tavily_direct' | 'tavily_publisher' | 'google_fallback'
+  relevance_reasons: string[]
   sample_titles: string[]
+  last_published_at: string | null
   subscribed: boolean
 }
 
 export type FeedDiscoveryResponse = {
   query: string
-  search_feed_url: string
   candidates: FeedDiscoveryCandidate[]
-  articles_considered: number
-  publishers_considered: number
+  stats: {
+    search_results: number
+    publishers_inspected: number
+    pages_inspected: number
+    feeds_validated: number
+    google_fallback_used: boolean
+  }
+  warnings: string[]
 }
 
 export type FeedBatchCreateResponse = {
