@@ -65,6 +65,28 @@ services:
         limits:
           memory: 256M
 
+  # PostgreSQL internals -- connections, locks, transaction age, table sizes.
+  # None of this is worth hand-writing into the application exporter: it is
+  # the same for every Postgres, and this image already knows the catalogue.
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+    command:
+      - --web.listen-address=127.0.0.1:9187
+    environment:
+      # Reaches the database through its published port, because host
+      # networking is what lets Prometheus scrape this container at all.
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@127.0.0.1:${POSTGRES_PORT:-5433}/${POSTGRES_DB:-news_radar}?sslmode=disable
+    network_mode: host
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: monitoring
+      news-radar.service: postgres-exporter
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
   prometheus:
     image: prom/prometheus:v3.13.1
     command:
@@ -82,6 +104,7 @@ services:
     depends_on:
       - node-exporter
       - cadvisor
+      - postgres-exporter
     restart: unless-stopped
     deploy:
       resources:

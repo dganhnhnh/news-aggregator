@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -47,6 +48,9 @@ from adapters.storage.schema import (
     worker_runs,
 )
 from core.content_quality import historical_summary_title_reason
+# The submodule, not the package: a worker importing storage should not pull
+# in Starlette for a middleware it will never mount.
+from observability.instruments import search_timer, timed_search
 from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
@@ -59,21 +63,26 @@ from models.storage_models import (
     ClusterMembership,
     ClusterMergeResult,
     ClusterRebuildResult,
+    CorpusMetrics,
     EmbeddingCandidate,
     EmbeddingRecord,
     FailureKind,
     FailureTarget,
+    FailureTypeCount,
     FeedFailureOutcome,
     FailureQueueStatus,
+    FeedMetrics,
     FeedPollTarget,
     FeedSeed,
     FeedStateItem,
     FlatTaxonomyNode,
     HistoricalBlockPage,
+    MetricsSnapshot,
     QueueStatusSnapshot,
     RawArticle,
     RunStatus,
     SourceItem,
+    StageJobMetrics,
     StageQueueStatus,
     StoredCrawlFailure,
     StorageWriteSummary,
@@ -94,7 +103,9 @@ from models.storage_models import (
     TopicRefItem,
     TopicSignalSnapshot,
     TopicSnapshot,
+    WorkerHealthMetrics,
     WorkerRunCount,
+    WorkerStatDelta,
     WorkerTrigger,
 )
 from services.raw_storage import build_excerpt, source_slug
@@ -377,6 +388,34 @@ def retry_delay(
     return timedelta(seconds=random_uniform(0, cap))
 
 
+def _capped_error_types(rows: Sequence[Any], limit: int) -> tuple[FailureTypeCount, ...]:
+    """Keep the `limit` largest error types and fold the tail into `other`.
+
+    `crawl_failures.error_type` carries exception class names, so a new
+    dependency can invent values nobody planned for. Folding the tail keeps
+    the totals honest while bounding how many time series one bad day can
+    create in Prometheus. Rows arrive largest-first.
+    """
+    kept = [
+        FailureTypeCount(
+            error_type=row.error_type,
+            total=int(row.total),
+            dead_lettered=int(row.dead_lettered),
+        )
+        for row in rows[:limit]
+    ]
+    tail = rows[limit:]
+    if tail:
+        kept.append(
+            FailureTypeCount(
+                error_type="other",
+                total=sum(int(row.total) for row in tail),
+                dead_lettered=sum(int(row.dead_lettered) for row in tail),
+            )
+        )
+    return tuple(kept)
+
+
 class PostgresRawStorage:
     def __init__(self, database_url: str) -> None:
         if not database_url:
@@ -645,6 +684,359 @@ class PostgresRawStorage:
                 )
                 for row in run_rows
             ),
+        )
+
+    async def metrics_snapshot(
+        self,
+        *,
+        recent_window_hours: int = 24,
+        feed_overdue_grace_seconds: int = 300,
+        max_error_types: int = 10,
+    ) -> MetricsSnapshot:
+        """Read every operational table once, for the `/metrics` endpoint.
+
+        Separate from `queue_status` rather than layered on it: a scrape runs
+        on a timer forever, so it asks for ages instead of timestamps, caps
+        label cardinality itself, and pays for the extra corpus queries that a
+        one-off CLI report has no use for. Writes nothing, like every other
+        monitoring path.
+        """
+        now = datetime.now(timezone.utc)
+        recent_cutoff = now - timedelta(hours=recent_window_hours)
+        overdue_cutoff = now - timedelta(seconds=feed_overdue_grace_seconds)
+        async with self._engine.connect() as connection:
+            stage_rows = (
+                await connection.execute(
+                    select(
+                        processing_jobs.c.stage,
+                        processing_jobs.c.state,
+                        func.count().label("count"),
+                        func.min(processing_jobs.c.available_at).label("oldest"),
+                        func.count()
+                        .filter(processing_jobs.c.lease_until < now)
+                        .label("expired"),
+                    ).group_by(processing_jobs.c.stage, processing_jobs.c.state)
+                )
+            ).all()
+            run_rows = (
+                await connection.execute(
+                    select(
+                        worker_runs.c.worker,
+                        worker_runs.c.status,
+                        func.count().label("count"),
+                    )
+                    .group_by(worker_runs.c.worker, worker_runs.c.status)
+                    .order_by(worker_runs.c.worker, worker_runs.c.status)
+                )
+            ).all()
+            health_rows = (
+                await connection.execute(
+                    select(
+                        worker_runs.c.worker,
+                        func.max(worker_runs.c.finished_at)
+                        .filter(worker_runs.c.status == "succeeded")
+                        .label("last_success"),
+                        func.count()
+                        .filter(worker_runs.c.status == "running")
+                        .label("running"),
+                        func.min(worker_runs.c.heartbeat_at)
+                        .filter(worker_runs.c.status == "running")
+                        .label("oldest_heartbeat"),
+                    ).group_by(worker_runs.c.worker)
+                )
+            ).all()
+            # DISTINCT ON rides `ix_worker_runs_worker_started`, so "how long
+            # did the last completed run take" costs one index lookup per
+            # worker rather than a scan of the whole history.
+            duration_rows = (
+                await connection.execute(
+                    select(
+                        worker_runs.c.worker,
+                        worker_runs.c.started_at,
+                        worker_runs.c.finished_at,
+                    )
+                    .where(worker_runs.c.finished_at.isnot(None))
+                    .distinct(worker_runs.c.worker)
+                    .order_by(worker_runs.c.worker, worker_runs.c.started_at.desc())
+                )
+            ).all()
+            failure_rows = (
+                await connection.execute(
+                    select(
+                        crawl_failures.c.failure_kind,
+                        func.count().label("total"),
+                        func.count()
+                        .filter(crawl_failures.c.dead_lettered_at.isnot(None))
+                        .label("dead_lettered"),
+                        func.count()
+                        .filter(
+                            crawl_failures.c.dead_lettered_at.is_(None),
+                            crawl_failures.c.next_retry_at <= now,
+                        )
+                        .label("due_now"),
+                        func.max(crawl_failures.c.attempt_count).label("max_attempts"),
+                    )
+                    .group_by(crawl_failures.c.failure_kind)
+                    .order_by(crawl_failures.c.failure_kind)
+                )
+            ).all()
+            error_type_rows = (
+                await connection.execute(
+                    select(
+                        crawl_failures.c.error_type,
+                        func.count().label("total"),
+                        func.count()
+                        .filter(crawl_failures.c.dead_lettered_at.isnot(None))
+                        .label("dead_lettered"),
+                    )
+                    .group_by(crawl_failures.c.error_type)
+                    .order_by(func.count().desc(), crawl_failures.c.error_type)
+                )
+            ).all()
+            feed_row = (
+                await connection.execute(
+                    select(
+                        func.count().label("total"),
+                        func.count()
+                        .filter(feed_state.c.disabled_at.is_(None))
+                        .label("active"),
+                        func.count()
+                        .filter(feed_state.c.disabled_at.isnot(None))
+                        .label("disabled"),
+                        func.count()
+                        .filter(
+                            feed_state.c.disabled_at.is_(None),
+                            feed_state.c.next_poll_at <= now,
+                        )
+                        .label("due"),
+                        func.count()
+                        .filter(
+                            feed_state.c.disabled_at.is_(None),
+                            feed_state.c.next_poll_at <= overdue_cutoff,
+                        )
+                        .label("overdue"),
+                        func.max(feed_state.c.consecutive_failures)
+                        .filter(feed_state.c.disabled_at.is_(None))
+                        .label("max_failures"),
+                    )
+                )
+            ).one()
+            content_source_rows = (
+                await connection.execute(
+                    select(raw_articles.c.content_source, func.count().label("count"))
+                    .group_by(raw_articles.c.content_source)
+                    .order_by(raw_articles.c.content_source)
+                )
+            ).all()
+            text_kind_rows = (
+                await connection.execute(
+                    select(
+                        article_embeddings.c.text_kind, func.count().label("count")
+                    )
+                    .group_by(article_embeddings.c.text_kind)
+                    .order_by(article_embeddings.c.text_kind)
+                )
+            ).all()
+            cluster_rows = (
+                await connection.execute(
+                    select(clusters.c.status, func.count().label("count"))
+                    .group_by(clusters.c.status)
+                    .order_by(clusters.c.status)
+                )
+            ).all()
+            member_count = await connection.scalar(
+                select(func.count()).select_from(cluster_members)
+            )
+            classification_row = (
+                await connection.execute(
+                    select(
+                        func.count()
+                        .filter(article_classifications.c.assigned_count > 0)
+                        .label("assigned"),
+                        func.count()
+                        .filter(article_classifications.c.assigned_count == 0)
+                        .label("uncategorized"),
+                    )
+                )
+            ).one()
+            # Windowed on `event_at` so the anti-joins ride the BRIN index
+            # instead of walking the whole corpus, and so the number answers
+            # "is the pipeline keeping up" rather than "was it ever behind".
+            recent_row = (
+                await connection.execute(
+                    select(
+                        func.count().label("total"),
+                        func.count()
+                        .filter(article_embeddings.c.article_id.is_(None))
+                        .label("embedding"),
+                        func.count()
+                        .filter(article_classifications.c.article_id.is_(None))
+                        .label("classification"),
+                        func.count()
+                        .filter(cluster_members.c.article_id.is_(None))
+                        .label("cluster"),
+                    )
+                    .select_from(
+                        raw_articles.outerjoin(
+                            article_embeddings,
+                            article_embeddings.c.article_id == raw_articles.c.id,
+                        )
+                        .outerjoin(
+                            article_classifications,
+                            article_classifications.c.article_id == raw_articles.c.id,
+                        )
+                        .outerjoin(
+                            cluster_members,
+                            cluster_members.c.article_id == raw_articles.c.id,
+                        )
+                    )
+                    .where(raw_articles.c.event_at >= recent_cutoff)
+                )
+            ).one()
+
+        counts: dict[str, dict[str, int]] = defaultdict(dict)
+        oldest_pending: dict[str, datetime] = {}
+        expired: dict[str, int] = defaultdict(int)
+        for row in stage_rows:
+            counts[row.stage][row.state] = int(row.count)
+            if row.state == "pending" and row.oldest is not None:
+                oldest_pending[row.stage] = row.oldest
+            if row.state == "running":
+                expired[row.stage] = int(row.expired)
+
+        stages = tuple(
+            StageJobMetrics(
+                stage=stage,
+                pending=states.get("pending", 0),
+                running=states.get("running", 0),
+                done=states.get("done", 0),
+                dead_letter=states.get("dead_letter", 0),
+                expired_leases=expired.get(stage, 0),
+                oldest_pending_age_seconds=(
+                    (now - oldest).total_seconds()
+                    if (oldest := oldest_pending.get(stage)) is not None
+                    else None
+                ),
+            )
+            for stage, states in sorted(counts.items())
+        )
+
+        durations = {
+            row.worker: (row.finished_at - row.started_at).total_seconds()
+            for row in duration_rows
+        }
+        workers = tuple(
+            WorkerHealthMetrics(
+                worker=row.worker,
+                last_success_at=row.last_success,
+                last_run_duration_seconds=durations.get(row.worker),
+                running=int(row.running),
+                oldest_heartbeat_age_seconds=(
+                    (now - row.oldest_heartbeat).total_seconds()
+                    if row.oldest_heartbeat is not None
+                    else None
+                ),
+            )
+            for row in sorted(health_rows, key=lambda row: row.worker)
+        )
+
+        return MetricsSnapshot(
+            captured_at=now,
+            recent_window_hours=recent_window_hours,
+            feed_overdue_grace_seconds=feed_overdue_grace_seconds,
+            stages=stages,
+            workers=workers,
+            runs=tuple(
+                WorkerRunCount(
+                    worker=row.worker, status=row.status, count=int(row.count)
+                )
+                for row in run_rows
+            ),
+            failures=tuple(
+                FailureQueueStatus(
+                    failure_kind=row.failure_kind,
+                    total=int(row.total),
+                    dead_lettered=int(row.dead_lettered),
+                    due_now=int(row.due_now),
+                    max_attempts=int(row.max_attempts or 0),
+                )
+                for row in failure_rows
+            ),
+            failure_types=_capped_error_types(error_type_rows, max_error_types),
+            feeds=FeedMetrics(
+                total=int(feed_row.total),
+                active=int(feed_row.active),
+                disabled=int(feed_row.disabled),
+                due=int(feed_row.due),
+                overdue=int(feed_row.overdue),
+                max_consecutive_failures=int(feed_row.max_failures or 0),
+            ),
+            corpus=CorpusMetrics(
+                articles_by_content_source=tuple(
+                    (row.content_source, int(row.count)) for row in content_source_rows
+                ),
+                embeddings_by_text_kind=tuple(
+                    (row.text_kind, int(row.count)) for row in text_kind_rows
+                ),
+                clusters_by_status=tuple(
+                    (row.status, int(row.count)) for row in cluster_rows
+                ),
+                cluster_members=int(member_count or 0),
+                classified_articles=(
+                    ("assigned", int(classification_row.assigned)),
+                    ("uncategorized", int(classification_row.uncategorized)),
+                ),
+                recent_articles=int(recent_row.total),
+                recent_missing=(
+                    ("embedding", int(recent_row.embedding)),
+                    ("classification", int(recent_row.classification)),
+                    ("cluster", int(recent_row.cluster)),
+                ),
+            ),
+        )
+
+    async def worker_stat_totals(
+        self, after: Mapping[str, int] | None = None
+    ) -> tuple[WorkerStatDelta, ...]:
+        """Sum every numeric `worker_runs.stats` key, resumably.
+
+        `worker_runs` is append-only and the advisory lock keeps one worker's
+        runs from overlapping, so ids increase with time per worker and the
+        sum over "runs after the last one counted" is a true counter delta --
+        which is what lets a scrape expose ephemeral workers' stats as
+        Prometheus counters with no Pushgateway and no per-stat migration.
+
+        Unfinished runs are excluded: their stats are a checkpoint, not a
+        total, and counting them now would double-count them once they close.
+        """
+        statement = text(
+            """
+            SELECT r.worker AS worker,
+                   s.key AS stat,
+                   sum((s.value #>> '{}')::numeric) AS total,
+                   max(r.id) AS through_run_id
+            FROM worker_runs AS r
+            CROSS JOIN LATERAL jsonb_each(r.stats) AS s(key, value)
+            WHERE r.finished_at IS NOT NULL
+              AND jsonb_typeof(s.value) = 'number'
+              AND r.id > coalesce((cast(:after AS jsonb) ->> r.worker)::bigint, 0)
+            GROUP BY r.worker, s.key
+            """
+        )
+        async with self._engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    statement, {"after": json.dumps(dict(after or {}))}
+                )
+            ).all()
+        return tuple(
+            WorkerStatDelta(
+                worker=row.worker,
+                stat=row.stat,
+                total=float(row.total),
+                through_run_id=int(row.through_run_id),
+            )
+            for row in rows
         )
 
     @staticmethod
@@ -1956,49 +2348,62 @@ class PostgresRawStorage:
         limit: int = ARTICLE_SEARCH_LIMIT,
         candidate_limit: int = ARTICLE_SEARCH_CANDIDATE_LIMIT,
     ) -> list[ArticleSearchHit]:
-        """Hybrid full-text/vector search merged with reciprocal-rank fusion."""
-        lexical_rows, semantic_rows = await asyncio.gather(
-            self._lexical_article_candidates(
-                query,
-                since=since,
-                until=until,
-                source=source,
-                limit=candidate_limit,
-            ),
-            self._semantic_article_candidates(
-                embedding,
-                model=model,
-                since=since,
-                until=until,
-                source=source,
-                limit=candidate_limit,
-            ),
-        )
-        rows_by_id = {
-            int(row.id): row for row in [*lexical_rows, *semantic_rows]
-        }
-        ranked_ids = reciprocal_rank_fusion(
-            [int(row.id) for row in lexical_rows],
-            [int(row.id) for row in semantic_rows],
-            limit=limit,
-            tie_break={
-                article_id: (row.event_at, article_id)
-                for article_id, row in rows_by_id.items()
-            },
-        )
-        return [
-            ArticleSearchHit(
-                id=article_id,
-                url=rows_by_id[article_id].url,
-                title=rows_by_id[article_id].title,
-                snippet=build_excerpt(rows_by_id[article_id].snippet_raw or ""),
-                source_slug=rows_by_id[article_id].source_slug,
-                source_name=rows_by_id[article_id].source_name,
-                published_at=rows_by_id[article_id].published_at,
-                event_at=rows_by_id[article_id].event_at,
+        """Hybrid full-text/vector search merged with reciprocal-rank fusion.
+
+        The two halves are timed separately as well as together: which of
+        BM25 and the vector scan dominates a slow search is the question a
+        single `hybrid` number cannot answer, and they run concurrently, so
+        the total is the slower one plus the fusion.
+        """
+        with search_timer("hybrid"):
+            lexical_rows, semantic_rows = await asyncio.gather(
+                timed_search(
+                    "lexical",
+                    self._lexical_article_candidates(
+                        query,
+                        since=since,
+                        until=until,
+                        source=source,
+                        limit=candidate_limit,
+                    ),
+                ),
+                timed_search(
+                    "semantic",
+                    self._semantic_article_candidates(
+                        embedding,
+                        model=model,
+                        since=since,
+                        until=until,
+                        source=source,
+                        limit=candidate_limit,
+                    ),
+                ),
             )
-            for article_id in ranked_ids
-        ]
+            rows_by_id = {
+                int(row.id): row for row in [*lexical_rows, *semantic_rows]
+            }
+            ranked_ids = reciprocal_rank_fusion(
+                [int(row.id) for row in lexical_rows],
+                [int(row.id) for row in semantic_rows],
+                limit=limit,
+                tie_break={
+                    article_id: (row.event_at, article_id)
+                    for article_id, row in rows_by_id.items()
+                },
+            )
+            return [
+                ArticleSearchHit(
+                    id=article_id,
+                    url=rows_by_id[article_id].url,
+                    title=rows_by_id[article_id].title,
+                    snippet=build_excerpt(rows_by_id[article_id].snippet_raw or ""),
+                    source_slug=rows_by_id[article_id].source_slug,
+                    source_name=rows_by_id[article_id].source_name,
+                    published_at=rows_by_id[article_id].published_at,
+                    event_at=rows_by_id[article_id].event_at,
+                )
+                for article_id in ranked_ids
+            ]
 
     async def source_articles(
         self,

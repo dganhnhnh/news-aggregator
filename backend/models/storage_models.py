@@ -699,3 +699,116 @@ class QueueStatusSnapshot:
                     "failure(s); replay them with `news-worker replay --failures`"
                 )
         return problems
+
+
+@dataclass(frozen=True)
+class StageJobMetrics:
+    """`processing_jobs` counts for one stage, as a Prometheus scrape sees them.
+
+    Separate from `StageQueueStatus` because a scrape wants two things that a
+    CLI report does not: the age of the oldest pending job rather than its
+    timestamp (Prometheus compares numbers, not clocks), and how many leases
+    have expired -- work a dead worker is still nominally holding.
+    """
+
+    stage: str
+    pending: int = 0
+    running: int = 0
+    done: int = 0
+    dead_letter: int = 0
+    expired_leases: int = 0
+    oldest_pending_age_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class WorkerHealthMetrics:
+    """Per-worker liveness read off `worker_runs`.
+
+    `last_success_at` is the one that matters for alerting: a worker that has
+    not succeeded in several scheduling intervals is down, whether or not it
+    has been failing loudly.
+    """
+
+    worker: str
+    last_success_at: datetime | None = None
+    last_run_duration_seconds: float | None = None
+    running: int = 0
+    oldest_heartbeat_age_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class FailureTypeCount:
+    error_type: str
+    total: int = 0
+    dead_lettered: int = 0
+
+
+@dataclass(frozen=True)
+class FeedMetrics:
+    """`feed_state` seen as a schedule rather than as a list of feeds.
+
+    `overdue` is the one worth alerting on: feeds past their `next_poll_at` by
+    more than a grace period mean the crawl worker is not keeping up with its
+    own rotation, which is a different failure from a feed being broken.
+    """
+
+    total: int = 0
+    active: int = 0
+    disabled: int = 0
+    due: int = 0
+    overdue: int = 0
+    max_consecutive_failures: int = 0
+
+
+@dataclass(frozen=True)
+class CorpusMetrics:
+    """Table-state counts that describe what the pipeline has produced."""
+
+    articles_by_content_source: tuple[tuple[str, int], ...] = ()
+    embeddings_by_text_kind: tuple[tuple[str, int], ...] = ()
+    clusters_by_status: tuple[tuple[str, int], ...] = ()
+    cluster_members: int = 0
+    # ('assigned', n) and ('uncategorized', n): an article whose classification
+    # assigned no topic at all is the taxonomy-drift signal from spec.md §12.
+    classified_articles: tuple[tuple[str, int], ...] = ()
+    # Articles inside the recent window that never reached a stage. Distinct
+    # from queue depth: a pending job is work that is queued, while these are
+    # articles nothing has queued.
+    recent_articles: int = 0
+    recent_missing: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class MetricsSnapshot:
+    """One read-only pass over every operational table, for `/metrics`.
+
+    Deliberately a plain value object: rendering it to the Prometheus text
+    format is somebody else's job, so the queries can be tested without a
+    Prometheus client and the rendering without a database.
+    """
+
+    captured_at: datetime
+    recent_window_hours: int
+    feed_overdue_grace_seconds: int
+    stages: tuple[StageJobMetrics, ...] = ()
+    workers: tuple[WorkerHealthMetrics, ...] = ()
+    runs: tuple[WorkerRunCount, ...] = ()
+    failures: tuple[FailureQueueStatus, ...] = ()
+    failure_types: tuple[FailureTypeCount, ...] = ()
+    feeds: FeedMetrics = FeedMetrics()
+    corpus: CorpusMetrics = CorpusMetrics()
+
+
+@dataclass(frozen=True)
+class WorkerStatDelta:
+    """A sum of one numeric `worker_runs.stats` key over a range of runs.
+
+    `through_run_id` is what makes the sum resumable: the caller adds the
+    delta to a running total and asks for runs after that id next time, so a
+    scrape never re-aggregates history it has already counted.
+    """
+
+    worker: str
+    stat: str
+    total: float
+    through_run_id: int

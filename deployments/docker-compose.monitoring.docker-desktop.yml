@@ -28,6 +28,17 @@ services:
     ports:
       - 127.0.0.1:18080:18080
 
+  postgres-exporter:
+    command: !override
+      - --web.listen-address=0.0.0.0:9187
+    environment:
+      # On the compose network the database is a service name, not a
+      # published port.
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@db:5432/${POSTGRES_DB:-news_radar}?sslmode=disable
+    network_mode: !reset null
+    ports:
+      - 127.0.0.1:9187:9187
+
   prometheus:
     command: !override
       - --config.file=/etc/prometheus/prometheus.yml

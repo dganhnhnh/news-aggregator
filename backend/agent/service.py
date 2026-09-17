@@ -24,6 +24,7 @@ from agent.graph import build_graph
 from agent.state import Evidence, ResearchContext
 from core.config import Settings
 from core.logger import get_logger
+from observability.instruments import observe_agent_run, record_llm_usage
 
 
 logger = get_logger(__name__)
@@ -239,6 +240,22 @@ def _tool_status(tool_name: str) -> str:
     return "searching" if tool_name.startswith("search_") else "reading"
 
 
+def _run_outcome(error: BaseException) -> str:
+    """Map a failed run onto a small, fixed set of metric outcomes.
+
+    Deliberately not `type(error).__name__`: the upstream exception classes
+    that reach here come from HTTP clients and the model SDK, and one new
+    class name upstream would mint a new Prometheus series forever.
+    """
+    if isinstance(error, ResearchUnavailable):
+        return "unavailable"
+    if isinstance(error, InvalidResearchCitation):
+        return "invalid_citation"
+    if isinstance(error, ResearchError):
+        return "timeout" if error.error_type == "TimeoutError" else "error"
+    return "error"
+
+
 def _cached_tokens(messages: list[Any]) -> int:
     total = 0
     for message in messages:
@@ -326,6 +343,16 @@ class ResearchService:
             timeout_seconds=settings.news_agent_run_timeout_seconds,
         )
 
+    def _model_label(self) -> str:
+        """The model id, as a metric label; a closed set per deployment."""
+        if self._model is None:
+            return "none"
+        return str(
+            getattr(self._model, "model_name", None)
+            or getattr(self._model, "model", "")
+            or "unknown"
+        )
+
     def _configured_model(self, thread_id: str) -> Any:
         if self._model is None:
             return None
@@ -380,11 +407,17 @@ class ResearchService:
         return ResearchStreamSession(
             request_id=request_id,
             thread_id=thread_id,
-            events=self._stream_graph(
-                graph,
-                query=query,
-                thread_id=thread_id,
-                request_id=request_id,
+            # The run is not over until the stream is, so the measurement has
+            # to wrap the iteration rather than this call.
+            events=observe_agent_run(
+                self._stream_graph(
+                    graph,
+                    query=query,
+                    thread_id=thread_id,
+                    request_id=request_id,
+                ),
+                model=self._model_label(),
+                outcome_for=_run_outcome,
             ),
         )
 
@@ -651,6 +684,16 @@ class ResearchService:
             for message in current_messages
             if isinstance(message, AIMessage)
         )
+        model_calls = sum(
+            isinstance(message, AIMessage) for message in current_messages
+        )
+        cached_tokens = _cached_tokens(current_messages)
+        record_llm_usage(
+            model=self._model_label(),
+            calls=model_calls,
+            total_tokens=total_tokens,
+            cached_tokens=cached_tokens,
+        )
         logger.info(
             "Research completed request_id=%s thread_id=%s duration_ms=%d "
             "model_calls=%d tool_calls=%d tool_messages=%d evidence=%d "
@@ -658,13 +701,13 @@ class ResearchService:
             request_id,
             thread_id,
             int((monotonic() - started) * 1000),
-            sum(isinstance(message, AIMessage) for message in current_messages),
+            model_calls,
             tool_calls,
             tool_messages,
             len(evidence),
             len(citations),
             total_tokens,
-            _cached_tokens(current_messages),
+            cached_tokens,
         )
 
     async def research(self, query: str) -> ResearchResult:

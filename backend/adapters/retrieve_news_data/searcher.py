@@ -18,6 +18,7 @@ from models.search_and_crawl_models import (
     SearchResult,
     Searcher,
 )
+from observability.instruments import tavily_timer
 from adapters.retrieve_news_data.helpers import _parse_datetime, extract_date_from_result
 
 logger = get_logger(__name__)
@@ -57,13 +58,16 @@ class TavilySearcher(Searcher):
     ) -> list[SearchResult]:
         t0 = time.monotonic()
         try:
-            raw = await self._client.search(
-                query=query,
-                max_results=max_results,
-                search_depth=search_depth,
-                topic=topic,
-                country=country,
-            )
+            # Counted because the quota is paid for: a loop that retries a
+            # failing query is invisible in the logs and expensive in the bill.
+            with tavily_timer("search"):
+                raw = await self._client.search(
+                    query=query,
+                    max_results=max_results,
+                    search_depth=search_depth,
+                    topic=topic,
+                    country=country,
+                )
             elapsed = time.monotonic() - t0
             results = [self._normalize(item) for item in raw.get("results", [])]
             self._logger.info(
@@ -95,7 +99,8 @@ class TavilySearcher(Searcher):
         # Phase 2: extract full content from each URL
         t0 = time.monotonic()
         try:
-            raw = await self._client.extract(urls)
+            with tavily_timer("extract"):
+                raw = await self._client.extract(urls)
             elapsed = time.monotonic() - t0
             self._logger.info(
                 "[Tavily.extract] urls=%d time=%.3fs",

@@ -13,6 +13,7 @@ from adapters.retrieve_news_data import (
     TopicFeedDiscovery,
 )
 from adapters.storage import PostgresRawStorage, StorageError
+from admin_api.metrics import MetricsCollector
 from core.config import Settings
 
 
@@ -28,6 +29,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     storage = PostgresRawStorage(settings.database_url)
     await storage.check_ready()
     app.state.storage = storage
+    # One collector for the whole process: its accumulated counters and cache
+    # are only meaningful if every scrape goes through the same instance.
+    app.state.metrics_collector = MetricsCollector(
+        storage,
+        cache_seconds=settings.metrics_cache_seconds,
+        recent_window_hours=settings.metrics_recent_window_hours,
+        max_error_types=settings.metrics_max_error_types,
+        feed_overdue_grace_seconds=settings.metrics_feed_overdue_grace_seconds,
+    )
     try:
         yield
     finally:
@@ -36,6 +46,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def get_storage(request: Request) -> PostgresRawStorage:
     return request.app.state.storage
+
+
+def get_metrics_collector(request: Request) -> MetricsCollector:
+    return request.app.state.metrics_collector
 
 
 def get_feed_discovery() -> TopicFeedDiscovery:

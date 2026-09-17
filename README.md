@@ -375,10 +375,13 @@ Lệnh này read-only, gộp `processing_jobs` (theo stage/state), `crawl_failur
 
 Overlay `deployments/docker-compose.monitoring.yml` dành cho **Linux
 single-host**. Node Exporter đo CPU, RAM, filesystem và network của host;
-cAdvisor đo tài nguyên của các container News Radar. Prometheus scrape mỗi 15
-giây và giữ dữ liệu tối đa 15 ngày hoặc 5 GB, điều kiện nào đến trước. Grafana
-provision sẵn hai dashboard **News Radar — Host** và **News Radar —
-Containers**.
+cAdvisor đo tài nguyên của các container News Radar; `postgres-exporter` đọc
+các view thống kê của PostgreSQL (connection, lock, transaction dài nhất, cache
+hit, deadlock, kích thước bảng) — phần này cố ý không tự viết trong admin API.
+Prometheus scrape mỗi 15 giây và giữ dữ liệu tối đa 15 ngày hoặc 5 GB, điều
+kiện nào đến trước. Grafana provision sẵn bốn dashboard **News Radar — Host**,
+**News Radar — Containers**, **News Radar — Pipeline** và **News Radar —
+Services**.
 
 Trên Docker Desktop, các host metric mô tả Linux VM của Docker Desktop chứ
 không phải toàn bộ máy macOS. cAdvisor cần quyền `privileged` và các host mount
@@ -436,7 +439,7 @@ Kiểm tra nhanh sau khi start:
 curl --fail http://127.0.0.1:9090/-/ready
 curl --fail http://127.0.0.1:3001/api/health
 curl --fail --get http://127.0.0.1:9090/api/v1/query \
-  --data-urlencode 'query=up{job=~"prometheus|node-exporter|cadvisor"}'
+  --data-urlencode 'query=up{job=~"prometheus|node-exporter|cadvisor|postgres|news-radar|news-radar-api"}'
 curl --fail --get http://127.0.0.1:9090/api/v1/query \
   --data-urlencode 'query=node_uname_info'
 ```
@@ -458,9 +461,86 @@ docker compose --env-file .env \
   grafana prometheus cadvisor node-exporter
 ```
 
-Stack này chưa cung cấp application `/metrics`, Postgres internals, HTTP probe,
-alert rule hoặc notification. `news-worker queue-status` vẫn là cách kiểm tra
-queue/worker nghiệp vụ cho đến phase instrument ứng dụng tiếp theo.
+Stack này chưa cung cấp HTTP probe, alert rule hoặc notification.
+
+### Application metrics (`/metrics`)
+
+`news-admin-api` expose `GET /metrics` theo Prometheus text format. Endpoint
+nằm ở admin API chứ không phải `news-api`: queue depth, kích thước corpus và
+số lần crawl thất bại là thông tin vận hành, và admin API chỉ publish trên
+loopback (`127.0.0.1:8001`). Prometheus scrape job `news-radar` mỗi 30 giây.
+
+Worker là container ephemeral — Airflow chạy `news-worker` rồi `auto_remove`
+xóa container — nên không có process nào để scrape. Vì vậy collector đọc thẳng
+PostgreSQL: `processing_jobs`, `worker_runs`, `crawl_failures`, `feed_state` và
+các bảng corpus. Counter của worker (`news_radar_worker_stat_total`) được cộng
+dồn từ `worker_runs.stats` theo watermark từng worker, nên mỗi lần collect chỉ
+đọc các run vừa kết thúc và giá trị chỉ tăng; process restart sẽ đọc lại lịch
+sử và quay về đúng tổng cũ thay vì reset.
+
+Mỗi lần collect đều đụng các bảng vận hành, nên kết quả được cache
+`METRICS_CACHE_SECONDS` (mặc định 15s, thấp hơn scrape interval 30s).
+`news_radar_metrics_collect_duration_seconds` cho biết thời gian nằm trong
+PostgreSQL; nếu nó tăng dần thì nâng cache hoặc thu hẹp
+`METRICS_RECENT_WINDOW_HOURS`.
+
+```bash
+curl --fail http://127.0.0.1:8001/metrics | head -40
+curl --fail --get http://127.0.0.1:9090/api/v1/query \
+  --data-urlencode 'query=news_radar_jobs{state="pending"}'
+```
+
+Dashboard **News Radar — Pipeline** dựng sẵn queue depth theo stage, tuổi job
+pending lâu nhất, backlog trong cửa sổ gần đây, throughput và sức khỏe worker,
+hàng đợi crawl failure, feed và độ phủ corpus. `news-worker queue-status` vẫn
+là cách đọc nhanh cùng dữ liệu đó từ CLI.
+
+### Service metrics (in-process)
+
+Metric ở trên suy ra từ PostgreSQL nên không biết gì về chính request. Phần
+này đo trong process đang phục vụ: `backend/observability/` cài middleware
+ASGI (không dùng `BaseHTTPMiddleware`, vì `/api/research/stream` là SSE và
+wrapper request/response sẽ giữ stream lại trong queue) và vài instrument
+đặt thẳng ở nơi thời gian thực sự trôi qua.
+
+- `news_radar_http_request_duration_seconds{method,route,status}` và
+  `news_radar_http_requests_in_progress{method}` — cả `news-api` lẫn
+  `news-admin-api`. Label `route` luôn là template
+  (`/api/articles/{article_id}`), không bao giờ là path thật: một series cho
+  mỗi article id sẽ chôn Prometheus, và một scanner dò URL ngẫu nhiên có thể
+  cố tình làm điều đó. Request không khớp route nào gom vào `__unmatched__`.
+- `news_radar_search_duration_seconds{mode}` và
+  `news_radar_search_requests_total{mode,outcome}` với `mode` là `lexical`,
+  `semantic` hoặc `hybrid` — hai nửa của hybrid search được đo riêng lẫn đo
+  chung, vì "BM25 hay vector scan làm chậm" là câu hỏi một con số `hybrid`
+  không trả lời được.
+- `news_radar_agent_runs_total{model,outcome}`,
+  `news_radar_agent_run_duration_seconds{model}`,
+  `news_radar_llm_calls_total{model}` và
+  `news_radar_llm_tokens_total{model,kind}` — một run bị client đóng giữa
+  chừng có outcome riêng (`abandoned`) để không bị đếm như một câu trả lời đã
+  giao.
+- `news_radar_tavily_requests_total{operation,outcome}` và
+  `news_radar_tavily_request_duration_seconds{operation}` — Tavily tính theo
+  quota trả phí, nên số lần gọi đáng theo dõi như latency.
+
+`news-admin-api` nối phần in-process này vào ngay sau phần đọc từ PostgreSQL
+trên cùng `GET /metrics`. `news-api` thì public trên `0.0.0.0:8000`, nên nó mở
+**listener thứ hai** chỉ để expose registry (`API_METRICS_HOST`/
+`API_METRICS_PORT`, mặc định `8002`) và Compose publish port đó ở
+`127.0.0.1:8002` — process bind `0.0.0.0` bên trong container vì port publish
+lên loopback không thể với tới thứ gì khác, còn tính riêng tư nằm ở chỗ
+publish. Prometheus scrape job `news-radar-api`.
+
+```bash
+curl --fail http://127.0.0.1:8002/ | grep news_radar_http_request_duration
+```
+
+Dashboard **News Radar — Services** ghép ba nguồn: RED của HTTP (request rate,
+tỉ lệ 5xx, p95, in-flight, tách theo route và status), research agent (số run
+theo outcome, latency percentile, token và số lần gọi model, Tavily) và
+PostgreSQL internals từ `postgres-exporter` (connection, lock, transaction dài
+nhất, cache hit, deadlock, rollback, bảng lớn nhất).
 
 ## Chạy API
 
@@ -475,7 +555,10 @@ uv run news-api
 
 Mặc định lắng nghe `API_HOST`/`API_PORT` (`0.0.0.0:8000`); `CORS_ALLOW_ORIGINS`
 trong `.env` là danh sách origin (phân tách bởi dấu phẩy) được phép gọi API,
-mặc định `http://localhost:3000` cho frontend dev. Endpoint hiện có:
+mặc định `http://localhost:3000` cho frontend dev. Cùng process còn mở một
+listener thứ hai ở `API_METRICS_HOST`/`API_METRICS_PORT` (`0.0.0.0:8002`) chỉ
+phục vụ Prometheus exposition — xem [Service metrics](#service-metrics-in-process).
+Endpoint hiện có:
 
 - `GET /health`, `GET /health/db`
 - `GET /api/articles?limit=&cursor=&source=&topic=&q=`

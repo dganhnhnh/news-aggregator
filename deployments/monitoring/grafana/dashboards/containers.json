@@ -13,7 +13,7 @@
       "gridPos": {"h": 5, "w": 12, "x": 0, "y": 0},
       "id": 1,
       "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
-      "targets": [{"editorMode": "code", "expr": "up{job=~\"prometheus|node-exporter|cadvisor\"}", "legendFormat": "{{job}}", "range": true, "refId": "A"}],
+      "targets": [{"editorMode": "code", "expr": "up{job=~\"prometheus|node-exporter|cadvisor|postgres|news-radar|news-radar-api\"}", "legendFormat": "{{job}}", "range": true, "refId": "A"}],
       "title": "Scrape targets",
       "type": "stat"
     },
@@ -33,7 +33,7 @@
       "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0},
       "id": 3,
       "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
-      "targets": [{"editorMode": "code", "expr": "scrape_duration_seconds{job=~\"prometheus|node-exporter|cadvisor\"}", "legendFormat": "{{job}}", "range": true, "refId": "A"}],
+      "targets": [{"editorMode": "code", "expr": "scrape_duration_seconds{job=~\"prometheus|node-exporter|cadvisor|postgres|news-radar|news-radar-api\"}", "legendFormat": "{{job}}", "range": true, "refId": "A"}],
       "title": "Scrape duration",
       "type": "stat"
     },

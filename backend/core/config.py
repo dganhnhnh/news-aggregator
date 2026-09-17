@@ -94,10 +94,27 @@ class Settings:
     worker_heartbeat_timeout_seconds: int = 900
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    # `news-api` serves its Prometheus registry on a second listener instead
+    # of on the public one. Bind it inside the container as usual; what keeps
+    # it private is compose publishing it to 127.0.0.1 only.
+    api_metrics_host: str = "0.0.0.0"
+    api_metrics_port: int = 8002
     cors_allow_origins: tuple[str, ...] = ()
     api_default_window_days: int = 30
     admin_api_host: str = "0.0.0.0"
     admin_api_port: int = 8001
+    # `/metrics` reads every operational table, so a scrape is far from free.
+    # The cache is what decouples that cost from how often Prometheus (or a
+    # second Prometheus, or a curious operator) asks; keep it below the scrape
+    # interval or samples go flat.
+    metrics_cache_seconds: float = 15.0
+    # "Is the pipeline keeping up right now", not "was it ever behind": the
+    # backlog gauges only count articles inside this window.
+    metrics_recent_window_hours: int = 24
+    # Upper bound on `error_type` series; the tail folds into `other`.
+    metrics_max_error_types: int = 10
+    # A feed one scheduler tick past due is normal, not overdue.
+    metrics_feed_overdue_grace_seconds: int = 300
     openrouter_api_key: str | None = None
     news_agent_model: str = "nvidia/nemotron-3.5-lightning:free"
     openrouter_site_url: str | None = None
@@ -170,10 +187,18 @@ class Settings:
             ),
             api_host=os.getenv("API_HOST", "0.0.0.0"),
             api_port=_env_int("API_PORT", 8000),
+            api_metrics_host=os.getenv("API_METRICS_HOST", "0.0.0.0"),
+            api_metrics_port=_env_int("API_METRICS_PORT", 8002),
             cors_allow_origins=cors_origins,
             api_default_window_days=_env_int("API_DEFAULT_WINDOW_DAYS", 30),
             admin_api_host=os.getenv("ADMIN_API_HOST", "0.0.0.0"),
             admin_api_port=_env_int("ADMIN_API_PORT", 8001),
+            metrics_cache_seconds=_env_float("METRICS_CACHE_SECONDS", 15.0),
+            metrics_recent_window_hours=_env_int("METRICS_RECENT_WINDOW_HOURS", 24),
+            metrics_max_error_types=_env_int("METRICS_MAX_ERROR_TYPES", 10),
+            metrics_feed_overdue_grace_seconds=_env_int(
+                "METRICS_FEED_OVERDUE_GRACE_SECONDS", 300
+            ),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip() or None,
             news_agent_model=(
                 os.getenv("OPENROUTER_MODEL", "").strip()

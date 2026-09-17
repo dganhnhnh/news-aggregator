@@ -21,6 +21,28 @@ scrape_configs:
       - targets:
           - 127.0.0.1:9100
 
+  # Application metrics, derived from PostgreSQL by the admin API. Scraped
+  # half as often as the host jobs because every collection reads the
+  # operational tables, and because queue depth does not move in 15s.
+  - job_name: news-radar
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - 127.0.0.1:8001
+
+  # In-process metrics of the public API: request latency, search, the
+  # research agent. Served on a second listener that is published on
+  # loopback, so this never rides on 0.0.0.0:8000.
+  - job_name: news-radar-api
+    static_configs:
+      - targets:
+          - 127.0.0.1:8002
+
+  - job_name: postgres
+    static_configs:
+      - targets:
+          - 127.0.0.1:9187
+
   - job_name: cadvisor
     static_configs:
       - targets:

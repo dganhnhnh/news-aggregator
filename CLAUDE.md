@@ -32,6 +32,16 @@ future Next.js UI.
   - `adapters/storage/`: async SQLAlchemy/asyncpg repository and schema.
   - `api/`: `news-api` FastAPI app (`main.py`, `deps.py`, `routers/`); reuses
     `PostgresRawStorage` for read-only endpoints, never writes.
+  - `admin_api/`: `news-admin-api`, published on loopback only. `metrics.py`
+    derives Prometheus metrics from the operational tables, because workers
+    are ephemeral containers with no process left to scrape.
+  - `observability/`: in-process instrumentation. `http.py` is a raw ASGI
+    middleware (never `BaseHTTPMiddleware` — it would buffer the SSE stream)
+    plus the exposition helpers; `instruments.py` holds the search, agent,
+    LLM and Tavily metrics and must not import Starlette, since a worker
+    importing storage pulls it in. Label only with closed sets: method, route
+    *template*, status, mode, model, operation, outcome — never a raw path,
+    URL, id or query string.
   - `migrations/`: Alembic environment and revisions.
   - `tests/`: unit and PostgreSQL integration tests.
 - `frontend/`: empty placeholder for a future Next.js app; see
