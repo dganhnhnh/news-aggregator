@@ -379,9 +379,9 @@ cAdvisor đo tài nguyên của các container News Radar; `postgres-exporter` �
 các view thống kê của PostgreSQL (connection, lock, transaction dài nhất, cache
 hit, deadlock, kích thước bảng) — phần này cố ý không tự viết trong admin API.
 Prometheus scrape mỗi 15 giây và giữ dữ liệu tối đa 15 ngày hoặc 5 GB, điều
-kiện nào đến trước. Grafana provision sẵn bốn dashboard **News Radar — Host**,
-**News Radar — Containers**, **News Radar — Pipeline** và **News Radar —
-Services**.
+kiện nào đến trước. Grafana provision sẵn năm dashboard **News Radar — Host**,
+**News Radar — Containers**, **News Radar — Pipeline**, **News Radar —
+Quality** và **News Radar — Services**.
 
 Trên Docker Desktop, các host metric mô tả Linux VM của Docker Desktop chứ
 không phải toàn bộ máy macOS. cAdvisor cần quyền `privileged` và các host mount
@@ -493,7 +493,69 @@ curl --fail --get http://127.0.0.1:9090/api/v1/query \
 Dashboard **News Radar — Pipeline** dựng sẵn queue depth theo stage, tuổi job
 pending lâu nhất, backlog trong cửa sổ gần đây, throughput và sức khỏe worker,
 hàng đợi crawl failure, feed và độ phủ corpus. `news-worker queue-status` vẫn
-là cách đọc nhanh cùng dữ liệu đó từ CLI.
+là cách đọc nhanh cùng dữ liệu đó từ CLI. Phần đo *chất lượng* đầu ra — độ trễ
+publication-to-ingestion, lag từng stage, hình dạng cluster, độ cũ của taxonomy
+— nằm ở [Quality metrics](#quality-metrics-metrics).
+
+### Quality metrics (`/metrics`)
+
+Queue depth trả lời "pipeline có chạy không". Nhóm này trả lời "thứ nó tạo ra
+có tốt không" — cùng nằm trên `GET /metrics` của `news-admin-api`, cùng cache
+`METRICS_CACHE_SECONDS`, và dựng sẵn thành dashboard **News Radar — Quality**.
+
+**Publication-to-ingestion.**
+`news_radar_ingestion_lag_seconds{content_source}` là histogram thật (có
+bucket `le`, dùng được `histogram_quantile`) đo `crawled_at - published_at`:
+khoảng cách giữa dấu thời gian của chính nhà xuất bản và lúc bài trở thành một
+row ở đây. Đây là độ trễ duy nhất chứa mọi thứ nằm ngoài hệ thống — nhà xuất
+bản cập nhật thưa hay dày, feed nằm ở đâu trong vòng quay, retry queue giữ
+trang bao lâu — nên nó trả lời "corpus có tươi không" trong khi không queue
+depth nào trả lời được.
+
+Mỗi bài chỉ được đo **đúng một lần, ở lần nhìn thấy đầu tiên**, qua watermark
+trên `raw_articles.id`. Lý do là `crawled_at` dịch chuyển khi trang bị crawl
+lại: đo lần hai có thể rơi vào bucket thấp hơn, mà counter thì không được phép
+giảm. Khác với `news_radar_worker_stat_total`, histogram này **không** đọc lại
+lịch sử khi restart — nó lấy watermark từ corpus hiện tại rồi đếm từ 0, vì dồn
+nhiều tháng lịch sử vào một scrape interval sẽ phá hỏng mọi `rate()`. Hai
+counter đi kèm đếm phần không thể bucket: `news_radar_articles_undated_total`
+(feed không cho ngày) và `news_radar_articles_published_ahead_total` (feed ghi
+ngày sau lúc crawl — lỗi clock/timezone, cố ý không kẹp về 0 vì làm vậy sẽ
+khiến feed hỏng trông như feed nhanh nhất).
+
+**Gauge histogram.** Các phân phối còn lại mô tả trạng thái bảng *hiện tại*,
+nên chúng được phép giảm — merge một cluster hay tắt một feed là thật sự bớt
+đi một quan sát. Text format 0.0.4 không có kiểu `gaugehistogram`, nên chúng
+xuất hiện dưới dạng `_bucket` cộng `_gcount`/`_gsum` và **không** có
+`_count`/`_sum`; đừng bao giờ `rate()` chúng.
+
+- `news_radar_pipeline_lag_seconds{stage}` — crawl đến embed / cluster /
+  classify, trong cửa sổ `METRICS_RECENT_WINDOW_HOURS`. Chỉ tính các row có
+  timestamp downstream muộn hơn `crawled_at`; một lần crawl lại có thể đẩy
+  `crawled_at` vượt qua dấu thời gian ghi trước đó, đó không phải thời gian
+  chờ âm mà là cùng một bài đo qua hai phiên bản.
+- `news_radar_cluster_size` và `news_radar_cluster_sources` — trên cluster
+  `open`. Bucket `le="1.0"` của cái thứ nhất chính là số cluster singleton;
+  phần chênh giữa `le="1.0"` của cái thứ hai và `_gcount` là số câu chuyện
+  được nhiều hơn một nguồn đưa tin, tức là lý do tồn tại của clustering.
+- `news_radar_feed_poll_interval_seconds` — các tier polling thích ứng thực sự
+  rơi vào đâu. Feed chưa từng poll chưa có tier, được đếm riêng ở
+  `news_radar_feeds_without_poll_interval` thay vì mặc định coi là chậm.
+
+**Gauge thường.** `news_radar_recent_articles_by_content_source{content_source}`
+(khác với `news_radar_articles` vốn tính toàn thời gian) —
+`feed_summary` tăng nghĩa là crawl đang hỏng *ngay lúc này* và row chỉ còn dek.
+`news_radar_stale_classifications` là số row sinh ra bởi classifier set đã
+không còn active (`news-worker classify --stale`), mẫu số dùng
+`sum(news_radar_classified_articles)`. `news_radar_stale_prototypes` là số
+topic có exemplar đổi sau lần compile prototype gần nhất — vẫn phân loại được,
+nhưng bằng định nghĩa cũ (`news-worker taxonomy-rebuild`);
+`news_radar_active_topics` là mẫu số của nó.
+
+```bash
+curl --fail --get http://127.0.0.1:9090/api/v1/query --data-urlencode \
+  'query=histogram_quantile(0.9, sum by (le) (rate(news_radar_ingestion_lag_seconds_bucket[1h])))'
+```
 
 ### Service metrics (in-process)
 

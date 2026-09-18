@@ -13,10 +13,14 @@ from admin_api.main import create_app
 from admin_api.metrics import MetricsCollector, build_families, render
 from models.storage_models import (
     CorpusMetrics,
+    Distribution,
     FailureQueueStatus,
     FailureTypeCount,
     FeedMetrics,
+    IngestionLagDelta,
+    LagBucketCounts,
     MetricsSnapshot,
+    QualityMetrics,
     StageJobMetrics,
     WorkerHealthMetrics,
     WorkerRunCount,
@@ -77,6 +81,40 @@ def _snapshot(**overrides) -> MetricsSnapshot:
         ),
     )
     return MetricsSnapshot(**{**defaults, **overrides})
+
+
+# Deliberately short and round: the assertions below are about bucket
+# arithmetic, not about the production tiers.
+BOUNDS = (60.0, 300.0, 900.0)
+
+
+def _quality(**overrides) -> QualityMetrics:
+    defaults = dict(
+        recent_window_hours=24,
+        recent_articles_by_content_source=(("crawl", 20), ("feed_summary", 5)),
+        pipeline_lag=(
+            (
+                "embed",
+                Distribution(
+                    bounds=BOUNDS, counts=(1, 4, 6), total=8, sum_value=9000.0
+                ),
+            ),
+        ),
+        cluster_sizes=Distribution(
+            bounds=(1.0, 2.0), counts=(30, 45), total=50, sum_value=120.0
+        ),
+        cluster_sources=Distribution(
+            bounds=(1.0, 2.0), counts=(40, 48), total=50, sum_value=70.0
+        ),
+        stale_classifications=12,
+        stale_prototypes=1,
+        active_topics=10,
+        feed_poll_intervals=Distribution(
+            bounds=(300.0, 1800.0), counts=(2, 6), total=9, sum_value=54000.0
+        ),
+        feeds_without_interval=3,
+    )
+    return QualityMetrics(**{**defaults, **overrides})
 
 
 def _samples(snapshot: MetricsSnapshot, **kwargs) -> dict[str, float]:
@@ -150,11 +188,138 @@ def test_idle_worker_reports_no_heartbeat_age() -> None:
     )
 
 
+def test_ingestion_lag_renders_as_a_counter_histogram() -> None:
+    ingestion = IngestionLagDelta(
+        bounds=BOUNDS,
+        through_article_id=400,
+        series=(LagBucketCounts("crawl", counts=(2, 5, 9), total_seconds=4000.0, count=11),),
+        undated=3,
+        ahead_of_publication=1,
+    )
+    text = render(build_families(_snapshot(), ingestion=ingestion)).decode()
+
+    assert "# TYPE news_radar_ingestion_lag_seconds histogram" in text
+    assert 'news_radar_ingestion_lag_seconds_bucket{content_source="crawl",le="900.0"} 9.0' in text
+    # Two articles took longer than the last bound, so `+Inf` exceeds it and
+    # equals the count -- the bucket every histogram is required to carry.
+    assert 'news_radar_ingestion_lag_seconds_bucket{content_source="crawl",le="+Inf"} 11.0' in text
+    assert 'news_radar_ingestion_lag_seconds_count{content_source="crawl"} 11.0' in text
+    # Undated articles are outside the histogram entirely: with no publication
+    # date there is no lag to bucket, and zero would be a lie.
+    assert "news_radar_articles_undated_total 3.0" in text
+    assert "news_radar_articles_published_ahead_total 1.0" in text
+
+
+def test_ingestion_buckets_accumulate_and_hold_sources_absent_from_a_delta() -> None:
+    storage = FakeMetricsStorage(
+        lag_deltas=[
+            # The corpus as it stood at startup. It sets the mark and is then
+            # discarded: this histogram counts what arrives from here on.
+            IngestionLagDelta(
+                bounds=BOUNDS,
+                through_article_id=5,
+                series=(LagBucketCounts("crawl", (900, 900, 900), 9e6, 900),),
+                undated=40,
+            ),
+            IngestionLagDelta(
+                bounds=BOUNDS,
+                through_article_id=10,
+                series=(
+                    LagBucketCounts("crawl", (1, 2, 3), 500.0, 4),
+                    LagBucketCounts("feed_summary", (0, 1, 1), 700.0, 2),
+                ),
+                undated=1,
+            ),
+            IngestionLagDelta(
+                bounds=BOUNDS,
+                through_article_id=17,
+                series=(LagBucketCounts("crawl", (2, 2, 5), 100.0, 5),),
+                undated=2,
+            ),
+        ]
+    )
+    clock = FrozenClock()
+    collector = MetricsCollector(storage, cache_seconds=0.0, clock=clock)
+
+    async def scenario() -> tuple[str, str, str]:
+        expositions = []
+        for tick in range(3):
+            clock.now = float(tick)
+            expositions.append((await collector.expose()).decode())
+        return tuple(expositions)
+
+    primed, first, second = asyncio.run(scenario())
+
+    # Nothing has been ingested while this process was up, so there is no
+    # histogram yet -- not 900 observations of historical lag.
+    assert "news_radar_ingestion_lag_seconds_bucket" not in primed
+    assert "news_radar_articles_undated_total 0.0" in primed
+
+    assert 'news_radar_ingestion_lag_seconds_count{content_source="crawl"} 4.0' in first
+    assert 'news_radar_ingestion_lag_seconds_count{content_source="crawl"} 9.0' in second
+    assert 'news_radar_ingestion_lag_seconds_bucket{content_source="crawl",le="60.0"} 3.0' in second
+    assert "news_radar_articles_undated_total 3.0" in second
+    # The second delta brought no feed_summary rows. Its totals must survive
+    # untouched: a bucket that fell back would read as a counter reset.
+    assert (
+        'news_radar_ingestion_lag_seconds_count{content_source="feed_summary"} 2.0'
+        in second
+    )
+    # Each article is measured once, so the mark carries between scrapes.
+    assert storage.lag_watermarks == [0, 5, 10]
+
+
+def test_current_state_distributions_render_as_gauge_histograms() -> None:
+    text = render(build_families(_snapshot(), quality=_quality())).decode()
+
+    assert 'news_radar_cluster_size_bucket{le="1.0"} 30.0' in text
+    assert 'news_radar_cluster_size_bucket{le="+Inf"} 50.0' in text
+    assert 'news_radar_pipeline_lag_seconds_bucket{le="300.0",stage="embed"} 4.0' in text
+    # The 0.0.4 text format has no gauge histogram, so the totals come out as
+    # `_gcount`/`_gsum` gauges and there is deliberately no `_count`/`_sum`.
+    # That absence is the signal: these buckets describe rows that exist now,
+    # they fall when a cluster is merged, and nothing may `rate()` them.
+    assert "news_radar_cluster_size_gcount 50.0" in text
+    assert "news_radar_cluster_size_gsum 120.0" in text
+    assert 'news_radar_pipeline_lag_seconds_gcount{stage="embed"} 8.0' in text
+    assert "news_radar_cluster_size_count " not in text
+    assert "news_radar_pipeline_lag_seconds_sum{" not in text
+
+
+def test_quality_gauges_name_what_needs_a_rebuild() -> None:
+    samples = _samples(_snapshot(), quality=_quality())
+
+    assert samples["news_radar_stale_classifications[]"] == 12.0
+    assert samples["news_radar_stale_prototypes[]"] == 1.0
+    assert samples["news_radar_active_topics[]"] == 10.0
+    assert samples["news_radar_feeds_without_poll_interval[]"] == 3.0
+    assert (
+        samples[
+            "news_radar_recent_articles_by_content_source"
+            "[('content_source', 'feed_summary')]"
+        ]
+        == 5.0
+    )
+
+
+def test_quality_families_are_absent_when_nothing_was_collected() -> None:
+    samples = _samples(_snapshot())
+
+    assert not any(name.startswith("news_radar_cluster_size") for name in samples)
+    assert not any(name.startswith("news_radar_ingestion_lag") for name in samples)
+
+
 class FakeMetricsStorage:
-    def __init__(self, deltas: list[tuple[WorkerStatDelta, ...]] | None = None) -> None:
+    def __init__(
+        self,
+        deltas: list[tuple[WorkerStatDelta, ...]] | None = None,
+        lag_deltas: list[IngestionLagDelta] | None = None,
+    ) -> None:
         self.snapshot_calls = 0
         self.watermarks: list[dict[str, int]] = []
+        self.lag_watermarks: list[int] = []
         self._deltas = deltas or [()]
+        self._lag_deltas = lag_deltas or [IngestionLagDelta(bounds=BOUNDS)]
 
     async def metrics_snapshot(self, **kwargs) -> MetricsSnapshot:
         self.snapshot_calls += 1
@@ -164,6 +329,14 @@ class FakeMetricsStorage:
         self.watermarks.append(dict(after))
         index = min(len(self.watermarks) - 1, len(self._deltas) - 1)
         return self._deltas[index]
+
+    async def ingestion_lag_since(self, after_article_id):
+        self.lag_watermarks.append(after_article_id)
+        index = min(len(self.lag_watermarks) - 1, len(self._lag_deltas) - 1)
+        return self._lag_deltas[index]
+
+    async def quality_snapshot(self, **kwargs) -> QualityMetrics:
+        return _quality()
 
 
 class FrozenClock:

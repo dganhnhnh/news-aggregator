@@ -823,3 +823,85 @@ class WorkerStatDelta:
     stat: str
     total: float
     through_run_id: int
+
+
+@dataclass(frozen=True)
+class Distribution:
+    """A bucketed distribution of rows that exist right now.
+
+    Prometheus calls this shape a gauge histogram, and the distinction from an
+    ordinary histogram is the point: these buckets describe current table
+    state, so they fall as well as rise. Merging a cluster or retiring a feed
+    genuinely removes an observation, which a counter is not allowed to do.
+
+    `counts` is cumulative and aligned with `bounds` -- entry *i* is how many
+    rows are at most `bounds[i]` -- and `total` is the row count, so the
+    overflow bucket is `total - counts[-1]`.
+    """
+
+    bounds: tuple[float, ...] = ()
+    counts: tuple[int, ...] = ()
+    total: int = 0
+    sum_value: float = 0.0
+
+
+@dataclass(frozen=True)
+class LagBucketCounts:
+    """Cumulative `le` counts for one content source, plus their sum."""
+
+    content_source: str
+    counts: tuple[int, ...] = ()
+    total_seconds: float = 0.0
+    count: int = 0
+
+
+@dataclass(frozen=True)
+class IngestionLagDelta:
+    """How long newly stored articles took to reach us, bucketed, since a mark.
+
+    A resumable histogram delta -- the trick `WorkerStatDelta` plays for worker
+    stats, applied to a latency. Each article is measured exactly once, at the
+    first scrape that sees it, because `crawled_at` moves when a page is
+    re-crawled and re-measuring would let an observation change bucket after
+    the fact. Counters may not go backwards, so the watermark is what keeps
+    this a legal histogram rather than an approximation of one.
+
+    Articles the feed dated in the future are counted in
+    `ahead_of_publication` rather than clamped to zero: a negative lag is a
+    publisher clock or timezone bug, and hiding it in the 1-minute bucket
+    would make the fastest feeds look like the healthiest ones.
+    """
+
+    bounds: tuple[float, ...] = ()
+    through_article_id: int = 0
+    series: tuple[LagBucketCounts, ...] = ()
+    undated: int = 0
+    ahead_of_publication: int = 0
+
+
+@dataclass(frozen=True)
+class QualityMetrics:
+    """What the pipeline produced, as opposed to whether it ran.
+
+    Everything here answers a question that queue depth cannot: articles keep
+    being written while the crawler quietly degrades to summaries, clusters
+    keep forming while they shatter into singletons, and classifications stay
+    in place long after the taxonomy that produced them was edited.
+    """
+
+    recent_window_hours: int = 24
+    recent_articles_by_content_source: tuple[tuple[str, int], ...] = ()
+    # stage -> how long articles in the recent window waited for it.
+    pipeline_lag: tuple[tuple[str, Distribution], ...] = ()
+    cluster_sizes: Distribution = Distribution()
+    cluster_sources: Distribution = Distribution()
+    # Rows whose `classifier_set_hash` predates the active classifier set. The
+    # denominator is already exposed as `news_radar_classified_articles`, so
+    # it is not repeated here.
+    stale_classifications: int = 0
+    stale_prototypes: int = 0
+    active_topics: int = 0
+    feed_poll_intervals: Distribution = Distribution()
+    # Active feeds that have never had their cadence bootstrap fetch, so they
+    # have no tier yet and cannot appear in the distribution above.
+    feeds_without_interval: int = 0

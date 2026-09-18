@@ -20,10 +20,24 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
-from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
+from prometheus_client.core import (
+    CounterMetricFamily,
+    GaugeHistogramMetricFamily,
+    GaugeMetricFamily,
+    HistogramMetricFamily,
+    Metric,
+)
+from prometheus_client.utils import floatToGoString
 
 from adapters.storage import PostgresRawStorage
-from models.storage_models import MetricsSnapshot, WorkerStatDelta
+from models.storage_models import (
+    Distribution,
+    IngestionLagDelta,
+    LagBucketCounts,
+    MetricsSnapshot,
+    QualityMetrics,
+    WorkerStatDelta,
+)
 
 
 PREFIX = "news_radar"
@@ -41,6 +55,8 @@ def build_families(
     snapshot: MetricsSnapshot,
     stat_totals: Mapping[tuple[str, str], float] = {},
     collect_seconds: float = 0.0,
+    quality: QualityMetrics | None = None,
+    ingestion: IngestionLagDelta | None = None,
 ) -> list[Metric]:
     """Shape one snapshot into Prometheus metric families.
 
@@ -277,6 +293,11 @@ def build_families(
         )
     )
 
+    if ingestion is not None:
+        families += _ingestion_families(ingestion)
+    if quality is not None:
+        families += _quality_families(quality)
+
     families.append(
         GaugeMetricFamily(
             f"{PREFIX}_metrics_collect_duration_seconds",
@@ -307,6 +328,147 @@ def _labelled(
     return family
 
 
+def _buckets(
+    bounds: Sequence[float], counts: Sequence[int], total: int
+) -> list[list[str | float]]:
+    """Cumulative counts in exposition order, with the mandatory `+Inf`.
+
+    `counts` is already cumulative and `le` is inclusive, which is exactly
+    what the format wants; the only thing added is the overflow bucket, whose
+    value is the total because every observation is at most infinity.
+    """
+    pairs: list[list[str | float]] = [
+        [floatToGoString(bound), float(count)]
+        for bound, count in zip(bounds, counts, strict=True)
+    ]
+    pairs.append(["+Inf", float(total)])
+    return pairs
+
+
+def _ingestion_families(totals: IngestionLagDelta) -> list[Metric]:
+    """The one latency that measures the world outside this system.
+
+    A true histogram, not a gauge histogram: `totals` is accumulated across
+    scrapes from per-article deltas, so the buckets only ever climb, and
+    `histogram_quantile` over them answers "how stale is the median article we
+    ingest" -- a question no queue depth can.
+    """
+    lag = HistogramMetricFamily(
+        f"{PREFIX}_ingestion_lag_seconds",
+        "Seconds between an article's published_at and the crawl that stored "
+        "it, counted once per article at first sight.",
+        labels=["content_source"],
+    )
+    for series in totals.series:
+        lag.add_metric(
+            [series.content_source],
+            _buckets(totals.bounds, series.counts, series.count),
+            series.total_seconds,
+        )
+    undated = CounterMetricFamily(
+        f"{PREFIX}_articles_undated",
+        "Stored articles whose feed gave no publication date, so their "
+        "ingestion lag is unmeasurable.",
+        value=float(totals.undated),
+    )
+    ahead = CounterMetricFamily(
+        f"{PREFIX}_articles_published_ahead",
+        "Stored articles dated after the crawl that fetched them, which is a "
+        "publisher clock or timezone fault rather than a negative lag.",
+        value=float(totals.ahead_of_publication),
+    )
+    return [lag, undated, ahead]
+
+
+def _gauge_histogram(
+    name: str, documentation: str, distribution: Distribution
+) -> GaugeHistogramMetricFamily:
+    family = GaugeHistogramMetricFamily(name, documentation)
+    family.add_metric(
+        [],
+        _buckets(distribution.bounds, distribution.counts, distribution.total),
+        distribution.sum_value,
+    )
+    return family
+
+
+def _quality_families(quality: QualityMetrics) -> list[Metric]:
+    """Shape the output-quality reads: pipeline lag, cluster shape, staleness.
+
+    Every distribution here is a *gauge* histogram, because each one describes
+    rows that exist right now. Merging two clusters or retiring a feed removes
+    an observation, and a counter that fell would be read as a process
+    restart.
+    """
+    pipeline = GaugeHistogramMetricFamily(
+        f"{PREFIX}_pipeline_lag_seconds",
+        "Seconds from an article's crawl to each downstream stage, over the "
+        "recent window.",
+        labels=["stage"],
+    )
+    for stage, distribution in quality.pipeline_lag:
+        pipeline.add_metric(
+            [stage],
+            _buckets(
+                distribution.bounds, distribution.counts, distribution.total
+            ),
+            distribution.sum_value,
+        )
+
+    return [
+        _labelled(
+            f"{PREFIX}_recent_articles_by_content_source",
+            "Recent-window articles by where their content came from; a rise "
+            "in feed_summary is the crawler degrading, not the feed changing.",
+            "content_source",
+            quality.recent_articles_by_content_source,
+        ),
+        pipeline,
+        _gauge_histogram(
+            f"{PREFIX}_cluster_size",
+            "Articles per open cluster; the le=1 bucket is the singleton "
+            "count, which is what over-strict clustering looks like.",
+            quality.cluster_sizes,
+        ),
+        _gauge_histogram(
+            f"{PREFIX}_cluster_sources",
+            "Distinct sources per open cluster; clusters above le=1 are "
+            "stories corroborated by more than one outlet.",
+            quality.cluster_sources,
+        ),
+        GaugeMetricFamily(
+            f"{PREFIX}_stale_classifications",
+            "Classifications produced by a classifier set that is no longer "
+            "active; they need `news-worker classify --stale`.",
+            value=float(quality.stale_classifications),
+        ),
+        GaugeMetricFamily(
+            f"{PREFIX}_stale_prototypes",
+            "Active topics whose exemplars changed since their prototype was "
+            "compiled; they need `news-worker taxonomy-rebuild`.",
+            value=float(quality.stale_prototypes),
+        ),
+        GaugeMetricFamily(
+            f"{PREFIX}_active_topics",
+            "Active topics in the registry, the denominator for the two "
+            "staleness gauges.",
+            value=float(quality.active_topics),
+        ),
+        _gauge_histogram(
+            f"{PREFIX}_feed_poll_interval_seconds",
+            "Adaptive poll interval across active feeds, which shows how the "
+            "cadence tiers are actually distributed.",
+            quality.feed_poll_intervals,
+        ),
+        GaugeMetricFamily(
+            f"{PREFIX}_feeds_without_poll_interval",
+            "Active feeds that have never been polled, so they have no "
+            "cadence tier yet.",
+            value=float(quality.feeds_without_interval),
+        ),
+    ]
+
+
 class _Families:
     """Adapts a ready list of families to the registry's collector protocol."""
 
@@ -334,6 +496,12 @@ class MetricsCollector:
     runs finished since the last one, so the numbers climb monotonically for
     as long as the process lives, and a restart re-reads history from zero and
     arrives back at the same totals instead of resetting them.
+
+    The ingestion histogram is the deliberate exception: it takes its opening
+    watermark from the corpus and counts only articles stored while this
+    process was running, so a restart resets it the way any other histogram
+    resets. Replaying history there would compress months of lag into one
+    scrape interval, and that series exists to be `rate()`d.
     """
 
     def __init__(
@@ -359,6 +527,14 @@ class MetricsCollector:
         self._expires_at = 0.0
         self._totals: dict[tuple[str, str], float] = {}
         self._watermarks: dict[str, int] = {}
+        # The ingestion histogram accumulates the same way, keyed by content
+        # source, behind a single article-id watermark.
+        self._lag_bounds: tuple[float, ...] = ()
+        self._lag: dict[str, LagBucketCounts] = {}
+        self._lag_watermark = 0
+        self._lag_primed = False
+        self._undated = 0
+        self._ahead = 0
 
     async def expose(self) -> bytes:
         async with self._lock:
@@ -371,9 +547,32 @@ class MetricsCollector:
                 max_error_types=self._max_error_types,
             )
             self._accumulate(await self._storage.worker_stat_totals(self._watermarks))
+            delta = await self._storage.ingestion_lag_since(self._lag_watermark)
+            if self._lag_primed:
+                self._accumulate_lag(delta)
+            else:
+                # First collection: take the mark and throw the corpus away.
+                # Unlike the worker stats, this histogram is meant to be
+                # `rate()`d, and replaying every article ever stored into a
+                # single scrape interval would put months of history into one
+                # minute's rate. Starting at zero is what an ordinary
+                # process-lifetime histogram does, and a counter reset is
+                # something `rate()` already understands.
+                self._lag_bounds = delta.bounds
+                self._lag_watermark = delta.through_article_id
+                self._lag_primed = True
+            quality = await self._storage.quality_snapshot(
+                recent_window_hours=self._recent_window_hours
+            )
             elapsed = self._clock() - started
             self._payload = render(
-                build_families(snapshot, dict(self._totals), elapsed)
+                build_families(
+                    snapshot,
+                    dict(self._totals),
+                    elapsed,
+                    quality,
+                    self._ingestion_totals(),
+                )
             )
             self._expires_at = self._clock() + self._cache_seconds
             return self._payload
@@ -385,3 +584,42 @@ class MetricsCollector:
             self._watermarks[delta.worker] = max(
                 self._watermarks.get(delta.worker, 0), delta.through_run_id
             )
+
+    def _accumulate_lag(self, delta: IngestionLagDelta) -> None:
+        """Fold one batch of newly seen articles into the running histogram.
+
+        A content source absent from this delta keeps the totals it had: a
+        histogram bucket must never drop back, and "no new feed_summary rows
+        this minute" is not the same as "none exist".
+        """
+        self._lag_bounds = delta.bounds
+        for series in delta.series:
+            running = self._lag.get(series.content_source)
+            if running is None:
+                self._lag[series.content_source] = series
+                continue
+            self._lag[series.content_source] = LagBucketCounts(
+                content_source=series.content_source,
+                counts=tuple(
+                    before + now
+                    for before, now in zip(
+                        running.counts, series.counts, strict=True
+                    )
+                ),
+                total_seconds=running.total_seconds + series.total_seconds,
+                count=running.count + series.count,
+            )
+        self._lag_watermark = max(self._lag_watermark, delta.through_article_id)
+        self._undated += delta.undated
+        self._ahead += delta.ahead_of_publication
+
+    def _ingestion_totals(self) -> IngestionLagDelta:
+        return IngestionLagDelta(
+            bounds=self._lag_bounds,
+            through_article_id=self._lag_watermark,
+            series=tuple(
+                self._lag[source] for source in sorted(self._lag)
+            ),
+            undated=self._undated,
+            ahead_of_publication=self._ahead,
+        )

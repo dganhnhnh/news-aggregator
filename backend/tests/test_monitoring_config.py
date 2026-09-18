@@ -176,6 +176,7 @@ def test_grafana_provisions_all_dashboards() -> None:
         "news-radar-host",
         "news-radar-containers",
         "news-radar-pipeline",
+        "news-radar-quality",
         "news-radar-services",
     }
     for dashboard in dashboards:

@@ -64,6 +64,7 @@ from models.storage_models import (
     ClusterMergeResult,
     ClusterRebuildResult,
     CorpusMetrics,
+    Distribution,
     EmbeddingCandidate,
     EmbeddingRecord,
     FailureKind,
@@ -78,7 +79,10 @@ from models.storage_models import (
     FlatTaxonomyNode,
     HighlightSegment,
     HistoricalBlockPage,
+    IngestionLagDelta,
+    LagBucketCounts,
     MetricsSnapshot,
+    QualityMetrics,
     QueueStatusSnapshot,
     RawArticle,
     RunStatus,
@@ -126,7 +130,14 @@ from services.classification import (
     classifier_set_hash,
 )
 from services.clustering import choose_canonical, recompute_centroid, running_centroid
-from services.taxonomy import SeedTaxonomyNode, TaxonomySeed, build_node_tree, next_classifier_revision
+from services.taxonomy import (
+    MIN_EXEMPLARS_TO_ACTIVATE,
+    SeedTaxonomyNode,
+    TaxonomySeed,
+    build_node_tree,
+    definition_hash,
+    next_classifier_revision,
+)
 
 
 class StorageError(RuntimeError):
@@ -142,6 +153,35 @@ ARTICLE_SEARCH_LIMIT = 8
 STORYLINE_SEARCH_LIMIT = 5
 STORYLINE_PREVIEW_LIMIT = 3
 RRF_K = 60
+
+# Publication to ingestion, in seconds. The range is wide on purpose: the fast
+# end is bounded by how often a feed is polled (30s for the instant tier) and
+# the slow end by feeds that publish backdated entries, so anything narrower
+# would put most of the mass in the overflow bucket and answer nothing.
+INGESTION_LAG_BOUNDS = (
+    60.0,
+    300.0,
+    900.0,
+    1800.0,
+    3600.0,
+    7200.0,
+    21600.0,
+    43200.0,
+    86400.0,
+    259200.0,
+)
+# Ingestion to each later stage. Shorter, because these are scheduled runs
+# inside this system rather than someone else's publishing cadence.
+PIPELINE_LAG_BOUNDS = (60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0, 21600.0, 86400.0)
+# Articles per open cluster. 1 is its own bucket: the singleton share is the
+# cheapest read on whether the similarity threshold has drifted.
+CLUSTER_SIZE_BOUNDS = (1.0, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0)
+# Distinct sources per open cluster. Burst detection needs three, so a corpus
+# whose clusters never pass 2 will never raise a trend no matter how it is
+# tuned -- worth knowing before that engine is written.
+CLUSTER_SOURCE_BOUNDS = (1.0, 2.0, 3.0, 5.0, 10.0)
+# Adaptive poll tiers, in seconds.
+POLL_INTERVAL_BOUNDS = (60.0, 300.0, 900.0, 1800.0, 3600.0, 10800.0, 21600.0, 86400.0)
 
 
 def reciprocal_rank_fusion(
@@ -1044,6 +1084,258 @@ class PostgresRawStorage:
                 through_run_id=int(row.through_run_id),
             )
             for row in rows
+        )
+
+    @staticmethod
+    def _distribution_columns(
+        expression: Any, bounds: Sequence[float], prefix: str
+    ) -> list[Any]:
+        """Cumulative `le` counts for one expression, as select() columns.
+
+        Written as filtered counts rather than with `width_bucket()` because
+        the exposition format's `le` is inclusive and `width_bucket`'s buckets
+        are half-open the other way round: an observation landing exactly on a
+        boundary would be one bucket out. `count(expression)` skips NULLs, so
+        a row with nothing to observe is absent rather than counted as zero.
+        """
+        return [
+            func.count(expression).label(f"{prefix}_total"),
+            func.sum(expression).label(f"{prefix}_sum"),
+            *[
+                func.count().filter(expression <= bound).label(f"{prefix}_le_{index}")
+                for index, bound in enumerate(bounds)
+            ],
+        ]
+
+    @staticmethod
+    def _distribution(row: Any, bounds: Sequence[float], prefix: str) -> Distribution:
+        return Distribution(
+            bounds=tuple(bounds),
+            counts=tuple(
+                int(getattr(row, f"{prefix}_le_{index}")) for index in range(len(bounds))
+            ),
+            total=int(getattr(row, f"{prefix}_total") or 0),
+            sum_value=float(getattr(row, f"{prefix}_sum") or 0.0),
+        )
+
+    async def ingestion_lag_since(
+        self,
+        after_article_id: int = 0,
+        *,
+        bounds: Sequence[float] = INGESTION_LAG_BOUNDS,
+    ) -> IngestionLagDelta:
+        """Bucket how long newly stored articles took to reach us.
+
+        Publication to ingestion is `crawled_at - published_at`: the feed's own
+        timestamp against the moment the article became a row here. It is the
+        only latency that contains everything outside this system -- how often
+        a publisher updates, how far down the rotation its feed sits, how long
+        the retry queue held a page -- which is why it answers "is the corpus
+        current" when no queue depth can.
+
+        Watermarked rather than recomputed each scrape, because a re-crawl
+        moves `crawled_at`: an article measured twice could land in a lower
+        bucket the second time, and a counter that goes backwards is not a
+        histogram. Reading only ids above the mark measures each article once,
+        at first sight. An article whose row commits after a higher id has
+        already been counted is missed; that is a rounding error in a
+        distribution, and the alternative is re-reading the whole corpus every
+        thirty seconds.
+
+        Feed dates that land after the crawl are counted separately instead of
+        clamped to zero. A negative lag is a publisher clock or timezone bug,
+        and folding it into the fastest bucket would make broken feeds look
+        like the healthiest ones.
+        """
+        bounds = tuple(float(bound) for bound in bounds)
+        lag = func.extract(
+            "epoch", raw_articles.c.crawled_at - raw_articles.c.published_at
+        )
+        async with self._engine.connect() as connection:
+            totals = (
+                await connection.execute(
+                    select(
+                        func.max(raw_articles.c.id).label("through_id"),
+                        func.count()
+                        .filter(raw_articles.c.published_at.is_(None))
+                        .label("undated"),
+                        func.count()
+                        .filter(
+                            raw_articles.c.published_at.isnot(None),
+                            raw_articles.c.published_at > raw_articles.c.crawled_at,
+                        )
+                        .label("ahead"),
+                    ).where(raw_articles.c.id > after_article_id)
+                )
+            ).one()
+            rows = (
+                await connection.execute(
+                    select(
+                        raw_articles.c.content_source,
+                        *self._distribution_columns(lag, bounds, "lag"),
+                    )
+                    .where(
+                        raw_articles.c.id > after_article_id,
+                        raw_articles.c.published_at.isnot(None),
+                        raw_articles.c.published_at <= raw_articles.c.crawled_at,
+                    )
+                    .group_by(raw_articles.c.content_source)
+                    .order_by(raw_articles.c.content_source)
+                )
+            ).all()
+
+        return IngestionLagDelta(
+            bounds=bounds,
+            # Never rewind: a scrape that saw nothing new must leave the
+            # watermark where it was, not reset it to zero.
+            through_article_id=int(totals.through_id or after_article_id),
+            series=tuple(
+                LagBucketCounts(
+                    content_source=row.content_source,
+                    counts=tuple(
+                        int(getattr(row, f"lag_le_{index}"))
+                        for index in range(len(bounds))
+                    ),
+                    total_seconds=float(row.lag_sum or 0.0),
+                    count=int(row.lag_total),
+                )
+                for row in rows
+            ),
+            undated=int(totals.undated),
+            ahead_of_publication=int(totals.ahead),
+        )
+
+    async def quality_snapshot(
+        self, *, recent_window_hours: int = 24
+    ) -> QualityMetrics:
+        """Read what the pipeline produced, rather than whether it ran.
+
+        Every number here describes a way the system can fail while looking
+        healthy: crawls degrading into summary-only rows, clusters shattering
+        into singletons, classifications left behind by a taxonomy edit. None
+        of them move a queue, so none of them show up in `metrics_snapshot`.
+
+        The distributions are gauge histograms, not counters -- they describe
+        rows that exist now, and merging a cluster or retiring a feed genuinely
+        removes an observation.
+        """
+        now = datetime.now(timezone.utc)
+        recent_cutoff = now - timedelta(hours=recent_window_hours)
+        # The prototype and classifier fingerprints are policy, computed the
+        # same way the workers compute them; reusing those calls is what keeps
+        # "stale" meaning exactly what `--stale` means.
+        classifier = await self.classifier_snapshot()
+        exemplar_sets = await self.topics_for_prototype_rebuild()
+        stale_prototypes = sum(
+            1
+            for item in exemplar_sets
+            if len(item.exemplars) >= MIN_EXEMPLARS_TO_ACTIVATE
+            and item.current_definition_hash != definition_hash(item.exemplars)
+        )
+
+        lag_sources = (
+            ("embed", article_embeddings, article_embeddings.c.created_at),
+            ("cluster", cluster_members, cluster_members.c.added_at),
+            (
+                "classify",
+                article_classifications,
+                article_classifications.c.classified_at,
+            ),
+        )
+        async with self._engine.connect() as connection:
+            recent_source_rows = (
+                await connection.execute(
+                    select(raw_articles.c.content_source, func.count().label("count"))
+                    .where(raw_articles.c.event_at >= recent_cutoff)
+                    .group_by(raw_articles.c.content_source)
+                    .order_by(raw_articles.c.content_source)
+                )
+            ).all()
+
+            pipeline_lag: list[tuple[str, Distribution]] = []
+            for stage, table, stamp in lag_sources:
+                lag = func.extract("epoch", stamp - raw_articles.c.crawled_at)
+                row = (
+                    await connection.execute(
+                        select(*self._distribution_columns(lag, PIPELINE_LAG_BOUNDS, "lag"))
+                        .select_from(
+                            raw_articles.join(
+                                table, table.c.article_id == raw_articles.c.id
+                            )
+                        )
+                        # A re-crawl can push `crawled_at` past a timestamp
+                        # written before it, which is not a negative wait --
+                        # it is the same article measured across two versions.
+                        .where(
+                            raw_articles.c.event_at >= recent_cutoff,
+                            stamp >= raw_articles.c.crawled_at,
+                        )
+                    )
+                ).one()
+                pipeline_lag.append(
+                    (stage, self._distribution(row, PIPELINE_LAG_BOUNDS, "lag"))
+                )
+
+            cluster_row = (
+                await connection.execute(
+                    select(
+                        *self._distribution_columns(
+                            clusters.c.n_articles, CLUSTER_SIZE_BOUNDS, "size"
+                        ),
+                        *self._distribution_columns(
+                            clusters.c.n_distinct_sources,
+                            CLUSTER_SOURCE_BOUNDS,
+                            "sources",
+                        ),
+                    ).where(clusters.c.status == "open")
+                )
+            ).one()
+
+            classification_row = (
+                await connection.execute(
+                    select(
+                        func.count()
+                        .filter(
+                            article_classifications.c.classifier_set_hash
+                            != classifier.set_hash
+                        )
+                        .label("stale")
+                    )
+                )
+            ).one()
+
+            feed_row = (
+                await connection.execute(
+                    select(
+                        *self._distribution_columns(
+                            feed_state.c.poll_interval_seconds,
+                            POLL_INTERVAL_BOUNDS,
+                            "interval",
+                        ),
+                        func.count()
+                        .filter(feed_state.c.poll_interval_seconds.is_(None))
+                        .label("unbootstrapped"),
+                    ).where(feed_state.c.disabled_at.is_(None))
+                )
+            ).one()
+
+        return QualityMetrics(
+            recent_window_hours=recent_window_hours,
+            recent_articles_by_content_source=tuple(
+                (row.content_source, int(row.count)) for row in recent_source_rows
+            ),
+            pipeline_lag=tuple(pipeline_lag),
+            cluster_sizes=self._distribution(cluster_row, CLUSTER_SIZE_BOUNDS, "size"),
+            cluster_sources=self._distribution(
+                cluster_row, CLUSTER_SOURCE_BOUNDS, "sources"
+            ),
+            stale_classifications=int(classification_row.stale),
+            stale_prototypes=stale_prototypes,
+            active_topics=len(exemplar_sets),
+            feed_poll_intervals=self._distribution(
+                feed_row, POLL_INTERVAL_BOUNDS, "interval"
+            ),
+            feeds_without_interval=int(feed_row.unbootstrapped),
         )
 
     @staticmethod

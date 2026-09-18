@@ -43,7 +43,7 @@
       "gridPos": {"h": 5, "w": 5, "x": 14, "y": 0},
       "id": 4,
       "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
-      "targets": [{"editorMode": "code", "expr": "news_radar_classified_articles{outcome=\"uncategorized\"} / clamp_min(sum(news_radar_classified_articles), 1)", "refId": "A", "legendFormat": "Uncategorized", "range": true}],
+      "targets": [{"editorMode": "code", "expr": "news_radar_classified_articles{outcome=\"uncategorized\"} / scalar(clamp_min(sum(news_radar_classified_articles), 1))", "refId": "A", "legendFormat": "Uncategorized", "range": true}],
       "title": "Uncategorized share",
       "type": "stat"
     },

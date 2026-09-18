@@ -141,6 +141,137 @@ async def _test_worker_stat_totals_resume_from_a_watermark() -> None:
         await engine.dispose()
 
 
+def test_ingestion_lag_buckets_each_article_once() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_ingestion_lag_buckets_each_article_once())
+
+
+async def _test_ingestion_lag_buckets_each_article_once() -> None:
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    now = datetime.now(timezone.utc)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        await _cleanup(engine)
+
+        baseline = await storage.ingestion_lag_since(0)
+
+        # Published ten minutes before the crawl stored it: past the 300s
+        # bound, inside the 900s one.
+        article = RawArticle(
+            url=ARTICLE_URL,
+            url_original=ARTICLE_URL,
+            title="Metrics article",
+            source="Metrics example",
+            lang="en",
+            content="body",
+            content_hash=b"m" * 32,
+            published_at=now - timedelta(minutes=10),
+            crawled_at=now,
+        )
+        await storage.apply_batch([article], [], [], received=1, rejected=0)
+
+        delta = await storage.ingestion_lag_since(baseline.through_article_id)
+        crawl = _series(delta, "crawl")
+        assert crawl is not None
+        assert crawl.count == 1
+        bounds = list(delta.bounds)
+        assert crawl.counts[bounds.index(300.0)] == 0
+        assert crawl.counts[bounds.index(900.0)] == 1
+        assert 500.0 < crawl.total_seconds < 700.0
+        assert delta.through_article_id > baseline.through_article_id
+
+        # The mark is what makes this a legal histogram: reading again from
+        # the new mark must return nothing, so the caller's counter holds
+        # instead of counting the same article a second time.
+        assert _series(
+            await storage.ingestion_lag_since(delta.through_article_id), "crawl"
+        ) is None
+
+        # An empty delta must not rewind the mark, or every later scrape would
+        # re-count the whole corpus.
+        empty = await storage.ingestion_lag_since(delta.through_article_id)
+        assert empty.through_article_id == delta.through_article_id
+    finally:
+        if ready:
+            await _cleanup(engine)
+        await storage.close()
+        await engine.dispose()
+
+
+def test_quality_snapshot_reads_current_table_state() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_quality_snapshot_reads_current_table_state())
+
+
+async def _test_quality_snapshot_reads_current_table_state() -> None:
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    now = datetime.now(timezone.utc)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        await _cleanup(engine)
+
+        before = await storage.quality_snapshot()
+
+        article = RawArticle(
+            url=ARTICLE_URL,
+            url_original=ARTICLE_URL,
+            title="Metrics article",
+            source="Metrics example",
+            lang="en",
+            content="",
+            content_hash=b"m" * 32,
+            feed_summary="dek only",
+            content_source="feed_summary",
+            published_at=now,
+            crawled_at=now,
+        )
+        await storage.apply_batch([article], [], [], received=1, rejected=0)
+
+        after = await storage.quality_snapshot()
+
+        assert dict(after.recent_articles_by_content_source).get(
+            "feed_summary", 0
+        ) == dict(before.recent_articles_by_content_source).get("feed_summary", 0) + 1
+        assert after.recent_window_hours == 24
+        assert [stage for stage, _ in after.pipeline_lag] == [
+            "embed",
+            "cluster",
+            "classify",
+        ]
+        # Cumulative counts, so every distribution must be non-decreasing and
+        # capped by its own total; a violation here is an illegal histogram.
+        for distribution in (
+            after.cluster_sizes,
+            after.cluster_sources,
+            after.feed_poll_intervals,
+            *(item for _, item in after.pipeline_lag),
+        ):
+            assert len(distribution.counts) == len(distribution.bounds)
+            assert list(distribution.counts) == sorted(distribution.counts)
+            assert distribution.counts[-1] <= distribution.total
+        assert after.stale_prototypes <= after.active_topics
+    finally:
+        if ready:
+            await _cleanup(engine)
+        await storage.close()
+        await engine.dispose()
+
+
+def _series(delta, content_source: str):
+    for item in delta.series:
+        if item.content_source == content_source:
+            return item
+    return None
+
+
 def _pending(snapshot, stage: str) -> int:
     for item in snapshot.stages:
         if item.stage == stage:
