@@ -104,11 +104,18 @@ export type TopicCatalog = {
   nodes: TaxonomyNode[]
 }
 
+export type TextHighlight = {
+  text: string
+  highlight: boolean
+}
+
 export type ArticleSummary = {
   id: number
   url: string
   title: string | null
+  title_highlights: TextHighlight[] | null
   excerpt: string
+  excerpt_highlights: TextHighlight[] | null
   source: SourceRef | null
   published_at: string | null
   crawled_at: string

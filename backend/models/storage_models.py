@@ -134,6 +134,14 @@ class TopicRefItem:
 
 
 @dataclass(frozen=True)
+class HighlightSegment:
+    """One piece of a `ts_headline()` result: matched or not."""
+
+    text: str
+    highlight: bool
+
+
+@dataclass(frozen=True)
 class ArticleFeedItem:
     id: int
     url: str
@@ -145,6 +153,9 @@ class ArticleFeedItem:
     crawled_at: datetime
     event_at: datetime
     topics: tuple[TopicRefItem, ...] = ()
+    # Populated only when the feed was filtered by a search query.
+    title_highlights: tuple[HighlightSegment, ...] | None = None
+    excerpt_highlights: tuple[HighlightSegment, ...] | None = None
 
 
 @dataclass(frozen=True)

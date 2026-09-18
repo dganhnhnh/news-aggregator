@@ -8,7 +8,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
-from models.storage_models import ArticleFeedItem, StoryFeedItem, TopicRefItem
+from models.storage_models import (
+    ArticleFeedItem,
+    HighlightSegment,
+    StoryFeedItem,
+    TopicRefItem,
+)
 
 T = TypeVar("T")
 
@@ -28,11 +33,22 @@ class TopicRef(BaseModel):
         return cls(id=item.id, slug=item.slug, name=item.display_name)
 
 
+class TextHighlight(BaseModel):
+    text: str
+    highlight: bool
+
+    @classmethod
+    def from_storage(cls, segment: HighlightSegment) -> "TextHighlight":
+        return cls(text=segment.text, highlight=segment.highlight)
+
+
 class ArticleSummary(BaseModel):
     id: int
     url: str
     title: str | None
+    title_highlights: list[TextHighlight] | None = None
     excerpt: str
+    excerpt_highlights: list[TextHighlight] | None = None
     source: SourceRef | None
     published_at: datetime | None
     crawled_at: datetime
@@ -50,7 +66,17 @@ class ArticleSummary(BaseModel):
             id=item.id,
             url=item.url,
             title=item.title,
+            title_highlights=(
+                [TextHighlight.from_storage(seg) for seg in item.title_highlights]
+                if item.title_highlights is not None
+                else None
+            ),
             excerpt=item.excerpt,
+            excerpt_highlights=(
+                [TextHighlight.from_storage(seg) for seg in item.excerpt_highlights]
+                if item.excerpt_highlights is not None
+                else None
+            ),
             source=source,
             published_at=item.published_at,
             crawled_at=item.crawled_at,

@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils'
 import { relativeTime } from '@/lib/time'
 import type { ArticleSummary } from '@/lib/types'
 import { TopicBadgeGroup } from '@/components/topics/topic-badge'
+import { HighlightedText } from '@/components/highlighted-text'
 
 function initialsFor(name: string) {
   return name.slice(0, 1).toUpperCase()
@@ -58,7 +59,9 @@ export function ArticleRow({
           selected ? 'text-foreground' : 'text-foreground/90',
         )}
       >
-        {article.title ?? (
+        {article.title ? (
+          <HighlightedText segments={article.title_highlights} fallback={article.title} />
+        ) : (
           <span className="inline-flex items-center gap-1 text-muted-foreground">
             <ExternalLink className="size-3" />
             {article.url}
@@ -69,7 +72,7 @@ export function ArticleRow({
       <TopicBadgeGroup topics={article.topics} maxVisible={2} />
 
       <p className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
-        {article.excerpt}
+        <HighlightedText segments={article.excerpt_highlights} fallback={article.excerpt} />
       </p>
     </button>
   )

@@ -76,6 +76,7 @@ from models.storage_models import (
     FeedSeed,
     FeedStateItem,
     FlatTaxonomyNode,
+    HighlightSegment,
     HistoricalBlockPage,
     MetricsSnapshot,
     QueueStatusSnapshot,
@@ -108,7 +109,13 @@ from models.storage_models import (
     WorkerStatDelta,
     WorkerTrigger,
 )
-from services.raw_storage import build_excerpt, source_slug
+from services.raw_storage import (
+    HEADLINE_START_SEL,
+    HEADLINE_STOP_SEL,
+    build_excerpt,
+    parse_headline,
+    source_slug,
+)
 from services.classification import (
     ArticleClassification,
     ClassifierSnapshot,
@@ -2021,6 +2028,35 @@ class PostgresRawStorage:
             )
             return int(result.rowcount or 0)
 
+    # `ts_headline()` options; no spaces or punctuation inside a value, so
+    # none need the quoting `ts_headline`'s option-string parser requires for
+    # values containing them. Title gets every match marked with no
+    # truncation (titles are already short); the excerpt is windowed down to
+    # the fragments around a match instead of always being a lead-in slice
+    # that may not even contain the matched term.
+    _TITLE_HEADLINE_OPTIONS = (
+        f"StartSel={HEADLINE_START_SEL},StopSel={HEADLINE_STOP_SEL},HighlightAll=true"
+    )
+    _EXCERPT_HEADLINE_OPTIONS = (
+        f"StartSel={HEADLINE_START_SEL},StopSel={HEADLINE_STOP_SEL},"
+        "MaxFragments=2,MaxWords=25,MinWords=10,ShortWord=3,HighlightAll=false"
+    )
+
+    @staticmethod
+    def _headline_body_source():
+        """The text an excerpt headline is cut from when a query is active.
+
+        Unlike `_excerpt_source`, this is not truncated to a lead-in slice:
+        `ts_headline` needs the full candidate text to find where the match
+        actually is. Bounded to 50k chars (search_tsv itself is only built
+        from the first 200k) so a pathological body can't make every search
+        request scan an entire article.
+        """
+        return func.coalesce(
+            func.nullif(raw_articles.c.feed_summary, ""),
+            func.left(raw_articles.c.content, 50_000),
+        )
+
     @staticmethod
     def _excerpt_source():
         """The text a list preview is cut from.
@@ -2143,16 +2179,36 @@ class PostgresRawStorage:
         query: str | None = None,
         max_per_source: int = 3,
     ) -> list[ArticleFeedItem]:
+        # Headlined columns are only meaningful (and only cost anything) when
+        # a search query narrows the result set.
+        tsquery = func.websearch_to_tsquery("english", query) if query else None
+
+        inner_columns = [
+            raw_articles.c.id,
+            raw_articles.c.url,
+            raw_articles.c.title,
+            self._excerpt_source().label("excerpt_raw"),
+            raw_articles.c.published_at,
+            raw_articles.c.crawled_at,
+            raw_articles.c.event_at,
+        ]
+        if tsquery is not None:
+            inner_columns += [
+                func.ts_headline(
+                    "english",
+                    func.coalesce(raw_articles.c.title, ""),
+                    tsquery,
+                    self._TITLE_HEADLINE_OPTIONS,
+                ).label("title_headline_raw"),
+                func.ts_headline(
+                    "english",
+                    self._headline_body_source(),
+                    tsquery,
+                    self._EXCERPT_HEADLINE_OPTIONS,
+                ).label("excerpt_headline_raw"),
+            ]
         inner = (
-            select(
-                raw_articles.c.id,
-                raw_articles.c.url,
-                raw_articles.c.title,
-                self._excerpt_source().label("excerpt_raw"),
-                raw_articles.c.published_at,
-                raw_articles.c.crawled_at,
-                raw_articles.c.event_at,
-            )
+            select(*inner_columns)
             .where(raw_articles.c.source_id == sources.c.id)
             .where(
                 *self._feed_filters(
@@ -2167,20 +2223,20 @@ class PostgresRawStorage:
             .limit(max_per_source)
             .lateral("a")
         )
-        stmt = (
-            select(
-                inner.c.id,
-                inner.c.url,
-                inner.c.title,
-                inner.c.excerpt_raw,
-                inner.c.published_at,
-                inner.c.crawled_at,
-                inner.c.event_at,
-                sources.c.slug,
-                sources.c.name,
-            )
-            .select_from(sources.join(inner, true()))
-        )
+        outer_columns = [
+            inner.c.id,
+            inner.c.url,
+            inner.c.title,
+            inner.c.excerpt_raw,
+            inner.c.published_at,
+            inner.c.crawled_at,
+            inner.c.event_at,
+            sources.c.slug,
+            sources.c.name,
+        ]
+        if tsquery is not None:
+            outer_columns += [inner.c.title_headline_raw, inner.c.excerpt_headline_raw]
+        stmt = select(*outer_columns).select_from(sources.join(inner, true()))
         if source_slugs:
             stmt = stmt.where(sources.c.slug.in_(source_slugs))
         stmt = stmt.order_by(inner.c.event_at.desc(), inner.c.id.desc()).limit(limit)
@@ -2190,21 +2246,33 @@ class PostgresRawStorage:
             topics_by_article = await self._assigned_article_topics(
                 connection, [row.id for row in rows]
             )
-            return [
-                ArticleFeedItem(
-                    id=row.id,
-                    url=row.url,
-                    title=row.title,
-                    excerpt=build_excerpt(row.excerpt_raw or ""),
-                    source_slug=row.slug,
-                    source_name=row.name,
-                    published_at=row.published_at,
-                    crawled_at=row.crawled_at,
-                    event_at=row.event_at,
-                    topics=topics_by_article.get(int(row.id), ()),
+            items = []
+            for row in rows:
+                title_highlights: tuple[HighlightSegment, ...] | None = None
+                excerpt_highlights: tuple[HighlightSegment, ...] | None = None
+                excerpt = build_excerpt(row.excerpt_raw or "")
+                if tsquery is not None:
+                    if row.title:
+                        title_highlights = parse_headline(row.title_headline_raw or "")
+                    excerpt_highlights = parse_headline(row.excerpt_headline_raw or "")
+                    excerpt = "".join(seg.text for seg in excerpt_highlights) or excerpt
+                items.append(
+                    ArticleFeedItem(
+                        id=row.id,
+                        url=row.url,
+                        title=row.title,
+                        excerpt=excerpt,
+                        source_slug=row.slug,
+                        source_name=row.name,
+                        published_at=row.published_at,
+                        crawled_at=row.crawled_at,
+                        event_at=row.event_at,
+                        topics=topics_by_article.get(int(row.id), ()),
+                        title_highlights=title_highlights,
+                        excerpt_highlights=excerpt_highlights,
+                    )
                 )
-                for row in rows
-            ]
+            return items
 
     @staticmethod
     def _research_article_filters(

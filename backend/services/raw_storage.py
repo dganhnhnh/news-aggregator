@@ -12,18 +12,28 @@ from urllib.parse import urlsplit
 from core.html_content import FEED_CONTENT_KEY, FEED_SUMMARY_KEY
 from core.urls import URL_ERROR_CONTEXT_KEY, normalize_url, source_slug
 from models.search_and_crawl_models import CrawlResult
-from models.storage_models import ContentSource, RawArticle
+from models.storage_models import ContentSource, HighlightSegment, RawArticle
 
 
 __all__ = [
+    "HEADLINE_START_SEL",
+    "HEADLINE_STOP_SEL",
     "build_excerpt",
     "content_hash",
     "crawl_result_to_article",
     "normalize_content",
     "normalize_url",
+    "parse_headline",
     "prepare_articles",
     "source_slug",
 ]
+
+# Control characters, not markdown or plausible article text, so they can
+# never collide with a match. Postgres `ts_headline()` wraps every matched
+# term in these; `parse_headline` below turns that back into segments.
+HEADLINE_START_SEL = "\x01"
+HEADLINE_STOP_SEL = "\x02"
+_HEADLINE_SEL_RE = re.compile(f"[{HEADLINE_START_SEL}{HEADLINE_STOP_SEL}]")
 
 
 def build_excerpt(raw: str, limit: int = 280) -> str:
@@ -34,6 +44,22 @@ def build_excerpt(raw: str, limit: int = 280) -> str:
         return text
     truncated = text[:limit].rsplit(" ", 1)[0]
     return truncated + "…"
+
+
+def parse_headline(raw: str) -> tuple[HighlightSegment, ...]:
+    """Clean a `ts_headline()` result into matched/unmatched segments.
+
+    Splitting on `HEADLINE_START_SEL`/`HEADLINE_STOP_SEL` alternates
+    unmatched, matched, unmatched, ... since Postgres always emits a
+    balanced start/stop pair around each match.
+    """
+    text = re.sub(r"[#>*_`\[\]]+", " ", raw)
+    text = re.sub(r"\s+", " ", text).strip()
+    return tuple(
+        HighlightSegment(text=part, highlight=bool(i % 2))
+        for i, part in enumerate(_HEADLINE_SEL_RE.split(text))
+        if part
+    )
 
 
 def normalize_content(content: str) -> str:
