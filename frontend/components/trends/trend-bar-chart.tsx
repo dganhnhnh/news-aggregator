@@ -23,7 +23,17 @@ function dayLabel(day: string) {
   })
 }
 
-export function TrendBarChart({ days, mode }: { days: TrendDay[]; mode: TrendMode }) {
+export function TrendBarChart({
+  days,
+  mode,
+  selectedDay,
+  onSelectDay,
+}: {
+  days: TrendDay[]
+  mode: TrendMode
+  selectedDay: string | null
+  onSelectDay: (day: string | null) => void
+}) {
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
 
   const { values, peak, lowSampleFloor } = useMemo(() => {
@@ -54,7 +64,13 @@ export function TrendBarChart({ days, mode }: { days: TrendDay[]; mode: TrendMod
   const cardAtEnd = cardCenter > 88
 
   return (
-    <div className="flex flex-col gap-2">
+    <div
+      className="mx-auto flex w-full max-w-5xl cursor-default flex-col gap-2 px-6 sm:px-10 lg:px-14"
+      onClick={() => onSelectDay(null)}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') onSelectDay(null)
+      }}
+    >
       <div className="relative">
         <div className="pointer-events-none absolute inset-x-0 top-0 border-t border-dashed border-border" />
         <span className="pointer-events-none absolute -top-4 right-0 text-[10px] tabular-nums text-muted-foreground">
@@ -62,9 +78,9 @@ export function TrendBarChart({ days, mode }: { days: TrendDay[]; mode: TrendMod
         </span>
 
         <div
-          role="img"
+          role="group"
           aria-label={`Mentions per day across ${days.length} days`}
-          className="flex h-64 items-end gap-px"
+          className="flex h-56 items-end gap-px sm:h-64"
           onMouseLeave={() => setActiveIndex(null)}
         >
           {days.map((day, index) => {
@@ -90,10 +106,23 @@ export function TrendBarChart({ days, mode }: { days: TrendDay[]; mode: TrendMod
                 onMouseEnter={() => setActiveIndex(index)}
                 onFocus={() => setActiveIndex(index)}
                 onBlur={() => setActiveIndex(null)}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  // The button fills its day slot for hover and keyboard
+                  // access, but a pointer click above the visible bar is a
+                  // click on empty chart space and clears the day filter.
+                  if (event.detail !== 0 && event.target === event.currentTarget) {
+                    onSelectDay(null)
+                    return
+                  }
+                  onSelectDay(selectedDay === day.day ? null : day.day)
+                }}
+                aria-pressed={selectedDay === day.day}
                 className={cn(
-                  'flex h-full min-w-px flex-1 items-end rounded-sm outline-none',
+                  'flex h-full min-w-px flex-1 items-end justify-center rounded-sm outline-none',
                   'hover:bg-accent/40 focus-visible:bg-accent/60',
                   activeIndex === index && 'bg-accent/40',
+                  selectedDay === day.day && 'bg-primary/15',
                 )}
               >
                 {noArticles ? (
@@ -103,15 +132,16 @@ export function TrendBarChart({ days, mode }: { days: TrendDay[]; mode: TrendMod
                   // misread as a short bar.
                   <span
                     aria-hidden
-                    className="w-full border-t-2 border-dotted border-muted-foreground/60"
+                    className="w-[45%] max-w-2.5 border-t-2 border-dotted border-muted-foreground/60"
                   />
                 ) : (
                   <span
                     aria-hidden
                     className={cn(
-                      'w-full rounded-t-[2px] bg-chart-1 transition-[height]',
+                      'w-[45%] max-w-2.5 rounded-t-[2px] bg-chart-1 transition-[height]',
                       day.matches === 0 && 'bg-muted-foreground/30',
                       (day.partial || lowSample) && 'opacity-55',
+                      selectedDay === day.day && 'bg-primary',
                     )}
                     style={{
                       height: day.matches === 0 ? '2px' : `max(2px, ${heightPct}%)`,

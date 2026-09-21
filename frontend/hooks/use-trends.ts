@@ -9,10 +9,6 @@ export function useTrends(params: TrendsParams) {
   // something to chart.
   const key = buildTrendsKey(params)
   const { data, error, isLoading, isValidating, mutate } = useSWR<TrendSeries>(key, fetcher, {
-    // The chart should dim while a new query loads rather than collapsing back
-    // to a skeleton on every debounced keystroke. This also makes `isLoading`
-    // true only when nothing is cached, which is exactly the skeleton case.
-    keepPreviousData: true,
     revalidateOnFocus: false,
   })
 

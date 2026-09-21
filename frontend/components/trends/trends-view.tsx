@@ -11,6 +11,7 @@ import { useTrends } from '@/hooks/use-trends'
 import { sinceFromRange, type TimeRangeValue } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { TrendBarChart, type TrendMode } from './trend-bar-chart'
+import { TrendArticles } from './trend-articles'
 import { TrendsToolbar } from './trends-toolbar'
 
 function isTimeRange(value: string | null): value is TimeRangeValue {
@@ -78,9 +79,8 @@ export function TrendsView() {
         selectedTopics={selectedTopics}
         onSelectedTopicsChange={changeSelectedTopics}
         resultLabel={
-          // Gated on `q`, not just on `series`: `keepPreviousData` deliberately
-          // holds the last series when the SWR key goes null, so clearing the
-          // box would otherwise leave a count above an empty state.
+          // Clearing the query hides the result count immediately, even while
+          // the debounced search and SWR state settle.
           q && series
             ? `${series.totals.matches.toLocaleString()} mention${
                 series.totals.matches === 1 ? '' : 's'
@@ -91,8 +91,10 @@ export function TrendsView() {
       />
       <div className="min-h-0 flex-1 overflow-auto p-4">
         <TrendsBody
+          key={[q, since, ...selectedTopics].join('|')}
           q={q}
           mode={mode}
+          topics={selectedTopics}
           series={series}
           isLoading={isLoading}
           isRefreshing={isRefreshing}
@@ -107,6 +109,7 @@ export function TrendsView() {
 function TrendsBody({
   q,
   mode,
+  topics,
   series,
   isLoading,
   isRefreshing,
@@ -115,12 +118,14 @@ function TrendsBody({
 }: {
   q: string
   mode: TrendMode
+  topics: string[]
   series: ReturnType<typeof useTrends>['series']
   isLoading: boolean
   isRefreshing: boolean
   error: unknown
   onRetry: () => void
 }) {
+  const [selectedDay, setSelectedDay] = useState<string | null>(null)
   if (!q) {
     return (
       <Empty className="h-full">
@@ -186,7 +191,19 @@ function TrendsBody({
 
   return (
     <div className={cn('transition-opacity', isRefreshing && 'opacity-60')}>
-      <TrendBarChart days={series.days} mode={mode} />
+      <TrendBarChart
+        days={series.days}
+        mode={mode}
+        selectedDay={selectedDay}
+        onSelectDay={setSelectedDay}
+      />
+      <TrendArticles
+        key={selectedDay ?? 'latest'}
+        series={series}
+        selectedDay={selectedDay}
+        topics={topics}
+        onClearDay={() => setSelectedDay(null)}
+      />
     </div>
   )
 }

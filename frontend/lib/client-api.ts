@@ -77,6 +77,7 @@ export type ArticlesParams = {
   sources?: string[]
   topics?: string[]
   q?: string
+  maxPerSource?: number
 }
 
 export type SourcesParams = {
@@ -116,6 +117,7 @@ export function buildArticlesKey(base: string, params: ArticlesParams): string {
   if (params.limit) sp.set('limit', String(params.limit))
   if (params.cursor) sp.set('cursor', params.cursor)
   if (params.q) sp.set('q', params.q)
+  if (params.maxPerSource) sp.set('max_per_source', String(params.maxPerSource))
   for (const s of params.sources ?? []) sp.append('source', s)
   for (const topic of params.topics ?? []) sp.append('topic', topic)
   const qs = sp.toString()

@@ -12,16 +12,17 @@ export type UseArticlesOptions = {
   topics?: string[]
   q?: string
   limit?: number
+  maxPerSource?: number
 }
 
 export function useArticles(options: UseArticlesOptions) {
-  const { base = '/api/articles', since, until, sources, topics, q, limit = 25 } = options
+  const { base = '/api/articles', since, until, sources, topics, q, limit = 25, maxPerSource } = options
 
   const getKey = (pageIndex: number, previousPage: ArticlePage | null) => {
     if (previousPage && previousPage.next_cursor === null) return null
     const cursor = pageIndex === 0 ? null : previousPage?.next_cursor
     if (pageIndex !== 0 && !cursor) return null
-    return buildArticlesKey(base, { since, until, sources, topics, q, limit, cursor })
+    return buildArticlesKey(base, { since, until, sources, topics, q, limit, cursor, maxPerSource })
   }
 
   const { data, error, isLoading, isValidating, size, setSize, mutate } =
