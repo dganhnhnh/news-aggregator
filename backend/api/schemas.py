@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import date, datetime
 from typing import Generic, TypeVar
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from models.storage_models import (
     ArticleFeedItem,
+    DailyArticleCount,
     HighlightSegment,
     StoryFeedItem,
     TopicRefItem,
@@ -181,6 +183,62 @@ class CursorPage(BaseModel, Generic[T]):
     items: list[T]
     next_cursor: str | None
     window: FeedWindow
+
+
+class TrendDay(BaseModel):
+    # Named `day` rather than `date`: this module uses postponed annotation
+    # evaluation, and a field named after its own type is a resolution hazard.
+    day: date
+    matches: int
+    articles: int
+    partial: bool
+
+
+class TrendTotals(BaseModel):
+    matches: int
+    articles: int
+
+
+class TrendSeries(BaseModel):
+    """A query's daily mention counts over one window.
+
+    No `share` field: the client divides `matches` by `articles` itself, so
+    there is exactly one place the ratio can be computed wrong.
+    """
+
+    query: str
+    window: FeedWindow
+    totals: TrendTotals
+    days: list[TrendDay]
+
+    @classmethod
+    def from_storage(
+        cls,
+        *,
+        query: str,
+        since: datetime,
+        until: datetime,
+        days: Sequence[DailyArticleCount],
+    ) -> "TrendSeries":
+        return cls(
+            query=query,
+            window=FeedWindow(since=since, until=until),
+            # Summed from the buckets rather than counted separately, so the
+            # header and the bars cannot tell different stories.
+            totals=TrendTotals(
+                matches=sum(day.matches for day in days),
+                articles=sum(day.articles for day in days),
+            ),
+            days=[
+                TrendDay(
+                    day=day.day,
+                    matches=day.matches,
+                    articles=day.articles,
+                    partial=day.partial,
+                )
+                for day in days
+            ],
+        )
 
 
 class ResearchRequest(BaseModel):

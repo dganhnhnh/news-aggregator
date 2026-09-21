@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi.testclient import TestClient
 
@@ -12,6 +12,7 @@ from api.main import create_app
 from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
+    DailyArticleCount,
     SourceItem,
     StoryDetailItem,
     StoryFeedItem,
@@ -90,6 +91,14 @@ class FakeStorage:
                 )
             ],
         )
+        # Three day shapes in one series: a partial edge day, a day the
+        # crawler produced nothing at all, and an ordinary day.
+        self._trend_days = (
+            DailyArticleCount(day=date(2026, 1, 1), matches=2, articles=5, partial=True),
+            DailyArticleCount(day=date(2026, 1, 2), matches=0, articles=0, partial=False),
+            DailyArticleCount(day=date(2026, 1, 3), matches=1, articles=4, partial=False),
+        )
+        self.trend_call = None
         self.list_stories_source_slugs = None
         self.list_stories_topic_slugs = None
         self.feed_article_topic_slugs = None
@@ -130,6 +139,18 @@ class FakeStorage:
     ):
         self.feed_article_topic_slugs = topic_slugs
         return self._feed_items[:limit]
+
+    async def daily_article_counts(
+        self, *, since, until, query, source_slugs=None, topic_slugs=None
+    ):
+        self.trend_call = {
+            "since": since,
+            "until": until,
+            "query": query,
+            "source_slugs": source_slugs,
+            "topic_slugs": topic_slugs,
+        }
+        return self._trend_days
 
     async def source_articles(
         self, slug, *, since, until, limit, cursor=None, topic_slugs=None, query=None
@@ -382,3 +403,84 @@ def test_cursor_round_trip() -> None:
     event_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     decoded = decode_cursor(encode_cursor(event_at, 42))
     assert decoded == (event_at, 42)
+
+
+def test_trends_returns_a_dense_series_with_totals() -> None:
+    client = _client()
+    response = client.get(
+        "/api/trends?q=ai&since=2026-01-01T00:00:00Z&until=2026-01-04T00:00:00Z"
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "query": "ai",
+        "window": {
+            "since": "2026-01-01T00:00:00Z",
+            "until": "2026-01-04T00:00:00Z",
+        },
+        # Summed from the buckets, never counted independently.
+        "totals": {"matches": 3, "articles": 9},
+        "days": [
+            {"day": "2026-01-01", "matches": 2, "articles": 5, "partial": True},
+            # A day with no articles at all survives as a zero row rather than
+            # dropping out, so the chart can draw it as a crawl gap.
+            {"day": "2026-01-02", "matches": 0, "articles": 0, "partial": False},
+            {"day": "2026-01-03", "matches": 1, "articles": 4, "partial": False},
+        ],
+    }
+
+
+def test_trends_requires_a_non_blank_query() -> None:
+    client = _client()
+    assert client.get("/api/trends").status_code == 422
+    assert client.get("/api/trends?q=%20%20").status_code == 400
+
+
+def test_trends_passes_source_and_topic_filters() -> None:
+    # The regression guard for "Trends and Articles can never disagree": both
+    # filters have to reach storage, or the two views answer different
+    # questions about the same query.
+    app = create_app()
+    storage = FakeStorage()
+    app.dependency_overrides[get_storage] = lambda: storage
+    client = TestClient(app)
+
+    response = client.get("/api/trends?q=ai&source=a&source=b&topic=open-source")
+
+    assert response.status_code == 200
+    assert storage.trend_call is not None
+    assert storage.trend_call["source_slugs"] == ["a", "b"]
+    assert storage.trend_call["topic_slugs"] == ["open-source"]
+    assert storage.trend_call["query"] == "ai"
+
+
+def test_trends_rejects_an_oversized_window() -> None:
+    client = _client()
+    response = client.get(
+        "/api/trends?q=ai&since=2020-01-01T00:00:00Z&until=2026-01-01T00:00:00Z"
+    )
+    assert response.status_code == 400
+    assert "maximum" in response.json()["detail"]
+
+
+def test_trends_rejects_an_inverted_window() -> None:
+    client = _client()
+    response = client.get(
+        "/api/trends?q=ai&since=2026-01-04T00:00:00Z&until=2026-01-01T00:00:00Z"
+    )
+    assert response.status_code == 400
+
+
+def test_trends_treats_a_naive_since_as_utc() -> None:
+    # A bound with no offset must not be read in the host's local time: the
+    # day buckets are computed from these values, so an implicit local zone
+    # would shift every bar.
+    app = create_app()
+    storage = FakeStorage()
+    app.dependency_overrides[get_storage] = lambda: storage
+    client = TestClient(app)
+
+    response = client.get("/api/trends?q=ai&since=2026-01-01T00:00:00")
+
+    assert response.status_code == 200
+    assert storage.trend_call is not None
+    assert storage.trend_call["since"] == datetime(2026, 1, 1, tzinfo=timezone.utc)

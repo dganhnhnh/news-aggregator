@@ -9,7 +9,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import (
@@ -64,6 +64,7 @@ from models.storage_models import (
     ClusterMergeResult,
     ClusterRebuildResult,
     CorpusMetrics,
+    DailyArticleCount,
     Distribution,
     EmbeddingCandidate,
     EmbeddingRecord,
@@ -461,6 +462,33 @@ def _capped_error_types(rows: Sequence[Any], limit: int) -> tuple[FailureTypeCou
             )
         )
     return tuple(kept)
+
+
+def _utc_day_span(since: datetime, until: datetime) -> list[tuple[date, bool]]:
+    """Every UTC calendar day the half-open window [since, until) touches.
+
+    The bool marks a day the window only partly covers. Both ends can be
+    partial, and the last one almost always is, since `until` defaults to now.
+
+    The window is half-open because `_feed_filters` emits `event_at < until`,
+    hence the microsecond step back: a window ending exactly at midnight must
+    not emit a bucket for the day it stops on. That bucket could only ever be
+    empty, and a permanent trailing zero bar is indistinguishable from a real
+    gap in the crawl.
+    """
+    if until <= since:
+        return []
+    start = since.astimezone(timezone.utc)
+    end = until.astimezone(timezone.utc)
+    last = (end - timedelta(microseconds=1)).date()
+    spans: list[tuple[date, bool]] = []
+    day = start.date()
+    while day <= last:
+        day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        day_end = day_start + timedelta(days=1)
+        spans.append((day, day_start < start or day_end > end))
+        day += timedelta(days=1)
+    return spans
 
 
 class PostgresRawStorage:
@@ -2365,7 +2393,39 @@ class PostgresRawStorage:
         )
 
     @staticmethod
+    def _search_match(query: str | None) -> Any | None:
+        """The single definition of "this article matches this query".
+
+        The feed puts it in a WHERE clause and the trend histogram puts it in a
+        FILTER clause, so it cannot live inline in either: a change to how
+        search works must not be able to make the two disagree about what
+        counts as a hit.
+        """
+        if not query:
+            return None
+        return raw_articles.c.search_tsv.op("@@")(
+            func.websearch_to_tsquery("english", query)
+        )
+
+    @staticmethod
+    def _source_filter(source_slugs: Sequence[str] | None) -> Any | None:
+        """Source scoping as a predicate rather than a join.
+
+        `raw_articles.source_id` is nullable, so joining `sources` would
+        quietly drop orphan rows — harmless in a feed, wrong in an aggregate
+        whose denominator is supposed to be every article in the window. As a
+        subquery filter an unfiltered call counts every row, and a filtered one
+        excludes NULL sources, which is what both callers want.
+        """
+        if not source_slugs:
+            return None
+        return raw_articles.c.source_id.in_(
+            select(sources.c.id).where(sources.c.slug.in_(source_slugs))
+        )
+
+    @classmethod
     def _feed_filters(
+        cls,
         *,
         since: datetime,
         until: datetime,
@@ -2381,12 +2441,9 @@ class PostgresRawStorage:
             filters.append(
                 tuple_(raw_articles.c.event_at, raw_articles.c.id) < tuple_(*cursor)
             )
-        if query:
-            filters.append(
-                raw_articles.c.search_tsv.op("@@")(
-                    func.websearch_to_tsquery("english", query)
-                )
-            )
+        match = cls._search_match(query)
+        if match is not None:
+            filters.append(match)
         if topic_slugs:
             filters.append(
                 select(1)
@@ -2565,6 +2622,103 @@ class PostgresRawStorage:
                     )
                 )
             return items
+
+    @classmethod
+    def _daily_counts_statement(
+        cls,
+        *,
+        since: datetime,
+        until: datetime,
+        query: str,
+        source_slugs: Sequence[str] | None,
+        topic_slugs: Sequence[str] | None,
+    ) -> Any:
+        # Explicit zone. `date_trunc` on a timestamptz otherwise buckets in the
+        # session TimeZone, which nothing here sets, so the same window would
+        # bucket differently per deployment. Every other date filter in this
+        # file is UTC and the buckets have to match. Three-argument date_trunc
+        # needs PostgreSQL 16, which deployments/docker-compose.yml pins.
+        day = func.date_trunc("day", raw_articles.c.event_at, "UTC")
+        # `cursor=None` because a histogram is not a page, and `query=None`
+        # because the match predicate belongs only in the FILTER below. Keeping
+        # it out of the WHERE is precisely what makes `articles` a denominator
+        # rather than a second copy of `matches`.
+        filters = cls._feed_filters(
+            since=since,
+            until=until,
+            cursor=None,
+            query=None,
+            topic_slugs=topic_slugs,
+        )
+        source_filter = cls._source_filter(source_slugs)
+        if source_filter is not None:
+            filters.append(source_filter)
+        # One scan, two counts. Two separate queries would each take their own
+        # READ COMMITTED snapshot, and an insert landing between them could
+        # return matches > articles -- a bar over 100% in share mode.
+        #
+        # Putting the match predicate in a FILTER means the GIN index on
+        # search_tsv goes unused and this becomes a BRIN-pruned window scan.
+        # That is the right trade: the denominator has to visit every article
+        # in the window by definition, and no text index can accelerate
+        # counting the rows that do not match.
+        return (
+            select(
+                day.label("day"),
+                func.count().label("articles"),
+                func.count().filter(cls._search_match(query)).label("matches"),
+            )
+            .where(*filters)
+            .group_by(day)
+            .order_by(day)
+        )
+
+    async def daily_article_counts(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        query: str,
+        source_slugs: Sequence[str] | None = None,
+        topic_slugs: Sequence[str] | None = None,
+    ) -> tuple[DailyArticleCount, ...]:
+        """Per-UTC-day mention counts for `query`, each with that day's total.
+
+        Deliberately unlike `feed_articles`: no `max_per_source` lateral and no
+        `limit`, because a histogram counts every matching row rather than
+        assembling a readable page out of them. The returned series is dense —
+        days PostgreSQL had no rows for come back as zeros, so callers never
+        have to distinguish "absent from the result set" from "nothing
+        happened".
+
+        The filters apply to both numbers, so `matches / articles` is a share
+        of the same population and cannot exceed 1.
+        """
+        stmt = self._daily_counts_statement(
+            since=since,
+            until=until,
+            query=query,
+            source_slugs=source_slugs,
+            topic_slugs=topic_slugs,
+        )
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(stmt)).all()
+        # The bucket stays a timestamptz all the way here on purpose: casting
+        # it to a date in SQL would re-apply the session TimeZone and undo the
+        # explicit 'UTC' above.
+        counted = {
+            row.day.astimezone(timezone.utc).date(): (int(row.articles), int(row.matches))
+            for row in rows
+        }
+        return tuple(
+            DailyArticleCount(
+                day=day,
+                matches=counted.get(day, (0, 0))[1],
+                articles=counted.get(day, (0, 0))[0],
+                partial=partial,
+            )
+            for day, partial in _utc_day_span(since, until)
+        )
 
     @staticmethod
     def _research_article_filters(

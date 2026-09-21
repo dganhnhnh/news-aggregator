@@ -185,3 +185,23 @@ export type StoryPage = {
     until: string
   }
 }
+
+export type TrendDay = {
+  day: string
+  matches: number
+  articles: number
+  partial: boolean
+}
+
+export type TrendSeries = {
+  query: string
+  window: {
+    since: string
+    until: string
+  }
+  totals: {
+    matches: number
+    articles: number
+  }
+  days: TrendDay[]
+}

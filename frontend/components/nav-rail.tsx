@@ -27,8 +27,8 @@ const NAV_ITEMS = [
     key: 'trends',
     label: 'Trends',
     icon: TrendingUp,
-    href: null,
-    available: false,
+    href: '/trends',
+    available: true,
   },
   {
     key: 'feeds',
@@ -51,6 +51,7 @@ export function NavRail() {
   const isArticlesActive =
     pathname === '/' || pathname.startsWith('/sources') || pathname.startsWith('/articles')
   const isStoriesActive = pathname.startsWith('/stories')
+  const isTrendsActive = pathname.startsWith('/trends')
   const isFeedsActive = pathname.startsWith('/feeds')
   const isAskActive = pathname.startsWith('/ask')
 
@@ -73,6 +74,7 @@ export function NavRail() {
             const isActive =
               (item.key === 'articles' && isArticlesActive) ||
               (item.key === 'stories' && isStoriesActive) ||
+              (item.key === 'trends' && isTrendsActive) ||
               (item.key === 'feeds' && isFeedsActive) ||
               (item.key === 'ask' && isAskActive)
             const Icon = item.icon

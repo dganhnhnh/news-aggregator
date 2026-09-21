@@ -6,6 +6,7 @@ import type {
   StoryDetail,
   StoryPage,
   TopicCatalog,
+  TrendSeries,
 } from './types'
 
 export class ApiError extends Error {
@@ -121,6 +122,28 @@ export function buildArticlesKey(base: string, params: ArticlesParams): string {
   return qs ? `${base}?${qs}` : base
 }
 
+export type TrendsParams = {
+  q: string
+  since?: string
+  until?: string
+  sources?: string[]
+  topics?: string[]
+}
+
+// Returns null for a blank query, which is SWR's "do not fetch" signal: the
+// endpoint requires `q`, so an empty box must not produce a request at all.
+export function buildTrendsKey(params: TrendsParams): string | null {
+  const q = params.q.trim()
+  if (!q) return null
+  const sp = new URLSearchParams()
+  sp.set('q', q)
+  if (params.since) sp.set('since', params.since)
+  if (params.until) sp.set('until', params.until)
+  for (const s of params.sources ?? []) sp.append('source', s)
+  for (const topic of params.topics ?? []) sp.append('topic', topic)
+  return `/api/trends?${sp.toString()}`
+}
+
 export function buildSourcesKey(params: SourcesParams = {}): string {
   const sp = new URLSearchParams()
   if (params.since) sp.set('since', params.since)
@@ -136,4 +159,5 @@ export type {
   StoryDetail,
   StoryPage,
   TopicCatalog,
+  TrendSeries,
 }

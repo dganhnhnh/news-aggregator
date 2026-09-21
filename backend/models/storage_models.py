@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from core.html_content import FEED_CONTENT_KEY, FEED_SUMMARY_KEY
@@ -156,6 +156,27 @@ class ArticleFeedItem:
     # Populated only when the feed was filtered by a search query.
     title_highlights: tuple[HighlightSegment, ...] | None = None
     excerpt_highlights: tuple[HighlightSegment, ...] | None = None
+
+
+@dataclass(frozen=True)
+class DailyArticleCount:
+    """One UTC calendar day of a query's mention count, with its denominator.
+
+    `articles` counts every article that day passing the same source/topic
+    filters but *not* the query, so `matches / articles` is a share. That
+    denominator is the point: daily crawl volume on this corpus swings by more
+    than an order of magnitude, so a bare `matches` series is mostly a picture
+    of how much the crawler fetched. `articles == 0` means nothing was crawled
+    at all, which reads very differently from a day with articles and no
+    matches, and the two must stay distinguishable.
+    """
+
+    day: date
+    matches: int
+    articles: int
+    # The day is only partly inside the requested window. Normal at both ends,
+    # and the last bucket is almost always partial since `until` defaults to now.
+    partial: bool
 
 
 @dataclass(frozen=True)
