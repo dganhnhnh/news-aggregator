@@ -751,3 +751,181 @@ SQL
   và 2 `abandoned`. Không dùng trạng thái Airflow thành công hoặc queue đã drain
   để suy ra SLA, uptime hay tỷ lệ crawl thành công. Không dùng dự phóng 2,5× ở
   T11.7, mục tiêu publication-to-ingestion latency, hay accuracy chưa được đo.
+
+---
+
+## T14 — Boilerplate trong text embed, trước và sau khi sửa (2026-09-23)
+
+Xuất phát từ một cụm hiển thị trên UI gồm hai bài không liên quan: *"The AI
+Researcher Who Just Quit Anthropic…"* (wired.com) và *"With another huge
+infusion of cash, Stoke Space goes even bigger"* (arstechnica.com). Tại thời
+điểm đo, cụm đó (`clusters.id = 2436`) đã có **29 thành viên**, 28 Wired và 1
+Ars, trải 14 ngày.
+
+### Nguyên nhân đo được
+
+`services/text.py:first_paragraphs` lấy 1.200 ký tự đầu của Markdown đã crawl,
+và với Wired toàn bộ 1.200 ký tự đó là banner cookie của Condé Nast ("Privacy
+Center…"). Cả 29 thành viên của cụm có **cùng một chuỗi body** sau
+`first_paragraphs` — chỉ có 1 body phân biệt trong 29 bài. `is_nav_dense` không
+chặn được vì banner là văn xuôi, không phải danh sách link.
+
+| Nguồn | Bài có body bắt đầu bằng banner CMP |
+| --- | --- |
+| wired.com | 37/37 |
+| arstechnica.com | 13/160 |
+
+Similarity lưu trong `cluster_members` cho thấy cụm tự củng cố: bài thứ hai vào
+với 0,7686; các bài sau vào với 0,80–0,93 khi centroid đã ngả về phía banner.
+
+```sql
+SELECT cm.cluster_id, cm.article_id, round(cm.similarity::numeric, 4), cm.added_at
+FROM cluster_members cm WHERE cm.cluster_id = 2436 ORDER BY cm.added_at;
+```
+
+### Snapshot database trước khi sửa
+
+Đo lúc **2026-09-23 11:09:29 UTC** trên `news-radar-db-1`.
+
+| Chỉ số | Giá trị |
+| --- | --- |
+| `raw_articles` | 6.909 |
+| `article_embeddings` | 6.901 |
+| Cluster có thành viên | 5.987 |
+| Cluster nhiều bài | 397 |
+| Cluster nhiều source | 194 |
+| Cluster lớn nhất | 30 bài |
+| Cluster trải > 72h | 35 |
+| Bài nằm trong cluster nhiều bài | 1.311 |
+
+### Replay offline: corpus 6.873 bài, export 2026-09-22
+
+Harness ngoài repo (`.scratch-boilerplate/`, không commit) embed lại corpus bằng
+đúng `FastEmbedEmbedder` rồi chạy lại `services/clustering.py` với threshold
+0,75 và window 72h. Biến duy nhất là text đưa vào model. Thước đo chất lượng là
+cosine giữa **embedding của riêng title** hai bài bị gom chung — một proxy, không
+phải nhãn người gán; cặp ≥0,60 tính là gom đúng, <0,45 tính là gom sai.
+
+| | Text hiện tại | Sau khi lọc boilerplate |
+| --- | --- | --- |
+| Cặp bài bị gom chung | 3.849 | 3.632 |
+| Cặp gom đúng (≥0,60) | 3.095 | 3.170 |
+| Cặp gom sai (<0,45) | 409 | 136 |
+| Tỉ lệ gom sai | 10,6% | 3,7% |
+| Cluster nhiều source | 201 | 222 |
+| Cluster coherence <0,35 | 4 (18 bài) | 1 (2 bài) |
+
+Sweep threshold trên cùng corpus:
+
+| Threshold | Hiện tại: đúng / sai / %sai / đa nguồn | Sau khi lọc: đúng / sai / %sai / đa nguồn |
+| --- | --- | --- |
+| 0,70 | 3.912 / 1.085 / 17,9% / 294 | 3.933 / 323 / 6,2% / 320 |
+| 0,72 | 3.573 / 859 / 16,6% / 252 | 3.646 / 229 / 5,1% / 282 |
+| 0,75 | 3.095 / 409 / 10,6% / 201 | 3.170 / 136 / 3,7% / 222 |
+| 0,78 | 2.584 / 160 / 5,4% / 133 | 2.549 / 14 / 0,5% / 154 |
+
+Hai số đo riêng của cặp bài trong cụm 2436: similarity 0,769 → 0,207. Toàn bộ
+cặp trong wired.com vượt 0,75: 125/666 → 1/666.
+
+### Giới hạn diễn giải
+
+- Thước đo "đúng/sai" dựa trên similarity của title, không phải nhãn người gán.
+  Nó không thiên vị bản lọc: text embed hiện tại cũng chứa title.
+- Replay sắp xếp bài theo `event_at`, còn worker thật xử lý theo thứ tự claim
+  của queue, nên số cluster trong replay (404 nhiều bài / 201 đa nguồn) không
+  trùng khít số trong database (397 / 194).
+- Sweep chỉ nói bản lọc trội hơn ở mọi threshold đã thử. Không dùng nó làm cơ sở
+  đổi `CLUSTER_THRESHOLD`; việc đó cần sweep riêng sau khi corpus đã sạch.
+- Lọc boilerplate **không** động tới cụm bài lặp theo mẫu hằng ngày (NYT
+  Connections, Pokémon deals, lịch bóng đá của mashable.com). Cụm lớn nhất vẫn
+  là 32 bài ở cả hai bản, và số cluster trải > 72h vẫn là 35–36.
+
+### Thay đổi đã áp dụng
+
+Profile chrome theo từng source, dựng từ document frequency của dòng đã chuẩn
+hoá (`core/boilerplate.py`), lưu ở `source_boilerplate`, áp dụng trong
+`services/text.py:article_text` **trước** khi xếp hạng text — vì gỡ banner chính
+là thứ quyết định nấc 2 chứa bài báo hay chứa cookie policy. Lệnh
+`news-worker boilerplate-refresh` dựng lại profile (lock riêng, có dòng
+`worker_runs`), chạy hằng đêm trong `news_maintenance`.
+
+Chạy trên DB thật, 2026-09-23:
+
+| Bước | Kết quả |
+| --- | --- |
+| `boilerplate-refresh` | 703 source xét, **69 profile**, 2.270 dòng; 634 source bị bỏ qua vì < 5 bài |
+| `embed --reprocess --since 2026-08-01` | 6.931 requeue, **3.333 embed lại**, 3.598 giữ nguyên hash |
+| `cluster --since 2026-08-01` | 3.333 claim, 2.858 cluster mới, 475 attach, 3.324 đánh giá lại, 2.327 cluster đóng |
+| `cluster --repair` | 0 drift |
+
+**3.333/6.931 = 48% corpus đổi text embed** — đó là phần thực sự có chrome bị gỡ.
+
+### Đo lại trên database sau khi sửa
+
+Cùng harness, cùng judge title-only như phần trước.
+
+| Chỉ số | Trước | Sau |
+| --- | --- | --- |
+| Cặp bài bị gom chung | 3.700 | 2.988 |
+| Cặp gom đúng (≥0,60) | 2.815 | 2.620 |
+| Cặp gom sai (<0,45) | **475** | **102** |
+| Tỉ lệ gom sai | **12,8%** | **3,4%** |
+| Mean coherence | 0,7694 | 0,7737 |
+| Cluster coherence <0,35 | 4 (19 bài) | 1 (2 bài) |
+| Cluster nhiều bài | 397 | 359 |
+| Cluster nhiều source | 194 | 161 |
+| Bài trong cluster nhiều bài | 1.311 | 1.154 |
+| Cluster trải > 72h | 35 | 33 |
+| Cluster lớn nhất | 30 | 30 |
+
+Cụm 29 bài của Wired đã biến mất, cụm 9 bài gom theo chrome của GitHub cũng vậy.
+**Cặp bài ban đầu đã tách: article 7161 → cluster 7640, article 7562 → cluster
+6442.** Cụm lớn nhất còn lại là NYT Connections (30 bài) — đúng phần đã dự báo là
+lọc boilerplate không chạm tới.
+
+Phân bố nguồn text sau khi sửa: `content` 5.754, `feed_summary` 1.023, `title` 154.
+
+### Vì sao số cặp gom đúng giảm 2.815 → 2.620
+
+Bóc theo từng cặp: giữ 2.654 cặp (3,1% sai), mất 1.046 cặp (**37,7% sai**), thêm
+334 cặp (6,3% sai). Phần mất đi chủ yếu là rác, nhưng vẫn mất 441 cặp "đúng" theo
+judge. Hai nguyên nhân, đo được riêng:
+
+1. **Judge bị nhiễu ở loạt bài cùng khuôn của một tờ báo.** 368/441 cặp mất là
+   content/content, và chỉ 58% cùng source so với baseline 85% ở nhóm giữ lại —
+   phần lớn là deal roundup, "How to watch…" cùng một tờ, title giống nhau nhưng
+   nội dung khác hẳn. Judge title-only chấm chúng là đúng; chúng không đúng.
+2. **Lần recluster này là rebuild *một phần*, sai thứ tự.** Chỉ 3.333 bài đổi text
+   bị tách ra và đánh giá lại, theo thứ tự claim của queue chứ không theo
+   `event_at`; 3.598 bài còn lại giữ nguyên cụm cũ. Greedy clustering phụ thuộc
+   thứ tự, nên đây không phải trạng thái mà một lần rebuild sạch sẽ cho ra.
+
+Để tách hai hiệu ứng, replay lại đúng policy production trên **chính các vector
+mới trong DB**, theo thứ tự `event_at` (`.scratch-boilerplate/replay_db.py`):
+
+| Chỉ số | DB trước | DB sau (rebuild một phần) | Replay trên vector mới |
+| --- | --- | --- | --- |
+| Cluster nhiều bài | 397 | 359 | 420 |
+| Cluster nhiều source | 194 | 161 | **228** |
+| Bài trong cluster nhiều bài | 1.311 | 1.154 | 1.344 |
+| Cặp gom đúng | 2.815 | 2.620 | **3.172** |
+| Cặp gom sai | 475 | 102 | 134 |
+| Tỉ lệ gom sai | 12,8% | 3,4% | 3,7% |
+| Cluster coherence <0,35 | 4 | 1 | 1 |
+
+Replay khớp với dự báo offline ở phần trên (3.170 cặp đúng, 222 cluster đa nguồn).
+Kết luận: embedding mới tốt hơn hẳn trên mọi chỉ số; phần hụt trong DB là hệ quả
+của rebuild một phần, không phải của thay đổi. Một lần rebuild sạch
+(`cluster_members`/`clusters` xoá rồi chạy lại theo `event_at`) sẽ lấy lại
+khoảng 67 cluster đa nguồn và ~550 cặp đúng. Đó là thao tác phá huỷ, chưa chạy.
+
+### Điểm còn hở
+
+- **arstechnica.com chưa được lọc.** Banner CMP của nó chỉ xuất hiện ở 13/169
+  bài (7,7%), quá thấp so với sàn DF 0,30 nên profile của nó chỉ có 4 dòng, và
+  bài Ars trong cặp gốc vẫn embed kèm banner. Hạ DF xuống dưới 7,7% sẽ ăn vào text
+  thật; sửa đúng phải là luật cross-source, nhưng luật đó phá nguyên tắc "một dòng
+  là chrome khi *chính source này* lặp lại nó" và cần sweep riêng.
+- 634/703 source dưới ngưỡng 5 bài nên chưa có profile; chúng chiếm 11% corpus.
+- Profile là dữ liệu dẫn xuất và **không** tự động embed lại: đổi profile là tín
+  hiệu để operator chạy `embed --reprocess`, DAG hằng đêm không tự làm việc đó.

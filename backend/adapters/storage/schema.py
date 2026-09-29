@@ -44,6 +44,35 @@ sources = Table(
     UniqueConstraint("slug", name="uq_sources_slug"),
 )
 
+# One row per source whose corpus is large enough to say what it repeats. The
+# lines are `core.boilerplate` keys (normalized visible text), not raw Markdown,
+# and they are derived data: dropping the table only costs a refresh.
+source_boilerplate = Table(
+    "source_boilerplate",
+    metadata,
+    Column(
+        "source_id",
+        BigInteger,
+        ForeignKey(
+            "sources.id",
+            name="fk_source_boilerplate_source_id_sources",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    ),
+    Column("lines", JSONB, nullable=False, server_default=text("'[]'::jsonb")),
+    # How many articles the profile was built from. A profile built from 6
+    # articles and one built from 200 are read very differently when a line
+    # turns out to have been article text after all.
+    Column("sample_size", Integer, nullable=False),
+    Column(
+        "refreshed_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+)
+
 raw_articles = Table(
     "raw_articles",
     metadata,

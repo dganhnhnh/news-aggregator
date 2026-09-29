@@ -76,6 +76,12 @@ class EmbedWorker(Worker):
 
         stats.reclaimed = await queue.reclaim_expired(STAGE)
 
+        # One load for the whole run. A profile that changes mid-run would make
+        # two articles from the same source embed under different rules, and
+        # `news-worker boilerplate-refresh` is a separate command precisely so
+        # that cannot happen while a run is in flight.
+        profiles = await storage.boilerplate_profiles()
+
         if args.reprocess or args.model_changed:
             stats.requeued = await storage.reenqueue_embeddings(
                 since=ctx.window.start,
@@ -110,6 +116,7 @@ class EmbedWorker(Worker):
                     content=candidate.content,
                     feed_summary=candidate.feed_summary,
                     content_source=candidate.content_source,
+                    boilerplate=profiles.get(candidate.source_id, frozenset()),
                 )
                 if not text.strip():
                     # No title, no body, no dek: there is nothing to place in

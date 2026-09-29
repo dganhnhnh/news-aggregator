@@ -94,8 +94,11 @@ class ClassifyWorker(Worker):
                 set_hash=snapshot.set_hash if args.stale else None,
             )
 
+        # Keyword matching has to run over the same text the embedding was
+        # built from, or a topic could be awarded on a cookie banner's wording.
+        profiles = await storage.boilerplate_profiles()
         interrupted = await self._run_classification(
-            ctx, storage, queue, locked_by, snapshot, args, stats
+            ctx, storage, queue, locked_by, snapshot, args, stats, profiles
         )
 
         logger.info(
@@ -126,6 +129,7 @@ class ClassifyWorker(Worker):
         snapshot: Any,
         args: argparse.Namespace,
         stats: ClassifyRunStats,
+        profiles: Mapping[int, frozenset[str]],
     ) -> bool:
         limit = args.limit or None
         while not ctx.shutdown.is_set():
@@ -162,6 +166,7 @@ class ClassifyWorker(Worker):
                         content=article.content,
                         feed_summary=article.feed_summary,
                         content_source=article.content_source,
+                        boilerplate=profiles.get(article.source_id, frozenset()),
                     )
                     classification = classify_article(
                         embedding=article.embedding,

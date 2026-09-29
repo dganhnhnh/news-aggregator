@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 
+from core.boilerplate import strip_boilerplate
 from core.content_quality import is_nav_dense
 from core.html_content import MIN_FEED_SUMMARY_CHARS
 from models.storage_models import ContentSource, TextKind
@@ -43,6 +44,7 @@ def article_text(
     content: str,
     feed_summary: str,
     content_source: ContentSource,
+    boilerplate: frozenset[str] = frozenset(),
 ) -> tuple[str, TextKind]:
     """Pick the body text to represent an article, and say which one it is.
 
@@ -62,7 +64,15 @@ def article_text(
 
     The caller adds the title itself; this function represents that final rung
     as `("", "title")` so no publisher chrome leaks into the text.
+
+    `boilerplate` is the calling source's chrome profile (see
+    `core/boilerplate.py`). It is applied before the ranking, not after, because
+    removing a consent panel is what decides whether rung 2 holds an article or
+    a cookie policy. The profile is applied to feed-supplied bodies too: rung 1
+    trusts publisher HTML, and a line the profile names is one the publisher
+    repeats on every article either way.
     """
+    content = strip_boilerplate(content, boilerplate)
     body = first_paragraphs(content) if content else ""
     summary = feed_summary.strip()
 
@@ -81,12 +91,14 @@ def article_embed_text(
     content: str,
     feed_summary: str,
     content_source: ContentSource,
+    boilerplate: frozenset[str] = frozenset(),
 ) -> tuple[str, TextKind]:
     """The exact string to embed, plus which text it was built from."""
     body, kind = article_text(
         content=content,
         feed_summary=feed_summary,
         content_source=content_source,
+        boilerplate=boilerplate,
     )
     clean_title = (title or "").strip()
     if clean_title and body:

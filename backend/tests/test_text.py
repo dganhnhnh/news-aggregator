@@ -1,3 +1,4 @@
+from core.boilerplate import normalize_line
 from services.text import article_embed_text, article_text, first_paragraphs
 
 
@@ -146,3 +147,86 @@ def test_a_title_only_article_embeds_just_the_title() -> None:
 
     assert kind == "title"
     assert text == "A headline"
+
+
+# A consent panel is prose, so `is_nav_dense` sees an ordinary article and the
+# crawled body wins rung 2 -- with the banner, not the article, inside the
+# embedder's window. This is what one source's profile is for.
+CONSENT_PANEL = (
+    "We and our partners use cookies and similar technologies to store and "
+    "access information on a device, such as unique IDs in cookies.\n"
+    "Some partners process personal data on the basis of legitimate interest, "
+    "which you may object to at any time via the preferences link.\n"
+)
+CONSENT_PROFILE = frozenset(
+    normalize_line(line) for line in CONSENT_PANEL.splitlines()
+)
+
+
+def test_a_consent_panel_survives_nav_density_and_wins_without_a_profile() -> None:
+    body, kind = article_text(
+        content=CONSENT_PANEL + "Stoke Space raised another round.",
+        feed_summary=DEK,
+        content_source="crawl",
+    )
+
+    assert kind == "content"
+    assert body.startswith("We and our partners")
+
+
+def test_the_source_profile_puts_the_article_back_at_the_front() -> None:
+    body, kind = article_text(
+        content=CONSENT_PANEL + "Stoke Space raised another round of funding.",
+        feed_summary=DEK,
+        content_source="crawl",
+        boilerplate=CONSENT_PROFILE,
+    )
+
+    assert kind == "content"
+    assert body == "Stoke Space raised another round of funding."
+
+
+def test_a_feed_body_is_stripped_too() -> None:
+    """Rung 1 trusts publisher HTML, but a line the profile names is one the
+    publisher repeats on every article either way."""
+    body, kind = article_text(
+        content=CONSENT_PANEL + "The article itself, as the feed shipped it.",
+        feed_summary=DEK,
+        content_source="feed_content",
+        boilerplate=CONSENT_PROFILE,
+    )
+
+    assert kind == "content"
+    assert body == "The article itself, as the feed shipped it."
+
+
+def test_stripping_a_page_down_to_nothing_falls_back_to_the_dek() -> None:
+    body, kind = article_text(
+        content=CONSENT_PANEL,
+        feed_summary=DEK,
+        content_source="crawl",
+        boilerplate=CONSENT_PROFILE,
+    )
+
+    assert kind == "feed_summary"
+    assert body == DEK
+
+
+def test_two_articles_behind_one_banner_stop_embedding_to_the_same_text() -> None:
+    first, _ = article_embed_text(
+        title="Crunch time for humanity",
+        content=CONSENT_PANEL + "An AI researcher quit Anthropic this week.",
+        feed_summary="",
+        content_source="crawl",
+        boilerplate=CONSENT_PROFILE,
+    )
+    second, _ = article_embed_text(
+        title="Stoke Space goes even bigger",
+        content=CONSENT_PANEL + "The launch startup raised another round.",
+        feed_summary="",
+        content_source="crawl",
+        boilerplate=CONSENT_PROFILE,
+    )
+
+    assert "cookies" not in first and "cookies" not in second
+    assert first != second

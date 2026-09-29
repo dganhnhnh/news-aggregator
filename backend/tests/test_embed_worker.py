@@ -36,6 +36,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
 def _candidate(
     article_id: int,
     *,
+    source_id: int | None = 7,
     content: str = "Body text.",
     feed_summary: str = "",
     content_source: str = "crawl",
@@ -44,6 +45,7 @@ def _candidate(
 ) -> EmbeddingCandidate:
     return EmbeddingCandidate(
         article_id=article_id,
+        source_id=source_id,
         title="Title",
         content=content,
         feed_summary=feed_summary,
@@ -53,13 +55,16 @@ def _candidate(
     )
 
 
-def _embedded_hash(candidate: EmbeddingCandidate) -> bytes:
+def _embedded_hash(
+    candidate: EmbeddingCandidate, boilerplate: frozenset[str] = frozenset()
+) -> bytes:
     """The hash the worker will compute for this candidate's chosen text."""
     text, _ = article_embed_text(
         title=candidate.title,
         content=candidate.content,
         feed_summary=candidate.feed_summary,
         content_source=candidate.content_source,
+        boilerplate=boilerplate,
     )
     return content_hash(text)
 
@@ -94,12 +99,22 @@ class FakeQueue:
 
 
 class FakeStorage:
-    def __init__(self, candidates: dict[int, EmbeddingCandidate]) -> None:
+    def __init__(
+        self,
+        candidates: dict[int, EmbeddingCandidate],
+        profiles: dict[int, frozenset[str]] | None = None,
+    ) -> None:
         self._candidates = candidates
+        self._profiles = profiles or {}
         self.upserted: list[EmbeddingRecord] = []
         self.reenqueue_calls: list[dict[str, Any]] = []
         self.reenqueue_result = 0
         self.ensure_calls: list[tuple[list[int], tuple[str, ...], int]] = []
+        self.profile_loads = 0
+
+    async def boilerplate_profiles(self) -> dict[int, frozenset[str]]:
+        self.profile_loads += 1
+        return dict(self._profiles)
 
     async def embeddable_articles(
         self, article_ids: Sequence[int]
@@ -229,6 +244,7 @@ def test_batch_failure_isolates_only_the_poison_pill_article() -> None:
             1: _candidate(1, content="good body"),
             2: EmbeddingCandidate(
                 article_id=2,
+                source_id=7,
                 title=None,
                 content="poison",
                 feed_summary="",

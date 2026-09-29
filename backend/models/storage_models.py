@@ -390,6 +390,7 @@ class EmbeddingCandidate:
     """
 
     article_id: int
+    source_id: int | None
     title: str | None
     content: str
     feed_summary: str
@@ -602,6 +603,20 @@ class PrototypeRebuildStats:
     rebuilt: int = 0
     skipped_unchanged: int = 0
     skipped_insufficient_exemplars: int = 0
+
+
+@dataclass
+class BoilerplateRefreshStats:
+    """What one `boilerplate-refresh` run did to `source_boilerplate`."""
+
+    considered: int = 0
+    refreshed: int = 0
+    unchanged: int = 0
+    skipped_too_few_articles: int = 0
+    # Sources whose corpus is big enough but that repeat nothing; their profile
+    # is stored empty so the run does not keep reconsidering them for free.
+    empty_profiles: int = 0
+    lines: int = 0
 
 
 @dataclass(frozen=True)

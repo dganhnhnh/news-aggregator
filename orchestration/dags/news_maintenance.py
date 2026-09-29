@@ -32,6 +32,16 @@ def news_maintenance():
         timeout=timedelta(minutes=30),
     )
 
+    # What a source repeats only changes when it redesigns, so daily is
+    # already generous. Articles already embedded keep their old vectors: a
+    # changed profile is an operator's cue to run `embed --reprocess`, not
+    # something a nightly DAG should trigger for the whole corpus.
+    boilerplate_refresh = admin(
+        "boilerplate_refresh",
+        "boilerplate-refresh",
+        timeout=timedelta(minutes=20),
+    )
+
     # Dry run on purpose. Quarantining rows is a judgement call an operator
     # makes after reading the log, not something a nightly DAG should decide;
     # `--apply` also needs the crawl and embed locks, which would make this
@@ -61,7 +71,7 @@ def news_maintenance():
         trigger_rule="all_done",
     )
 
-    cluster_repair >> cleanup_block_pages >> run_health_report
+    cluster_repair >> boilerplate_refresh >> cleanup_block_pages >> run_health_report
 
 
 news_maintenance()

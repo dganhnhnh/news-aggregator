@@ -38,6 +38,7 @@ from adapters.storage.schema import (
     feed_state,
     processing_jobs,
     raw_articles,
+    source_boilerplate,
     sources,
     taxonomies,
     taxonomy_node_topics,
@@ -47,6 +48,12 @@ from adapters.storage.schema import (
     topics,
     worker_runs,
 )
+from core.boilerplate import (
+    LEAD_CHARS,
+    MIN_DOCS_PER_SOURCE,
+    PROFILE_SAMPLE_SIZE,
+    build_profile,
+)
 from core.content_quality import historical_summary_title_reason
 # The submodule, not the package: a worker importing storage should not pull
 # in Starlette for a middleware it will never mount.
@@ -55,6 +62,7 @@ from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
     ArticleSearchHit,
+    BoilerplateRefreshStats,
     ClassifiableArticle,
     CrawlFailureOccurrence,
     ClusterArticle,
@@ -1711,6 +1719,107 @@ class PostgresRawStorage:
                 priority=priority,
             )
 
+    async def boilerplate_profiles(self) -> dict[int, frozenset[str]]:
+        """Every stored chrome profile, keyed by source.
+
+        Loaded once per run rather than per article: the whole table is a few
+        thousand short strings, and a per-article lookup would put a query
+        between the queue and the embedder for no benefit.
+        """
+        async with self._engine.connect() as connection:
+            result = await connection.execute(
+                select(source_boilerplate.c.source_id, source_boilerplate.c.lines)
+            )
+            return {row.source_id: frozenset(row.lines or ()) for row in result}
+
+    async def refresh_boilerplate_profiles(
+        self,
+        *,
+        source_slug: str | None = None,
+        sample_size: int = PROFILE_SAMPLE_SIZE,
+    ) -> BoilerplateRefreshStats:
+        """Rebuild `source_boilerplate` from what each source actually repeats.
+
+        Storage picks the sample and writes the rows; what counts as chrome is
+        `core.boilerplate.build_profile`'s call alone. Sources are handled one
+        at a time so the sample of a single publisher, not the whole corpus, is
+        what has to fit in memory.
+        """
+        stats = BoilerplateRefreshStats()
+        counts = select(
+            raw_articles.c.source_id,
+            func.count().label("n"),
+        ).where(raw_articles.c.source_id.isnot(None))
+        if source_slug is not None:
+            counts = counts.where(
+                raw_articles.c.source_id.in_(
+                    select(sources.c.id).where(sources.c.slug == source_slug)
+                )
+            )
+        counts = counts.group_by(raw_articles.c.source_id)
+
+        async with self._engine.connect() as connection:
+            source_ids = [row.source_id for row in await connection.execute(counts)]
+
+        for candidate_id in source_ids:
+            stats.considered += 1
+            async with self._engine.connect() as connection:
+                rows = await connection.execute(
+                    select(func.left(raw_articles.c.content, LEAD_CHARS))
+                    .where(raw_articles.c.source_id == candidate_id)
+                    .where(raw_articles.c.content != "")
+                    .order_by(raw_articles.c.event_at.desc())
+                    .limit(sample_size)
+                )
+                contents = [row[0] for row in rows]
+
+            if len(contents) < MIN_DOCS_PER_SOURCE:
+                # Not enough evidence to call anything repetition. Leave any
+                # existing profile alone: it was built when the source had more
+                # rows, and deleting it would silently un-strip its articles.
+                stats.skipped_too_few_articles += 1
+                continue
+
+            profile = sorted(build_profile(contents))
+            if not profile:
+                stats.empty_profiles += 1
+            stats.lines += len(profile)
+            if await self._store_boilerplate(candidate_id, profile, len(contents)):
+                stats.refreshed += 1
+            else:
+                stats.unchanged += 1
+        return stats
+
+    async def _store_boilerplate(
+        self, source_id: int, lines: list[str], sample_size: int
+    ) -> bool:
+        """Upsert one profile; True when the line set actually changed.
+
+        `refreshed_at` moves every run either way -- it records when the
+        corpus was last examined, which is the question an operator asks when a
+        profile looks wrong.
+        """
+        stmt = (
+            pg_insert(source_boilerplate)
+            .values(source_id=source_id, lines=lines, sample_size=sample_size)
+            .on_conflict_do_update(
+                index_elements=[source_boilerplate.c.source_id],
+                set_={
+                    "lines": lines,
+                    "sample_size": sample_size,
+                    "refreshed_at": func.now(),
+                },
+            )
+        )
+        async with self._engine.begin() as connection:
+            previous = await connection.scalar(
+                select(source_boilerplate.c.lines).where(
+                    source_boilerplate.c.source_id == source_id
+                )
+            )
+            await connection.execute(stmt)
+        return list(previous or ()) != lines
+
     async def embeddable_articles(
         self, article_ids: Sequence[int]
     ) -> dict[int, EmbeddingCandidate]:
@@ -1727,6 +1836,7 @@ class PostgresRawStorage:
             result = await connection.execute(
                 select(
                     raw_articles.c.id,
+                    raw_articles.c.source_id,
                     raw_articles.c.title,
                     raw_articles.c.content,
                     raw_articles.c.feed_summary,
@@ -1745,6 +1855,7 @@ class PostgresRawStorage:
             return {
                 row.id: EmbeddingCandidate(
                     article_id=row.id,
+                    source_id=row.source_id,
                     title=row.title,
                     content=row.content,
                     feed_summary=row.feed_summary,

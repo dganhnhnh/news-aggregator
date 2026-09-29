@@ -15,6 +15,7 @@ from typing import Any
 import yaml
 
 from adapters.storage import PostgresRawStorage, StorageError
+from core.boilerplate import MIN_DOCS_PER_SOURCE, PROFILE_SAMPLE_SIZE
 from core.config import Settings
 from core.logger import get_logger, setup_logging
 from models.storage_models import PrototypeRebuildStats, TopicPrototypeRecord
@@ -487,6 +488,29 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Exit with CODE when another rebuild holds the lock",
     )
 
+    boilerplate_refresh = subparsers.add_parser(
+        "boilerplate-refresh",
+        help="Rebuild each source's repeated-chrome profile from its corpus",
+    )
+    boilerplate_refresh.add_argument(
+        "--source",
+        metavar="SLUG",
+        help="Refresh only this source; default is every source",
+    )
+    boilerplate_refresh.add_argument(
+        "--sample",
+        type=int,
+        default=PROFILE_SAMPLE_SIZE,
+        help="Articles per source the profile is built from, newest first",
+    )
+    boilerplate_refresh.add_argument(
+        "--exit-busy",
+        type=int,
+        default=0,
+        metavar="CODE",
+        help="Exit with CODE when another refresh holds the lock",
+    )
+
     queue_status = subparsers.add_parser(
         "queue-status",
         help="Report processing_jobs, crawl_failures and worker_runs state",
@@ -637,7 +661,10 @@ def _validate_exit_busy(
 
 
 def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    if args.command in WORKERS or args.command == "taxonomy-rebuild":
+    if args.command in WORKERS or args.command in {
+        "taxonomy-rebuild",
+        "boilerplate-refresh",
+    }:
         _validate_exit_busy(args, parser)
     if args.command in WORKERS:
         if args.interval is not None and args.interval <= 0:
@@ -663,6 +690,12 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     elif args.command == "queue-status":
         if args.runs_window <= 0:
             parser.error("--runs-window must be positive")
+    elif args.command == "boilerplate-refresh":
+        if args.sample < MIN_DOCS_PER_SOURCE:
+            parser.error(
+                f"--sample must be at least {MIN_DOCS_PER_SOURCE}, the smallest "
+                "corpus a profile is ever built from"
+            )
     elif args.command in {"taxonomy-import", "taxonomy-export"}:
         if args.command == "taxonomy-import" and not args.file.is_file():
             parser.error(f"Taxonomy seed file not found: {args.file}")
@@ -864,6 +897,48 @@ async def _dispatch_admin(
             stats.skipped_unchanged,
             stats.skipped_insufficient_exemplars,
         )
+        return EXIT_OK
+
+    if args.command == "boilerplate-refresh":
+        # Same lock discipline as taxonomy-rebuild: this rewrites a registry
+        # every embed and classify run reads, so two concurrent refreshes must
+        # not interleave their writes.
+        async with storage.worker_lock("boilerplate-refresh") as acquired:
+            if not acquired:
+                logger.info(
+                    "Another boilerplate-refresh run holds the lock; "
+                    "exiting without doing work"
+                )
+                return exit_busy_for(args)
+            run_id = await storage.start_run(
+                worker="boilerplate-refresh",
+                trigger="manual",
+                params={"source": args.source, "sample": args.sample},
+            )
+            try:
+                stats = await storage.refresh_boilerplate_profiles(
+                    source_slug=args.source, sample_size=args.sample
+                )
+            except Exception as exc:
+                logger.exception("boilerplate-refresh run %d failed", run_id)
+                await storage.finish_run(run_id, "failed", None, str(exc))
+                return EXIT_FAILED
+            await storage.finish_run(run_id, "succeeded", stats)
+        logger.info(
+            "Boilerplate refresh: considered=%d refreshed=%d unchanged=%d "
+            "skipped_too_few_articles=%d empty_profiles=%d lines=%d",
+            stats.considered,
+            stats.refreshed,
+            stats.unchanged,
+            stats.skipped_too_few_articles,
+            stats.empty_profiles,
+            stats.lines,
+        )
+        if stats.refreshed:
+            logger.info(
+                "Profiles changed; articles already embedded keep their old "
+                "vectors until `news-worker embed --reprocess` re-queues them"
+            )
         return EXIT_OK
 
     raise AssertionError(f"unhandled admin command: {args.command}")

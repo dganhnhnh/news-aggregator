@@ -16,3 +16,6 @@ node_modules/
 frontend/out/
 
 uv.lock
+
+# Ad-hoc measurement harnesses (see docs/measurements.md); never part of the build.
+.scratch-*/

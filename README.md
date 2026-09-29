@@ -112,6 +112,24 @@ uv run news-worker classify --refresh-clusters --last 30d --once
 Nếu đổi embedding model hoặc input builder, chạy `embed --model-changed`
 trước; re-embedding sẽ enqueue lại cả `classify` và `cluster`.
 
+### 2b. Profile boilerplate theo source
+
+Mỗi source lặp lại chrome của riêng nó — banner cookie, disclaimer affiliate,
+thanh menu — và phần đó lọt vào 1.200 ký tự mà embedder đọc, khiến mọi bài của
+cùng một tờ embed ra gần như một vector (xem `docs/measurements.md`, T14).
+`boilerplate-refresh` dựng lại profile từ document frequency của chính corpus,
+lưu vào `source_boilerplate`:
+
+```bash
+uv run news-worker boilerplate-refresh
+uv run news-worker boilerplate-refresh --source wired.com --sample 200
+```
+
+Source dưới `MIN_DOCS_PER_SOURCE` bài bị bỏ qua và giữ nguyên profile cũ.
+Profile không tự động embed lại: khi profile đổi, bài đã embed vẫn giữ vector cũ
+cho tới khi chạy `embed --reprocess`. DAG `news_maintenance` chạy refresh hằng
+đêm nhưng cố tình *không* kích hoạt re-embed toàn corpus.
+
 ### 3. Smoke-check dữ liệu, API và Stories UI
 
 Queue, retry queue và worker runs xem bằng một lệnh:
