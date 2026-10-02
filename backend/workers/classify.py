@@ -19,7 +19,7 @@ from services.classification import (
     classify_article,
 )
 from services.text import article_embed_text
-from workers.base import RunContext, RunOutcome, Worker
+from workers.base import LockMode, RunContext, RunOutcome, Worker
 from workers.queue import DEFAULT_MAX_ATTEMPTS, JobQueue, PostgresJobQueue
 
 
@@ -49,6 +49,13 @@ class ClassifyWorker(Worker):
             "prototype_weight": PROTOTYPE_WEIGHT,
             "keyword_weight": KEYWORD_WEIGHT,
         }
+
+    def lock_mode(self, args: argparse.Namespace) -> LockMode:
+        # Same reasoning as embed: draining is safe side by side, re-queueing
+        # or rebuilding every cluster label in a window is not.
+        if args.reprocess or args.stale or args.refresh_clusters:
+            return "exclusive"
+        return "shared"
 
     async def execute(self, ctx: RunContext) -> RunOutcome:
         args = ctx.args

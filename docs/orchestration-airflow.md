@@ -1,5 +1,13 @@
 # Điều phối worker bằng Airflow (kế hoạch triển khai)
 
+> **TẠM NGƯNG TỪ 2026-09-29.** Luồng định kỳ (`news_ingest`, `news_semantic`,
+> `news_maintenance`) đã chuyển sang các service `ingest`, `semantic` và
+> `maintenance` chạy liên tục, được đánh thức bằng Postgres LISTEN/NOTIFY. Xem
+> [orchestration-workers.md](orchestration-workers.md). Code DAG vẫn được giữ
+> nguyên. Service Airflow đã bị comment khỏi
+> `deployments/docker-compose.airflow.yml`; cách bật lại ghi ở header của file
+> đó. Phần còn lại của tài liệu này mô tả thiết kế Airflow như lúc đang chạy.
+
 > Chi tiết hoá §4.1 "Mô hình vận hành worker" của [spec.md](spec.md), thay thế
 > phần "Cron / systemd timer" ở §4.1.1 cho môi trường có nhiều hơn một worker.
 >

@@ -7,12 +7,13 @@ import json
 import random
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
-from dataclasses import asdict, is_dataclass
+from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import (
+    and_,
     case,
     delete,
     func,
@@ -269,7 +270,20 @@ async def _refresh_cluster_topics_locked(
     depend on which worker touched it last. `cluster_topics` is a
     materialized view of `article_topics` and is always fully replaced, never
     incrementally patched -- that is what makes it rebuildable (spec §2.7).
+
+    Serialized per cluster for the rest of the transaction: two classify
+    replicas labelling articles of one story would otherwise both delete and
+    re-insert the same rows (a duplicate-key error for the later one), or
+    each compute labels without the other's uncommitted article. Callers that
+    refresh several clusters in one transaction go in ascending id order.
     """
+    await connection.execute(
+        text(
+            "SELECT pg_advisory_xact_lock(hashtext('cluster_topics'), "
+            "CAST(:cluster_id % 2147483647 AS INTEGER))"
+        ),
+        {"cluster_id": cluster_id},
+    )
     member_rows = (
         await connection.execute(
             select(cluster_members.c.article_id, raw_articles.c.source_id)
@@ -499,6 +513,24 @@ def _utc_day_span(since: datetime, until: datetime) -> list[tuple[date, bool]]:
     return spans
 
 
+# Every enqueue into `processing_jobs` notifies this channel from inside the
+# enqueuing transaction, so a listener hears about work only once it is
+# committed. It is a doorbell, not a mailbox: the payload is informational and
+# a missed notification loses nothing, because the table is the queue.
+JOBS_CHANNEL = "news_radar_jobs"
+
+
+@dataclass
+class NotificationListener:
+    """What `PostgresRawStorage.listen` hands its caller."""
+
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    """Set on every notification; the caller clears it before waiting again."""
+
+    alive: bool = True
+    """False once the listening connection dropped; the caller must re-listen."""
+
+
 class PostgresRawStorage:
     def __init__(self, database_url: str) -> None:
         if not database_url:
@@ -550,7 +582,9 @@ class PostgresRawStorage:
             raise StorageError(f"Database is unavailable: {exc}") from exc
 
     @asynccontextmanager
-    async def worker_lock(self, name: str) -> AsyncIterator[bool]:
+    async def worker_lock(
+        self, name: str, *, shared: bool = False
+    ) -> AsyncIterator[bool]:
         """Hold a session-level advisory lock for the duration of a worker run.
 
         Yields whether the lock was acquired; a caller that gets ``False`` must
@@ -558,15 +592,24 @@ class PostgresRawStorage:
         otherwise pile up waiters. The lock lives on a dedicated AUTOCOMMIT
         connection: advisory locks do not need a transaction, and holding one
         open for a run that may last an hour would block autovacuum.
+
+        ``shared=True`` admits any number of shared holders of the same name
+        and excludes only an exclusive one, which is how queue-draining
+        replicas run side by side while a bulk operation can still wait them
+        all out.
         """
         key = {"key": f"worker:{name}"}
+        suffix = "_shared" if shared else ""
         engine = self._engine.execution_options(isolation_level="AUTOCOMMIT")
         acquired = False
         async with engine.connect() as connection:
             try:
                 acquired = bool(
                     await connection.scalar(
-                        text("SELECT pg_try_advisory_lock(hashtext(:key)::bigint)"),
+                        text(
+                            f"SELECT pg_try_advisory_lock{suffix}"
+                            "(hashtext(:key)::bigint)"
+                        ),
                         key,
                     )
                 )
@@ -574,9 +617,80 @@ class PostgresRawStorage:
             finally:
                 if acquired:
                     await connection.execute(
-                        text("SELECT pg_advisory_unlock(hashtext(:key)::bigint)"),
+                        text(
+                            f"SELECT pg_advisory_unlock{suffix}"
+                            "(hashtext(:key)::bigint)"
+                        ),
                         key,
                     )
+
+    @asynccontextmanager
+    async def listen(
+        self, channel: str = JOBS_CHANNEL
+    ) -> AsyncIterator[NotificationListener]:
+        """LISTEN on `channel` for as long as the context is open.
+
+        Holds one pooled connection for the duration and never runs a query
+        on it, so it opens no transaction. A dropped connection sets the event
+        too, so a waiter wakes up, sees `alive` is False and reconnects rather
+        than sleeping on a socket that will never speak again.
+        """
+        listener = NotificationListener()
+
+        def on_notify(*_: Any) -> None:
+            listener.event.set()
+
+        def on_terminate(*_: Any) -> None:
+            listener.alive = False
+            listener.event.set()
+
+        async with self._engine.connect() as connection:
+            raw = await connection.get_raw_connection()
+            driver = raw.driver_connection
+            await driver.add_listener(channel, on_notify)
+            driver.add_termination_listener(on_terminate)
+            try:
+                yield listener
+            finally:
+                driver.remove_termination_listener(on_terminate)
+                if listener.alive:
+                    with suppress(Exception):
+                        await driver.remove_listener(channel, on_notify)
+                else:
+                    await connection.invalidate()
+
+    async def actionable_jobs(self, stages: Sequence[str]) -> dict[str, int]:
+        """Jobs a claimer could take right now, per stage.
+
+        The same predicate `JobQueue.claim` and `reclaim_expired` act on: due
+        pending jobs plus running ones whose lease has expired. A stage with
+        nothing actionable reports 0 rather than being absent.
+        """
+        counts = {stage: 0 for stage in stages}
+        if not stages:
+            return counts
+        now = datetime.now(timezone.utc)
+        async with self._engine.connect() as connection:
+            rows = await connection.execute(
+                select(processing_jobs.c.stage, func.count().label("n"))
+                .where(
+                    processing_jobs.c.stage.in_(list(stages)),
+                    or_(
+                        and_(
+                            processing_jobs.c.state == "pending",
+                            processing_jobs.c.available_at <= now,
+                        ),
+                        and_(
+                            processing_jobs.c.state == "running",
+                            processing_jobs.c.lease_until < now,
+                        ),
+                    ),
+                )
+                .group_by(processing_jobs.c.stage)
+            )
+            for row in rows:
+                counts[row.stage] = int(row.n)
+        return counts
 
     async def reap_abandoned(self, worker: str, stale_after: timedelta) -> int:
         """Close out runs whose process died without finishing them.
@@ -1634,6 +1748,12 @@ class PostgresRawStorage:
     ) -> None:
         if not article_ids or not stages:
             return
+        # Delivered only if this transaction commits, and Postgres folds
+        # identical payloads within one transaction into a single message.
+        await connection.execute(
+            text("SELECT pg_notify(:channel, :payload)"),
+            {"channel": JOBS_CHANNEL, "payload": ",".join(stages)},
+        )
         timestamp = now or datetime.now(timezone.utc)
         stmt = pg_insert(processing_jobs).values(
             [
@@ -2363,7 +2483,9 @@ class PostgresRawStorage:
             )
             drifted_ids = {int(row.id) for row in drifted_rows}
 
-            affected = list(orphan_cluster_ids | drifted_ids)[:limit]
+            # Ascending, like every multi-cluster transaction, so it cannot
+            # deadlock against another one on the per-cluster label lock.
+            affected = sorted(orphan_cluster_ids | drifted_ids)[:limit]
             for cluster_id in affected:
                 await _rebuild_cluster_locked(connection, cluster_id)
             return len(affected)
@@ -4874,11 +4996,13 @@ class PostgresRawStorage:
             cluster_ids = [
                 int(row.id)
                 for row in await connection.execute(
-                    select(clusters.c.id).where(
+                    select(clusters.c.id)
+                    .where(
                         clusters.c.status != "merged",
                         clusters.c.last_seen_at >= since,
                         clusters.c.last_seen_at < until,
                     )
+                    .order_by(clusters.c.id)
                 )
             ]
             for cluster_id in cluster_ids:

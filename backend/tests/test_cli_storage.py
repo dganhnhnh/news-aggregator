@@ -83,11 +83,16 @@ def test_scheduler_flags_are_available_to_every_worker_command() -> None:
     assert _parse(["taxonomy-rebuild", "--exit-busy", "99"]).exit_busy == 99
 
 
-def test_max_runtime_rejects_invalid_or_looping_worker_values() -> None:
+def test_max_runtime_rejects_invalid_values() -> None:
     with pytest.raises(SystemExit):
         _parse(["embed", "--max-runtime", "soon"])
-    with pytest.raises(SystemExit):
-        _parse(["embed", "--max-runtime", "25m", "--interval", "60"])
+
+
+def test_max_runtime_combines_with_interval() -> None:
+    # The budget ends one run, not the looping process, which is how the
+    # `ingest` service keeps a slow crawl from holding the lock forever.
+    args = _parse(["crawl", "--max-runtime", "8m", "--interval", "300"])
+    assert (args.max_runtime, args.interval) == ("8m", 300)
 
 
 def test_adaptive_poll_settings_reject_invalid_order() -> None:
@@ -510,3 +515,60 @@ def test_crawl_command_with_no_usable_url_never_builds_a_provider(
 
     assert seen == []
     assert [failure.permanent for failure in batch.failures] == [True]
+
+
+def test_semantic_parses_with_service_defaults() -> None:
+    args = _parse(["semantic"])
+    assert args.last == "24h"
+    assert (args.fallback_interval, args.min_pass_interval) == (300.0, 60.0)
+    assert (args.merge_every, args.refresh_every) == ("15m", "15m")
+    assert worker_cli.resolve_window(args, worker_cli.build_parser(_settings()))
+
+
+def test_semantic_rejects_bad_pacing() -> None:
+    with pytest.raises(SystemExit):
+        _parse(["semantic", "--fallback-interval", "0"])
+    with pytest.raises(SystemExit):
+        _parse(["semantic", "--merge-every", "soon"])
+
+
+def test_semantic_stage_args_reuse_each_stage_parser() -> None:
+    args = _parse(["semantic", "--last", "6h"])
+    stages = worker_cli.semantic_stage_args(args, _settings())
+    assert stages.embed.command == "embed" and stages.embed.max_runtime == "30m"
+    assert stages.classify.command == "classify"
+    assert not stages.classify.refresh_clusters
+    assert stages.cluster.command == "cluster" and not stages.cluster.merge_only
+    assert stages.merge.merge_only
+    assert stages.refresh.command == "classify" and stages.refresh.refresh_clusters
+    assert {s.last for s in vars(stages).values()} == {"6h"}
+
+
+def test_maintenance_steps_all_parse() -> None:
+    for argv in worker_cli.MAINTENANCE_STEPS:
+        _parse(argv)
+    assert worker_cli.MAINTENANCE_STEPS[-1][0] == "queue-status"
+
+
+def test_maintenance_reports_health_even_after_a_failed_step(monkeypatch) -> None:
+    ran: list[str] = []
+
+    async def fake_dispatch(args, settings, window):
+        ran.append(args.command)
+        if args.command == "cluster":
+            raise RuntimeError("repair blew up")
+        return worker_cli.EXIT_OK
+
+    monkeypatch.setattr(worker_cli, "_dispatch", fake_dispatch)
+    code = asyncio.run(worker_cli._run_maintenance(_settings("postgresql://x")))
+
+    assert ran == ["cluster", "boilerplate-refresh", "cleanup-block-pages", "queue-status"]
+    assert code == worker_cli.EXIT_FAILED
+
+
+def test_maintenance_succeeds_when_every_step_does(monkeypatch) -> None:
+    async def fake_dispatch(args, settings, window):
+        return worker_cli.EXIT_OK
+
+    monkeypatch.setattr(worker_cli, "_dispatch", fake_dispatch)
+    assert asyncio.run(worker_cli._run_maintenance(_settings())) == worker_cli.EXIT_OK

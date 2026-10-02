@@ -1,0 +1,5 @@
+# news-radar maintenance schedule, run by supercronic in the `maintenance`
+# service (deployments/docker-compose.yml). Replaces the `news_maintenance`
+# Airflow DAG; the steps themselves live in `news-worker maintenance`.
+# The container sets TZ=UTC, so this is 03:00 UTC.
+0 3 * * * news-worker maintenance

@@ -19,7 +19,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from adapters.storage import PostgresRawStorage
 from core.logger import get_logger
@@ -35,6 +35,9 @@ EXIT_FAILED = 1
 # a file. `/dev/stdout` is accepted because that is what a Docker command line
 # reads naturally, but opening it in append mode is not portable.
 STDOUT_TARGETS = frozenset({"-", "/dev/stdout"})
+
+
+LockMode = Literal["exclusive", "shared"]
 
 
 class RunOutcome(NamedTuple):
@@ -88,17 +91,26 @@ async def sleep_or_shutdown(seconds: float, event: asyncio.Event) -> None:
 
 async def request_shutdown_after(
     duration: timedelta, event: asyncio.Event, worker_name: str
-) -> None:
-    """Request a cooperative stop before the orchestrator's hard timeout."""
+) -> bool:
+    """Request a cooperative stop before the orchestrator's hard timeout.
+
+    Returns whether the budget, rather than something else, set the event.
+    """
     await sleep_or_shutdown(duration.total_seconds(), event)
     if event.is_set():
-        return
+        return False
     logger.warning(
         "%s reached its %s max runtime; stopping after the current chunk",
         worker_name,
         duration,
     )
     event.set()
+    return True
+
+
+async def _forward(source: asyncio.Event, target: asyncio.Event) -> None:
+    await source.wait()
+    target.set()
 
 
 def orchestration_context() -> dict[str, str]:
@@ -151,6 +163,9 @@ def emit_summary(target: str, payload: Mapping[str, Any]) -> None:
 class Worker(ABC):
     name: str
 
+    last_outcome: RunOutcome | None = None
+    """What the latest `run_once` produced; `None` when the lock was busy."""
+
     @abstractmethod
     async def execute(self, ctx: RunContext) -> RunOutcome:
         """Do the work, checking `ctx.shutdown` between chunks."""
@@ -158,6 +173,17 @@ class Worker(ABC):
     def run_params(self, args: argparse.Namespace) -> Mapping[str, Any]:
         """Flags worth recording on the run for later diagnosis."""
         return {}
+
+    def lock_mode(self, args: argparse.Namespace) -> LockMode:
+        """How this run shares the worker lock with other runs of the same name.
+
+        Exclusive by default. A worker whose run only drains `processing_jobs`
+        -- where `SKIP LOCKED` already keeps two claimers apart -- may return
+        "shared" so replicas run side by side, while anything that must see
+        the stage quiet (a bulk re-queue, `cleanup-block-pages --apply`) still
+        takes the exclusive lock and waits for all of them.
+        """
+        return "exclusive"
 
     async def run(
         self,
@@ -205,7 +231,14 @@ class Worker(ABC):
         if reaped:
             logger.info("Marked %d stale %s run(s) as abandoned", reaped, self.name)
 
-        async with storage.worker_lock(self.name) as acquired:
+        self.last_outcome = None
+        mode = self.lock_mode(args)
+        lock = (
+            storage.worker_lock(self.name, shared=True)
+            if mode == "shared"
+            else storage.worker_lock(self.name)
+        )
+        async with lock as acquired:
             if not acquired:
                 logger.info(
                     "Another %s run holds the lock; exiting without doing work",
@@ -235,10 +268,16 @@ class Worker(ABC):
                 window.end.isoformat(),
             )
 
+            # The body stops on `run_stop`, not on the process-wide event: a
+            # runtime budget ends this run only, so a looping worker (or the
+            # semantic service driving several workers) keeps going. A process
+            # shutdown still reaches the body through `forward`.
+            run_stop = asyncio.Event()
+            forward = asyncio.create_task(_forward(shutdown, run_stop))
             ctx = RunContext(
                 run_id=run_id,
                 window=window,
-                shutdown=shutdown,
+                shutdown=run_stop,
                 args=args,
                 storage=storage,
             )
@@ -246,7 +285,7 @@ class Worker(ABC):
             runtime_guard = (
                 asyncio.create_task(
                     request_shutdown_after(
-                        parse_duration(max_runtime), shutdown, self.name
+                        parse_duration(max_runtime), run_stop, self.name
                     )
                 )
                 if max_runtime
@@ -256,10 +295,20 @@ class Worker(ABC):
                 try:
                     outcome = await self.execute(ctx)
                 finally:
+                    budget_reached = False
                     if runtime_guard is not None:
+                        if runtime_guard.done() and not runtime_guard.cancelled():
+                            budget_reached = runtime_guard.result()
                         runtime_guard.cancel()
                         with suppress(asyncio.CancelledError):
                             await runtime_guard
+                    forward.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await forward
+                    # A body that asked to stop for its own reasons still
+                    # means "stop the process"; only the budget is run-local.
+                    if run_stop.is_set() and not budget_reached:
+                        shutdown.set()
             except asyncio.CancelledError:
                 await self._finish(
                     storage,
@@ -271,16 +320,14 @@ class Worker(ABC):
                 raise
             except Exception as exc:
                 logger.exception("%s run %d failed", self.name, run_id)
+                self.last_outcome = RunOutcome("failed", None, str(exc))
                 await self._finish(
-                    storage,
-                    run_id,
-                    RunOutcome("failed", None, str(exc)),
-                    args=args,
-                    window=window,
+                    storage, run_id, self.last_outcome, args=args, window=window
                 )
                 return EXIT_FAILED
 
             await self._finish(storage, run_id, outcome, args=args, window=window)
+            self.last_outcome = outcome
             if outcome.status == "failed":
                 return EXIT_FAILED
             if outcome.status == "partial" and getattr(args, "strict", False):

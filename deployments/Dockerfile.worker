@@ -1,20 +1,44 @@
-# Runs one `news-worker` subcommand per container, launched by Airflow's
-# DockerOperator. Build from the repo root:
+# Runs one `news-worker` subcommand per container: the long-running `ingest`,
+# `semantic` and `instant-crawl` services in deployments/docker-compose.yml,
+# the `maintenance` cron container, and one-off `docker compose run` jobs.
+# (Airflow's DockerOperator launched it the same way; see
+# docs/orchestration-airflow.md.) Build from the repo root:
 #   docker build -f deployments/Dockerfile.worker -t news-radar-worker:<git-sha> .
 #
-# Three things make this image different from Dockerfile.api, and all three
-# matter for a scheduled one-shot process:
+# Four things make this image different from Dockerfile.api:
 #   1. `crawl4ai-setup` installs the Chromium the crawl worker drives.
 #   2. tini (`--init` at run time also works) reaps the browser's orphaned
 #      children; without it a long-lived container accumulates zombies.
 #   3. The entrypoint is the console script itself, not `uv run`, so the
-#      SIGTERM Airflow sends on timeout reaches Python and the worker gets to
+#      SIGTERM `docker stop` sends reaches Python and the worker gets to
 #      close out its `worker_runs` row as `partial` instead of being killed.
+#   4. supercronic, a cron built for containers (logs to stdout, forwards
+#      SIGTERM, no setuid daemon), runs the nightly `news-worker maintenance`.
 FROM python:3.12-slim
+
+ARG TARGETARCH
+ARG SUPERCRONIC_VERSION=v0.2.49
+# SHA1 sums published with the release; bump them together with the version.
+ARG SUPERCRONIC_SHA1_AMD64=e63c11a9726b775a6a11801e81af4f3fb926aa68
+ARG SUPERCRONIC_SHA1_ARM64=0b6c5bb743e0b0dafed1132198c81807927ac413
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y tini \
     && rm -rf /var/lib/apt/lists/*
+
+# Downloaded with Python rather than curl so the image gains no extra package.
+RUN set -eu; \
+    arch="${TARGETARCH:-amd64}"; \
+    case "$arch" in \
+        amd64) sha1="$SUPERCRONIC_SHA1_AMD64" ;; \
+        arm64) sha1="$SUPERCRONIC_SHA1_ARM64" ;; \
+        *) echo "no pinned supercronic for $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${arch}"; \
+    python -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+        "$url" /usr/local/bin/supercronic; \
+    echo "${sha1}  /usr/local/bin/supercronic" | sha1sum -c -; \
+    chmod +x /usr/local/bin/supercronic
 
 RUN pip install --no-cache-dir uv
 
@@ -30,7 +54,7 @@ RUN uv sync --frozen --no-dev
 RUN uv run crawl4ai-setup
 
 # Putting the venv on PATH is what lets the entrypoint be `news-worker`
-# directly: `uv run` would sit between Airflow's SIGTERM and the worker.
+# directly: `uv run` would sit between the container's SIGTERM and the worker.
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

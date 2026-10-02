@@ -25,13 +25,9 @@ def test_compose_services_have_stable_monitoring_labels() -> None:
             "api": ("app", "api"),
             "admin-api": ("app", "admin-api"),
             "instant-crawl": ("app", "instant-crawl"),
-        },
-        "docker-compose.airflow.yml": {
-            "airflow-db": ("airflow", "airflow-db"),
-            "airflow-init": ("airflow", "airflow-init"),
-            "airflow-scheduler": ("airflow", "airflow-scheduler"),
-            "airflow-apiserver": ("airflow", "airflow-apiserver"),
-            "airflow-dag-processor": ("airflow", "airflow-dag-processor"),
+            "ingest": ("app", "ingest"),
+            "semantic": ("app", "semantic"),
+            "maintenance": ("app", "maintenance"),
         },
         "docker-compose.monitoring.yml": {
             "node-exporter": ("monitoring", "node-exporter"),
@@ -51,6 +47,13 @@ def test_compose_services_have_stable_monitoring_labels() -> None:
                 GROUP_LABEL: group,
                 SERVICE_LABEL: stable_service_name,
             }
+
+
+def test_airflow_compose_is_suspended() -> None:
+    # Commented out, not deleted, since 2026-09-29: merging the file must not
+    # start a second scheduler next to the `ingest`/`semantic` services.
+    compose = _yaml(DEPLOYMENTS / "docker-compose.airflow.yml")
+    assert "services" not in compose
 
 
 def test_airflow_workers_have_stable_monitoring_labels() -> None:

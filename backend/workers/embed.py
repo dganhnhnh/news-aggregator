@@ -17,7 +17,7 @@ from core.logger import get_logger
 from models.storage_models import EmbedRunStats, EmbeddingRecord, TextKind
 from services.raw_storage import content_hash
 from services.text import article_embed_text
-from workers.base import RunContext, RunOutcome, Worker
+from workers.base import LockMode, RunContext, RunOutcome, Worker
 from workers.queue import DEFAULT_MAX_ATTEMPTS, JobQueue, PostgresJobQueue
 
 
@@ -56,6 +56,14 @@ class EmbedWorker(Worker):
             "model_changed": args.model_changed,
             "limit": args.limit,
         }
+
+    def lock_mode(self, args: argparse.Namespace) -> LockMode:
+        # A plain drain only claims jobs, and `SKIP LOCKED` already keeps two
+        # replicas off the same article. A re-queue rewrites the stage in bulk
+        # and must not interleave with anyone.
+        if args.reprocess or args.model_changed:
+            return "exclusive"
+        return "shared"
 
     async def execute(self, ctx: RunContext) -> RunOutcome:
         args = ctx.args

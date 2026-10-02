@@ -1,5 +1,15 @@
 """Persistence adapters for raw article storage."""
 
-from .postgres import PostgresRawStorage, StorageError
+from .postgres import (
+    JOBS_CHANNEL,
+    NotificationListener,
+    PostgresRawStorage,
+    StorageError,
+)
 
-__all__ = ["PostgresRawStorage", "StorageError"]
+__all__ = [
+    "JOBS_CHANNEL",
+    "NotificationListener",
+    "PostgresRawStorage",
+    "StorageError",
+]

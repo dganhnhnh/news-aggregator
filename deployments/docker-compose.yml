@@ -149,6 +149,130 @@ services:
         limits:
           memory: 512M
 
+  # The three services below replace the Airflow DAGs `news_ingest`,
+  # `news_semantic` and `news_maintenance`; see docs/orchestration-workers.md.
+  # Airflow is suspended, not deleted: deployments/docker-compose.airflow.yml.
+  ingest:
+    image: ${NEWS_RADAR_WORKER_IMAGE:-news-radar-worker:dev}
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: app
+      news-radar.service: ingest
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.worker
+    # One crawl run at a time across every machine (the advisory lock makes
+    # extra replicas exit as "busy"), so this service is not scaled. The
+    # runtime budget ends a slow run, not the process.
+    command:
+      - crawl
+      - --last
+      - 12h
+      - --interval
+      - ${INGEST_INTERVAL_SECONDS:-300}
+      - --max-runtime
+      - ${INGEST_MAX_RUNTIME:-8m}
+    environment: &worker-environment
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-news_radar}:${POSTGRES_PASSWORD:-news_radar}@db:5432/${POSTGRES_DB:-news_radar}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      FASTEMBED_CACHE_PATH: /models
+      MAX_CONCURRENT_FEEDS: ${MAX_CONCURRENT_FEEDS:-8}
+      MAX_CONCURRENT_CRAWLS: ${MAX_CONCURRENT_CRAWLS:-6}
+      FEED_FETCH_TIMEOUT_SECONDS: ${FEED_FETCH_TIMEOUT_SECONDS:-8}
+      FEED_POLL_FAST_INTERVAL_SECONDS: ${FEED_POLL_FAST_INTERVAL_SECONDS:-300}
+      FEED_POLL_INTERVAL_SECONDS: ${FEED_POLL_INTERVAL_SECONDS:-1800}
+      FEED_POLL_SLOW_INTERVAL_SECONDS: ${FEED_POLL_SLOW_INTERVAL_SECONDS:-21600}
+      FEED_POLL_MIN_GAPS: ${FEED_POLL_MIN_GAPS:-3}
+      FEED_POLL_TRIM_FRACTION: ${FEED_POLL_TRIM_FRACTION:-0.1}
+      FEED_POLL_FUTURE_TOLERANCE_SECONDS: ${FEED_POLL_FUTURE_TOLERANCE_SECONDS:-300}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ../backend
+        target: /app/backend
+      - type: bind
+        source: ../data
+        target: /data
+        read_only: true
+    shm_size: 1gb
+    # Long enough for the active chunk to commit and close its worker_runs
+    # row as `partial` after SIGTERM.
+    stop_grace_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  semantic:
+    image: ${NEWS_RADAR_WORKER_IMAGE:-news-radar-worker:dev}
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: app
+      news-radar.service: semantic
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.worker
+    # Woken by NOTIFY on every processing_jobs enqueue. Safe to scale with
+    # `--scale semantic=N`, or to run on another machine against the same
+    # DATABASE_URL: embed and classify split the queue, cluster/merge/refresh
+    # run on whichever replica holds the lock.
+    command:
+      - semantic
+      - --last
+      - ${SEMANTIC_WINDOW:-24h}
+    environment: *worker-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ../backend
+        target: /app/backend
+      - model_cache:/models
+    stop_grace_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  maintenance:
+    image: ${NEWS_RADAR_WORKER_IMAGE:-news-radar-worker:dev}
+    labels:
+      news-radar.project: news-radar
+      news-radar.group: app
+      news-radar.service: maintenance
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.worker
+    # supercronic runs `news-worker maintenance` at 03:00 UTC. Run it now
+    # with `docker compose exec maintenance news-worker maintenance`.
+    entrypoint: ["/usr/bin/tini", "--", "supercronic", "/etc/news-radar/crontab"]
+    command: []
+    environment:
+      <<: *worker-environment
+      TZ: UTC
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ../backend
+        target: /app/backend
+      - type: bind
+        source: ./crontab
+        target: /etc/news-radar/crontab
+        read_only: true
+    stop_grace_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
 volumes:
   news_radar_postgres_data:
     name: news_radar_postgres_data

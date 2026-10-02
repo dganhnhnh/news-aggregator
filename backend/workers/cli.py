@@ -8,7 +8,7 @@ import copy
 import json
 from asyncio import to_thread
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,7 @@ from workers.crawl import CrawlWorker
 from workers.cluster import ClusterWorker
 from workers.embed import EmbedWorker
 from workers.instant_crawl import InstantCrawlWorker
+from workers.semantic import SemanticConfig, SemanticService, StageArgs, describe
 from workers.window import RunWindow, build_window, parse_duration
 
 
@@ -52,6 +53,26 @@ WORKERS: dict[str, type[Worker]] = {
     ClassifyWorker.name: ClassifyWorker,
     ClusterWorker.name: ClusterWorker,
 }
+
+# What `news-worker semantic` runs for each stage. The budgets are the old
+# `news_semantic` DAG timeouts: with no orchestrator left to kill a stage they
+# only keep a long backlog in one stage from starving the others.
+SEMANTIC_STAGE_ARGV: dict[str, list[str]] = {
+    "embed": ["embed", "--max-runtime", "30m"],
+    "classify": ["classify", "--max-runtime", "20m"],
+    "cluster": ["cluster", "--max-runtime", "20m"],
+    "merge": ["cluster", "--merge-only", "--max-runtime", "15m"],
+    "refresh": ["classify", "--refresh-clusters", "--max-runtime", "15m"],
+}
+
+# The nightly `news_maintenance` DAG, one argv per step. The health report is
+# last and always runs, so a failed repair still leaves a snapshot behind.
+MAINTENANCE_STEPS: tuple[list[str], ...] = (
+    ["cluster", "--repair", "--last", "7d", "--max-runtime", "30m"],
+    ["boilerplate-refresh"],
+    ["cleanup-block-pages", "--limit", "200"],
+    ["queue-status", "--json", "--runs-window", "24", "--fail-on-alert"],
+)
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -564,6 +585,59 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="0 for instant crawl, 1 for normal scheduled crawl",
     )
 
+    semantic = subparsers.add_parser(
+        "semantic",
+        help="Keep running embed -> (classify | cluster -> merge) -> refresh, "
+        "woken whenever work is queued",
+    )
+    semantic.add_argument(
+        "--last",
+        default="24h",
+        metavar="DURATION",
+        help="Relative window every stage runs over (default: 24h)",
+    )
+    semantic.add_argument(
+        "--once",
+        action="store_true",
+        help="Drain until nothing is actionable, merge and refresh, then exit",
+    )
+    semantic.add_argument(
+        "--fallback-interval",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="Longest idle wait without a notification (default: 300)",
+    )
+    semantic.add_argument(
+        "--min-pass-interval",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Minimum gap between pass starts, folding bursts of "
+        "notifications into one pass (default: 60)",
+    )
+    semantic.add_argument(
+        "--merge-every",
+        default="15m",
+        metavar="DURATION",
+        help="Minimum gap between cluster merges (default: 15m)",
+    )
+    semantic.add_argument(
+        "--refresh-every",
+        default="15m",
+        metavar="DURATION",
+        help="Minimum gap between cluster_topics refreshes (default: 15m)",
+    )
+    # Relative windows only: a fixed backfill range belongs to a one-shot
+    # stage command, not to a service that runs for days.
+    semantic.set_defaults(since=None, until=None)
+
+    subparsers.add_parser(
+        "maintenance",
+        help="Run the nightly steps: cluster repair, boilerplate refresh, "
+        "block-page dry run and the queue health report",
+    )
+
     return parser
 
 
@@ -676,8 +750,6 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 parse_duration(args.max_runtime)
             except ValueError as exc:
                 parser.error(str(exc))
-            if args.interval is not None:
-                parser.error("--max-runtime cannot be combined with --interval")
         if args.command in {"crawl", "instant-crawl"}:
             _validate_crawl(args, parser, adaptive=args.command == "crawl")
         elif args.command in {"embed", "classify"}:
@@ -687,6 +759,16 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     elif args.command in {"replay", "cleanup-block-pages"}:
         if args.limit <= 0:
             parser.error("--limit must be positive")
+    elif args.command == "semantic":
+        if args.fallback_interval <= 0:
+            parser.error("--fallback-interval must be positive")
+        if args.min_pass_interval < 0:
+            parser.error("--min-pass-interval must not be negative")
+        for flag in ("last", "merge_every", "refresh_every"):
+            try:
+                parse_duration(getattr(args, flag))
+            except ValueError as exc:
+                parser.error(str(exc))
     elif args.command == "queue-status":
         if args.runs_window <= 0:
             parser.error("--runs-window must be positive")
@@ -722,6 +804,73 @@ async def _dispatch(
         return await _dispatch_admin(storage, args)
     finally:
         await storage.close()
+
+
+def semantic_stage_args(
+    args: argparse.Namespace,
+    settings: Settings,
+) -> StageArgs:
+    """Parse each stage's argv through the real parser, so a stage gets the
+    same defaults and validation it would get on its own command line."""
+    parser = build_parser(settings)
+    parsed: dict[str, argparse.Namespace] = {}
+    for stage, argv in SEMANTIC_STAGE_ARGV.items():
+        stage_args = parser.parse_args([*argv, "--last", args.last])
+        validate(stage_args, parser)
+        parsed[stage] = stage_args
+    return StageArgs(**parsed)
+
+
+async def _run_semantic(
+    args: argparse.Namespace,
+    settings: Settings,
+    window: RunWindow,
+) -> int:
+    config = SemanticConfig(
+        once=args.once,
+        fallback_interval=args.fallback_interval,
+        min_pass_interval=args.min_pass_interval,
+        merge_every=parse_duration(args.merge_every),
+        refresh_every=parse_duration(args.refresh_every),
+        stale_after=timedelta(seconds=settings.worker_heartbeat_timeout_seconds),
+    )
+    stage_args = semantic_stage_args(args, settings)
+    logger.info("Starting semantic service: %s", describe(config))
+    storage = PostgresRawStorage(settings.database_url)
+    try:
+        await storage.check_ready()
+        return await SemanticService(storage, stage_args, window, config).run()
+    finally:
+        await storage.close()
+
+
+async def _run_maintenance(settings: Settings) -> int:
+    """Run every step even when an earlier one fails; exit 1 if any did."""
+    parser = build_parser(settings)
+    failed: list[str] = []
+    for argv in MAINTENANCE_STEPS:
+        step = " ".join(argv)
+        step_args = parser.parse_args(argv)
+        validate(step_args, parser)
+        window = (
+            resolve_window(step_args, parser)
+            if step_args.command in WORKERS
+            else None
+        )
+        logger.info("Maintenance step: %s", step)
+        try:
+            code = await _dispatch(step_args, settings, window)
+        except Exception:
+            logger.exception("Maintenance step failed: %s", step)
+            code = EXIT_FAILED
+        if code != EXIT_OK:
+            logger.error("Maintenance step exited %d: %s", code, step)
+            failed.append(step)
+    if failed:
+        logger.error("Maintenance finished with %d failed step(s)", len(failed))
+        return EXIT_FAILED
+    logger.info("Maintenance finished")
+    return EXIT_OK
 
 
 async def _dispatch_admin(
@@ -1074,9 +1223,18 @@ def main(argv: list[str] | None = None) -> None:
     validate(args, parser)
     if not settings.database_url:
         parser.error("DATABASE_URL is required for news-worker")
-    window = resolve_window(args, parser) if args.command in WORKERS else None
+    window = (
+        resolve_window(args, parser)
+        if args.command in WORKERS or args.command == "semantic"
+        else None
+    )
     try:
-        exit_code = asyncio.run(_dispatch(args, settings, window))
+        if args.command == "semantic":
+            exit_code = asyncio.run(_run_semantic(args, settings, window))
+        elif args.command == "maintenance":
+            exit_code = asyncio.run(_run_maintenance(settings))
+        else:
+            exit_code = asyncio.run(_dispatch(args, settings, window))
     except StorageError as exc:
         parser.error(str(exc))
     except KeyboardInterrupt:

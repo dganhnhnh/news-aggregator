@@ -55,14 +55,16 @@ class FakeStorage:
         self._lock_acquired = lock_acquired
         self._next_run_id = 1
         self.started_params: list[dict[str, Any]] = []
+        self.lock_modes: list[str] = []
 
     async def reap_abandoned(self, worker: str, stale_after: timedelta) -> int:
         self.calls.append(("reap", worker, stale_after))
         return 0
 
     @asynccontextmanager
-    async def worker_lock(self, name: str):
+    async def worker_lock(self, name: str, *, shared: bool = False):
         self.calls.append(("lock", name, self._lock_acquired))
+        self.lock_modes.append("shared" if shared else "exclusive")
         yield self._lock_acquired
 
     async def start_run(self, **kwargs: Any) -> int:
@@ -408,3 +410,107 @@ def test_stale_after_never_dips_below_the_configured_floor() -> None:
     assert stale_after_for(_args(), 900) == timedelta(seconds=900)
     assert stale_after_for(_args(interval=60), 900) == timedelta(seconds=900)
     assert stale_after_for(_args(interval=1800), 900) == timedelta(seconds=5400)
+
+
+def test_max_runtime_with_interval_ends_the_run_not_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The `ingest` service: a slow crawl hits its budget, closes as partial,
+    # and the process sleeps and runs again instead of exiting.
+    storage = FakeStorage()
+    monkeypatch.setattr(
+        "workers.base.parse_duration", lambda value: timedelta(milliseconds=1)
+    )
+    monkeypatch.setattr("workers.base.sleep_or_shutdown", _no_sleep)
+
+    class BudgetedWorker(Worker):
+        name = "crawl"
+        runs = 0
+
+        async def execute(self, ctx: RunContext) -> RunOutcome:
+            self.runs += 1
+            if self.runs == 1:
+                await asyncio.wait_for(ctx.shutdown.wait(), timeout=1)
+                return RunOutcome("partial", IngestRunStats(), "Runtime budget reached")
+            ctx.shutdown.set()
+            return RunOutcome("succeeded", IngestRunStats())
+
+    worker = BudgetedWorker()
+    exit_code = _run(worker, storage, _args(once=False, interval=1, max_runtime="8m"))
+
+    assert exit_code == EXIT_OK
+    assert worker.runs == 2
+    assert ("finish", 1, "partial", "Runtime budget reached") in storage.calls
+    assert ("finish", 2, "succeeded", None) in storage.calls
+
+
+async def _no_sleep(seconds: float, event: asyncio.Event) -> None:
+    return None
+
+
+def test_process_shutdown_still_reaches_a_budgeted_run() -> None:
+    storage = FakeStorage()
+    seen: list[bool] = []
+
+    class WaitingWorker(Worker):
+        name = "crawl"
+
+        async def execute(self, ctx: RunContext) -> RunOutcome:
+            await asyncio.wait_for(ctx.shutdown.wait(), timeout=1)
+            seen.append(True)
+            return RunOutcome("partial", IngestRunStats(), "Stopped")
+
+    async def scenario() -> int:
+        shutdown = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.01, shutdown.set)
+        return await WaitingWorker().run_once(
+            storage, _args(max_runtime="1h"), _window(), shutdown,
+            stale_after=STALE_AFTER,
+        )
+
+    assert asyncio.run(scenario()) == EXIT_OK
+    assert seen == [True]
+
+
+def test_lock_mode_is_passed_to_the_worker_lock() -> None:
+    class SharedWorker(ScriptedWorker):
+        def lock_mode(self, args: argparse.Namespace):
+            return "shared"
+
+    storage = FakeStorage()
+    _run(SharedWorker(RunOutcome("succeeded", IngestRunStats())), storage, _args())
+    _run(ScriptedWorker(RunOutcome("succeeded", IngestRunStats())), storage, _args())
+
+    assert storage.lock_modes == ["shared", "exclusive"]
+
+
+def test_last_outcome_distinguishes_busy_from_ran() -> None:
+    outcome = RunOutcome("succeeded", IngestRunStats())
+    worker = ScriptedWorker(outcome)
+
+    _run(worker, FakeStorage(), _args())
+    assert worker.last_outcome == outcome
+
+    _run(worker, FakeStorage(lock_acquired=False), _args())
+    assert worker.last_outcome is None
+
+    failing = ScriptedWorker(RuntimeError("boom"))
+    _run(failing, FakeStorage(), _args())
+    assert failing.last_outcome is not None
+    assert failing.last_outcome.status == "failed"
+
+
+def test_embed_and_classify_share_the_lock_only_when_draining() -> None:
+    from workers.classify import ClassifyWorker
+    from workers.embed import EmbedWorker
+
+    embed = EmbedWorker()
+    assert embed.lock_mode(_args(reprocess=False, model_changed=False)) == "shared"
+    assert embed.lock_mode(_args(reprocess=True, model_changed=False)) == "exclusive"
+    assert embed.lock_mode(_args(reprocess=False, model_changed=True)) == "exclusive"
+
+    classify = ClassifyWorker()
+    drain = {"reprocess": False, "stale": False, "refresh_clusters": False}
+    assert classify.lock_mode(_args(**drain)) == "shared"
+    for flag in drain:
+        assert classify.lock_mode(_args(**(drain | {flag: True}))) == "exclusive"

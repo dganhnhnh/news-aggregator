@@ -3,10 +3,10 @@ from datetime import datetime, timedelta, timezone
 import os
 
 import pytest
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from adapters.storage.postgres import PostgresRawStorage
+from adapters.storage.postgres import JOBS_CHANNEL, PostgresRawStorage
 from adapters.storage.schema import (
     crawl_failures,
     processing_jobs,
@@ -51,6 +51,126 @@ async def _test_worker_lock_admits_one_holder_at_a_time() -> None:
     finally:
         await first.close()
         await second.close()
+
+
+def test_shared_holders_coexist_but_exclude_an_exclusive_one() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_shared_holders_coexist_but_exclude_an_exclusive_one())
+
+
+async def _test_shared_holders_coexist_but_exclude_an_exclusive_one() -> None:
+    # Two embed replicas drain side by side; `embed --reprocess` and
+    # `cleanup-block-pages --apply` must wait for both of them.
+    first = PostgresRawStorage(DATABASE_URL)
+    second = PostgresRawStorage(DATABASE_URL)
+    third = PostgresRawStorage(DATABASE_URL)
+    try:
+        await first.check_ready()
+        async with first.worker_lock("test-shared", shared=True) as a:
+            assert a is True
+            async with second.worker_lock("test-shared", shared=True) as b:
+                assert b is True
+                async with third.worker_lock("test-shared") as exclusive:
+                    assert exclusive is False
+            async with third.worker_lock("test-shared") as exclusive:
+                assert exclusive is False
+
+        async with third.worker_lock("test-shared") as exclusive:
+            assert exclusive is True
+            async with first.worker_lock("test-shared", shared=True) as shared:
+                assert shared is False
+
+        # Released cleanly in both modes: nothing is left behind.
+        async with first.worker_lock("test-shared") as again:
+            assert again is True
+    finally:
+        await first.close()
+        await second.close()
+        await third.close()
+
+
+def test_notifications_arrive_on_commit_only() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_notifications_arrive_on_commit_only())
+
+
+async def _test_notifications_arrive_on_commit_only() -> None:
+    # A private channel: the development database's own crawlers ring the
+    # jobs channel whenever they commit.
+    channel = "news_radar_test_notify"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    try:
+        await storage.check_ready()
+        async with storage.listen(channel) as listener:
+            async with engine.connect() as connection:
+                transaction = await connection.begin()
+                await connection.execute(
+                    text("SELECT pg_notify(:channel, 'embed')"), {"channel": channel}
+                )
+                await transaction.rollback()
+            await asyncio.sleep(0.3)
+            assert not listener.event.is_set()
+
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text("SELECT pg_notify(:channel, 'embed')"), {"channel": channel}
+                )
+            await asyncio.wait_for(listener.event.wait(), timeout=5)
+            assert listener.alive
+    finally:
+        await engine.dispose()
+        await storage.close()
+
+
+def test_enqueueing_a_job_rings_the_jobs_channel() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_enqueueing_a_job_rings_the_jobs_channel())
+
+
+async def _test_enqueueing_a_job_rings_the_jobs_channel() -> None:
+    url = "https://notify-integration.example/a"
+    slug = "notify-integration.example"
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    now = datetime.now(timezone.utc)
+    ready = False
+    try:
+        await storage.check_ready()
+        ready = True
+        await _purge_queue_status_fixtures(engine, url, slug, url)
+        async with storage.listen(JOBS_CHANNEL) as listener:
+            await storage.apply_batch(
+                [
+                    RawArticle(
+                        url=url,
+                        url_original=url,
+                        title="Title",
+                        source="Example",
+                        lang="en",
+                        content="body",
+                        content_hash=b"n" * 32,
+                        published_at=now,
+                        crawled_at=now,
+                    )
+                ],
+                [],
+                [],
+                received=1,
+                rejected=0,
+            )
+            await asyncio.wait_for(listener.event.wait(), timeout=5)
+        counts = await storage.actionable_jobs(["embed", "no-such-stage"])
+        assert counts["embed"] >= 1
+        assert counts["no-such-stage"] == 0
+    finally:
+        if ready:
+            await _purge_queue_status_fixtures(engine, url, slug, url)
+        await engine.dispose()
+        await storage.close()
 
 
 def test_reaper_only_touches_stale_runs_of_its_own_worker() -> None:

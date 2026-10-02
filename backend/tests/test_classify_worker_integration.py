@@ -8,7 +8,10 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from adapters.embedding.fastembed_embedder import EMBEDDING_DIM, MODEL_NAME
-from adapters.storage.postgres import PostgresRawStorage
+from adapters.storage.postgres import (
+    PostgresRawStorage,
+    _refresh_cluster_topics_locked,
+)
 from adapters.storage.schema import (
     article_classifications,
     article_embeddings,
@@ -480,6 +483,64 @@ async def _test_refresh_clusters_rebuilds_labels_from_article_topics() -> None:
             _classify_context(storage, now, refresh_clusters=True)
         )
         assert outcome.stats.clusters_refreshed >= 1
+        assert await _cluster_labels(engine, article_ids[0]) == before
+    finally:
+        await _cleanup(engine)
+        await engine.dispose()
+        await storage.close()
+
+
+def test_concurrent_refreshes_of_one_cluster_serialize() -> None:
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_test_concurrent_refreshes_of_one_cluster_serialize())
+
+
+async def _test_concurrent_refreshes_of_one_cluster_serialize() -> None:
+    """Two classify replicas refreshing one story must not collide.
+
+    Without the per-cluster lock the later transaction's delete cannot see
+    the earlier one's uncommitted insert, and its own insert then hits the
+    primary key the moment the first commits.
+    """
+    now = datetime.now(timezone.utc)
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    try:
+        await storage.check_ready()
+        await _cleanup(engine)
+        await _seed_topics(engine)
+        article_ids = await _seed_articles(storage, engine, now)
+        await ClassifyWorker(queue=PostgresJobQueue(engine)).execute(
+            _classify_context(storage, now)
+        )
+        await ClusterWorker(queue=PostgresJobQueue(engine)).execute(
+            _cluster_context(storage, now)
+        )
+        before = await _cluster_labels(engine, article_ids[0])
+        assert before
+        async with engine.connect() as connection:
+            cluster_id = await connection.scalar(
+                select(cluster_members.c.cluster_id).where(
+                    cluster_members.c.article_id == article_ids[0]
+                )
+            )
+
+        first_refreshed = asyncio.Event()
+
+        async def slow_refresh() -> None:
+            async with engine.begin() as connection:
+                await _refresh_cluster_topics_locked(connection, cluster_id)
+                first_refreshed.set()
+                # Hold the transaction open so the second one overlaps it.
+                await asyncio.sleep(0.3)
+
+        async def racing_refresh() -> None:
+            await first_refreshed.wait()
+            async with engine.begin() as connection:
+                await _refresh_cluster_topics_locked(connection, cluster_id)
+
+        await asyncio.wait_for(asyncio.gather(slow_refresh(), racing_refresh()), 10)
         assert await _cluster_labels(engine, article_ids[0]) == before
     finally:
         await _cleanup(engine)
