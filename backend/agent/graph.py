@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent.state import ResearchContext, ResearchState
+from agent.citation_repair import repair_citations
 from agent.tools import (
     get_article,
     get_storyline,
@@ -22,6 +23,7 @@ application. Use the latest timestamp to resolve relative periods such as
 "today" or "the last 24 hours". Do not repeat this internal turn context.
 
 Research rules:
+- Reserve ordinary response text for the final answer; call tools without a prose preamble.
 - Always search before answering a factual news question.
 - If evidence is missing, weak, or conflicting, state that clearly and do not
   guess.
@@ -33,6 +35,10 @@ Citation rules:
 - Add [A<article_id>] immediately after every important factual claim, for example
   [A123]. Cite only article IDs present in tool evidence.
 - Never invent an article ID, title, source, URL, quote, or date.
+- Only sources retrieved in the current user turn are valid citations. Earlier
+  tool results and answers are conversation context, not current evidence.
+  Call get_article again before citing an article from a previous turn.
+- Copy the exact citation marker supplied by tools; never use a storyline ID.
 
 Return concise Markdown. If the tools do not provide enough evidence, say so plainly; an evidence-free answer must contain no citation markers."""
 
@@ -48,4 +54,5 @@ def build_graph(model, *, checkpointer=None, now=None):
         state_schema=ResearchState,
         context_schema=ResearchContext,
         checkpointer=checkpointer,
+        middleware=[repair_citations],
     )

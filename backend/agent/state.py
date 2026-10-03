@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, NotRequired
 
 from langchain.agents import AgentState
 
@@ -43,6 +43,7 @@ def merge_evidence(
 
 class ResearchState(AgentState):
     evidence: Annotated[list[Evidence], merge_evidence]
+    citation_repair_attempts: NotRequired[int]
 
 
 @dataclass(frozen=True)

@@ -19,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from adapters.storage import PostgresRawStorage, StorageError
 from agent.config import RECURSION_LIMIT, RUN_TIMEOUT_SECONDS, build_openrouter_model
+from agent.citations import CITATION_RE
 from agent.embedding import QueryEmbedder, QueryEmbedderProtocol, QueryEmbeddingError
 from agent.graph import build_graph
 from agent.state import Evidence, ResearchContext
@@ -28,7 +29,6 @@ from observability.instruments import observe_agent_run, record_llm_usage
 
 
 logger = get_logger(__name__)
-CITATION_RE = re.compile(r"\[A(\d+)\]")
 LOG_CONTENT_LIMIT = 2_000
 SECRET_VALUE_RE = re.compile(
     r"(?i)(api[_-]?key|authorization)(\s*[:=]\s*)([^\s,;]+)"
@@ -125,7 +125,11 @@ def _message_text(message: Any) -> str:
         for block in content:
             if isinstance(block, str):
                 parts.append(block)
-            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+            elif (
+                isinstance(block, dict)
+                and block.get("type", "text") == "text"
+                and isinstance(block.get("text"), str)
+            ):
                 parts.append(block["text"])
         return "".join(parts).strip()
     return str(content).strip()
@@ -140,10 +144,52 @@ def _message_delta_text(message: Any) -> str:
         for block in content:
             if isinstance(block, str):
                 parts.append(block)
-            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+            elif (
+                isinstance(block, dict)
+                and block.get("type", "text") == "text"
+                and isinstance(block.get("text"), str)
+            ):
                 parts.append(block["text"])
         return "".join(parts)
-    return str(content)
+    return ""
+
+
+def _message_reasoning_text(message: Any) -> str:
+    """Read only displayable reasoning, never signatures or encrypted blocks."""
+    extra = getattr(message, "additional_kwargs", None) or {}
+    for key in ("reasoning_content", "reasoning"):
+        if isinstance(extra.get(key), str) and extra[key]:
+            return extra[key]
+    blocks = extra.get("reasoning_details") or []
+    if not blocks and isinstance(getattr(message, "content", None), list):
+        blocks = message.content
+    parts = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        key = {
+            "reasoning.text": "text", "reasoning.summary": "summary",
+            "reasoning": "reasoning", "thinking": "thinking",
+        }.get(kind)
+        if key and isinstance(block.get(key), str):
+            parts.append(block[key])
+    return "".join(parts)
+
+
+def _tool_result_event(message: ToolMessage) -> ResearchStreamEvent:
+    try:
+        payload = json.loads(_message_text(message))
+    except (TypeError, ValueError):
+        payload = None
+    failed = message.status == "error" or (
+        isinstance(payload, dict) and payload.get("ok") is False
+    )
+    return ResearchStreamEvent("tool_result", {
+        "id": message.tool_call_id,
+        "status": "error" if failed else "completed",
+        "output": _logged_message_content(message),
+    })
 
 
 def _root_exception(exc: BaseException) -> BaseException:
@@ -165,13 +211,20 @@ def _root_exception(exc: BaseException) -> BaseException:
 def _contains_exception(
     exc: BaseException, classes: tuple[type[BaseException], ...]
 ) -> bool:
-    if isinstance(exc, classes):
-        return True
-    nested = getattr(exc, "exceptions", None) or ()
-    if any(_contains_exception(item, classes) for item in nested):
-        return True
-    cause = exc.__cause__ or exc.__context__
-    return cause is not None and _contains_exception(cause, classes)
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, classes):
+            return True
+        pending.extend(getattr(current, "exceptions", None) or ())
+        cause = current.__cause__ or current.__context__
+        if cause is not None:
+            pending.append(cause)
+    return False
 
 
 def _diagnostic(exc: BaseException) -> tuple[str, str]:
@@ -336,6 +389,8 @@ class ResearchService:
                 model=settings.news_agent_model,
                 site_url=settings.openrouter_site_url,
                 timeout_seconds=settings.openrouter_timeout_seconds,
+                base_url=settings.openrouter_base_url,
+                extra_body=settings.openrouter_extra_body,
             )
         return cls(
             storage=storage,
@@ -356,17 +411,18 @@ class ResearchService:
     def _configured_model(self, thread_id: str) -> Any:
         if self._model is None:
             return None
-        if not hasattr(self._model, "extra_body"):
+        if not hasattr(self._model, "session_id"):
             return self._model
-        extra_body = dict(getattr(self._model, "extra_body", None) or {})
-        extra_body["session_id"] = thread_id
+        model_kwargs = dict(getattr(self._model, "model_kwargs", None) or {})
         model_name = str(
             getattr(self._model, "model_name", None)
             or getattr(self._model, "model", "")
         )
         if model_name.startswith("anthropic/"):
-            extra_body["cache_control"] = {"type": "ephemeral"}
-        return self._model.model_copy(update={"extra_body": extra_body})
+            model_kwargs["cache_control"] = {"type": "ephemeral"}
+        return self._model.model_copy(update={
+            "session_id": thread_id, "model_kwargs": model_kwargs,
+        })
 
     def start_stream(self, query: str, *, thread_id: str) -> ResearchStreamSession:
         request_id = uuid4().hex
@@ -446,6 +502,9 @@ class ResearchService:
         logged_messages = baseline_messages
         observed_messages = baseline_messages
         emitted_tool_calls: set[str] = set()
+        emitted_tool_results: set[str] = set()
+        reasoning_generations: set[str] = set()
+        preamble_generations: set[str] = set()
         current_generation: str | None = None
         current_generation_uses_tools = False
         visible_answer = ""
@@ -473,13 +532,33 @@ class ResearchService:
                     {
                         "messages": [HumanMessage(content=turn_message)],
                         "evidence": Overwrite([]),
+                        "citation_repair_attempts": 0,
                     },
                     config=config,
                     context=context,
-                    stream_mode=["messages", "values"],
+                    stream_mode=["messages", "values", "custom"],
                     version="v2",
                 ):
                     part_type = part.get("type")
+                    if part_type == "custom":
+                        data = part["data"]
+                        if isinstance(data, dict) and data.get("type") == "citation_repair":
+                            logger.info(
+                                "Research citation repair request_id=%s article_ids=%s attempt=1",
+                                request_id, data["article_ids"],
+                            )
+                            visible_answer = ""
+                            current_generation = None
+                            current_generation_uses_tools = False
+                            yield ResearchStreamEvent("reset", {"reason": "citation_repair"})
+                            yield ResearchStreamEvent("status", {"phase": "verifying"})
+                            continue
+                        if isinstance(data, dict) and data.get("type") == "tool_result":
+                            message = data["message"]
+                            if message.tool_call_id not in emitted_tool_results:
+                                emitted_tool_results.add(message.tool_call_id)
+                                yield _tool_result_event(message)
+                        continue
                     if part_type == "messages":
                         message, metadata = part["data"]
                         if metadata.get("langgraph_node") != "model":
@@ -488,15 +567,31 @@ class ResearchService:
                         if generation != current_generation:
                             current_generation = generation
                             current_generation_uses_tools = False
+                        reasoning = _message_reasoning_text(message)
+                        if reasoning:
+                            reasoning_generations.add(generation)
+                            yield ResearchStreamEvent("reasoning", {
+                                "id": generation, "text": reasoning,
+                            })
                         calls = list(getattr(message, "tool_calls", None) or [])
                         call_chunks = list(
                             getattr(message, "tool_call_chunks", None) or []
                         )
                         if calls or call_chunks:
                             if not current_generation_uses_tools and visible_answer:
+                                preamble_generations.add(generation)
+                                yield ResearchStreamEvent("reasoning", {
+                                    "id": f"{generation}:preamble", "text": visible_answer,
+                                })
                                 visible_answer = ""
-                                yield ResearchStreamEvent("reset", {})
+                                yield ResearchStreamEvent("reset", {"reason": "tool_call"})
                             current_generation_uses_tools = True
+                            delta = _message_delta_text(message)
+                            if delta:
+                                preamble_generations.add(generation)
+                                yield ResearchStreamEvent("reasoning", {
+                                    "id": f"{generation}:preamble", "text": delta,
+                                })
                             for call in [*calls, *call_chunks]:
                                 tool_name = str(call.get("name") or "")
                                 call_id = str(
@@ -514,6 +609,12 @@ class ResearchService:
                                     )
                             continue
                         if current_generation_uses_tools:
+                            delta = _message_delta_text(message)
+                            if delta:
+                                preamble_generations.add(generation)
+                                yield ResearchStreamEvent("reasoning", {
+                                    "id": f"{generation}:preamble", "text": delta,
+                                })
                             continue
                         delta = _message_delta_text(message)
                         if delta:
@@ -531,6 +632,20 @@ class ResearchService:
                     )
                     for message in messages[observed_messages:]:
                         if isinstance(message, AIMessage):
+                            generation = str(message.id or "model")
+                            reasoning = _message_reasoning_text(message)
+                            if reasoning and generation not in reasoning_generations:
+                                reasoning_generations.add(generation)
+                                yield ResearchStreamEvent("reasoning", {
+                                    "id": generation, "text": reasoning,
+                                })
+                            preamble = _message_delta_text(message)
+                            if (message.tool_calls and preamble
+                                    and generation not in preamble_generations):
+                                preamble_generations.add(generation)
+                                yield ResearchStreamEvent("reasoning", {
+                                    "id": f"{generation}:preamble", "text": preamble,
+                                })
                             for call in message.tool_calls:
                                 tool_name = str(call.get("name") or "")
                                 call_id = str(call.get("id") or tool_name)
@@ -538,7 +653,7 @@ class ResearchService:
                                     emitted_tool_calls.add(call_id)
                                     if visible_answer:
                                         visible_answer = ""
-                                        yield ResearchStreamEvent("reset", {})
+                                        yield ResearchStreamEvent("reset", {"reason": "tool_call"})
                                     yield ResearchStreamEvent(
                                         "status",
                                         {
@@ -546,7 +661,17 @@ class ResearchService:
                                             "tool": tool_name,
                                         },
                                     )
+                                yield ResearchStreamEvent("tool_call", {
+                                    "id": call_id,
+                                    "tool": tool_name,
+                                    "input": _safe_text(json.dumps(
+                                        call.get("args") or {}, ensure_ascii=False, default=str,
+                                    )),
+                                })
                         elif isinstance(message, ToolMessage):
+                            if message.tool_call_id not in emitted_tool_results:
+                                emitted_tool_results.add(message.tool_call_id)
+                                yield _tool_result_event(message)
                             yield ResearchStreamEvent(
                                 "status", {"phase": "synthesizing"}
                             )

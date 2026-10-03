@@ -13,20 +13,11 @@ import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { MarkdownContent } from '@/components/feed/markdown-content'
 import { streamResearch } from '@/lib/research-stream'
+import { applyResearchEvent, type ChatMessage } from '@/lib/research-message'
+import { ResearchProgress } from './research-progress'
 import type { ResearchCitation, ResearchStreamEvent } from '@/lib/types'
 
 const SESSION_KEY = 'news-radar:ask-ai'
-
-type ChatMessage = {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  query?: string
-  citations?: ResearchCitation[]
-  status?: 'searching' | 'reading' | 'synthesizing'
-  pending?: boolean
-  error?: string
-}
 
 type StoredChat = {
   threadId: string
@@ -38,6 +29,7 @@ function createId(): string {
 }
 
 function statusLabel(status?: ChatMessage['status']): string {
+  if (status === 'verifying') return 'Verifying sources and correcting the answer…'
   if (status === 'searching') return 'Searching articles…'
   if (status === 'reading') return 'Reading sources…'
   return 'Synthesizing answer…'
@@ -130,6 +122,9 @@ export function AskView() {
       query,
       status: 'synthesizing',
       pending: true,
+      steps: [],
+      reasoningOpen: true,
+      answerStarted: false,
     }
     setMessages((current) =>
       appendUser
@@ -151,40 +146,9 @@ export function AskView() {
     let streamError = false
 
     function onEvent(event: ResearchStreamEvent) {
-      if (event.event === 'status') {
-        updateAssistant(assistantId, (message) => ({
-          ...message,
-          status: event.data.phase,
-        }))
-      } else if (event.event === 'delta') {
-        updateAssistant(assistantId, (message) => ({
-          ...message,
-          content: message.content + event.data.text,
-          status: undefined,
-        }))
-      } else if (event.event === 'reset') {
-        updateAssistant(assistantId, (message) => ({ ...message, content: '' }))
-      } else if (event.event === 'citations') {
-        updateAssistant(assistantId, (message) => ({
-          ...message,
-          citations: event.data.citations,
-        }))
-      } else if (event.event === 'done') {
-        completed = true
-        updateAssistant(assistantId, (message) => ({
-          ...message,
-          pending: false,
-          status: undefined,
-        }))
-      } else if (event.event === 'error') {
-        streamError = true
-        updateAssistant(assistantId, (message) => ({
-          ...message,
-          pending: false,
-          status: undefined,
-          error: `${event.data.reason} · Request ${event.data.request_id}`,
-        }))
-      }
+      if (event.event === 'done') completed = true
+      if (event.event === 'error') streamError = true
+      updateAssistant(assistantId, (message) => applyResearchEvent(message, event))
     }
 
     try {
@@ -293,6 +257,13 @@ export function AskView() {
                       <Sparkles className="size-3.5" />
                     </div>
                     <div className="min-w-0 flex-1">
+                      <ResearchProgress
+                        message={message}
+                        onToggle={() => updateAssistant(message.id, (current) => ({
+                          ...current,
+                          reasoningOpen: !(current.reasoningOpen ?? !current.answerStarted),
+                        }))}
+                      />
                       {message.content && (
                         <MarkdownContent
                           content={citationMarkdown(

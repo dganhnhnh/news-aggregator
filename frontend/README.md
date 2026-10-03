@@ -25,3 +25,10 @@ Frontend mặc định chạy tại `http://localhost:3000`. API backend cần �
 động riêng. Trang `/feeds` cần cả `news-api` và `news-admin-api`; xem
 [README chính](../README.md). Tab `/ask` gọi research agent qua SSE; conversation
 memory nằm trong process `news-api` và được reset khi API restart.
+
+Phần **Reasoning & tools** mở trong lúc agent chạy, hiển thị reasoning và
+input/result của từng tool. Khi nhận token answer đầu tiên, phần này tự thu gọn;
+có thể mở lại trong khi answer tiếp tục stream. Tiến trình được giữ cùng tin nhắn
+trong session hiện tại, kể cả sau khi stop hoặc có lỗi.
+
+Kiểm tra frontend: `pnpm test`, `pnpm exec tsc --noEmit`, `pnpm build`.

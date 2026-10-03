@@ -25,6 +25,7 @@ dependencies = [
     "langchain>=1.4,<2",
     "langchain-openai>=1.6,<2",
     "langgraph>=1.2,<2",
+    "langchain-openrouter>=0.2.9,<1",
 ]
 
 [project.optional-dependencies]

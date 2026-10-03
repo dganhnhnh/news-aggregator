@@ -90,6 +90,7 @@ def _article_evidence(
     evidence: Evidence = {
         "kind": "article",
         "article_id": article_id,
+        "citation": f"[A{article_id}]",
         "url": url,
         "title": title,
         "source": _source(source_slug, source_name),
@@ -114,17 +115,16 @@ def _json_default(value: Any) -> str:
 
 
 def _command(runtime: ToolRuntime, payload: dict[str, Any], evidence: list[Evidence]) -> Command:
+    message = ToolMessage(
+        content=json.dumps(payload, ensure_ascii=False, default=_json_default),
+        tool_call_id=runtime.tool_call_id,
+    )
+    # Publish each result immediately, even while sibling tools are still running.
+    runtime.stream_writer({"type": "tool_result", "message": message})
     return Command(
         update={
             "evidence": evidence,
-            "messages": [
-                ToolMessage(
-                    content=json.dumps(
-                        payload, ensure_ascii=False, default=_json_default
-                    ),
-                    tool_call_id=runtime.tool_call_id,
-                )
-            ],
+            "messages": [message],
         }
     )
 
@@ -187,6 +187,7 @@ async def search_articles(
     items = [
         {
             "id": hit.id,
+            "citation": f"[A{hit.id}]",
             "title": hit.title,
             "source": _source(hit.source_slug, hit.source_name),
             "published_at": hit.published_at,
@@ -248,6 +249,7 @@ async def search_storylines(
         members = [
             {
                 "article_id": member.article_id,
+                "citation": f"[A{member.article_id}]",
                 "title": member.title,
                 "url": member.url,
                 "source": _source(member.source_slug, member.source_name),
@@ -321,6 +323,7 @@ async def get_article(article_id: int, runtime: ToolRuntime) -> Command:
         "ok": True,
         "article": {
             "id": article_id,
+            "citation": f"[A{article_id}]",
             "url": article.url,
             "url_original": article.url_original,
             "title": article.title,
@@ -380,6 +383,7 @@ async def get_storyline(storyline_id: int, runtime: ToolRuntime) -> Command:
     members = [
         {
             "article_id": member.article_id,
+            "citation": f"[A{member.article_id}]",
             "title": member.title,
             "url": member.url,
             "source": _source(member.source_slug, member.source_name),

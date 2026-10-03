@@ -67,9 +67,12 @@ export type ResearchCitation = {
 
 export type ResearchStreamEvent =
   | { event: 'start'; data: { request_id: string; thread_id: string } }
-  | { event: 'status'; data: { phase: 'searching' | 'reading' | 'synthesizing'; tool?: string } }
+  | { event: 'status'; data: { phase: 'searching' | 'reading' | 'synthesizing' | 'verifying'; tool?: string } }
+  | { event: 'reasoning'; data: { id: string; text: string } }
+  | { event: 'tool_call'; data: { id: string; tool: string; input: string } }
+  | { event: 'tool_result'; data: { id: string; status: 'completed' | 'error'; output: string } }
   | { event: 'delta'; data: { text: string } }
-  | { event: 'reset'; data: Record<string, never> }
+  | { event: 'reset'; data: { reason?: 'tool_call' | 'citation_repair' } }
   | { event: 'citations'; data: { citations: ResearchCitation[] } }
   | { event: 'done'; data: { request_id: string; thread_id: string } }
   | {

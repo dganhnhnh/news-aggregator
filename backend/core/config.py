@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,6 +22,20 @@ load_dotenv()
 # good feed is disabled. Lives here rather than in the adapter so `Settings`
 # can default to it without `core` importing `adapters`.
 DEFAULT_USER_AGENT = "news-radar/1.0"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _env_json_object(name: str) -> dict:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return value
 
 
 def _env_int(name: str, default: int) -> int:
@@ -116,6 +131,8 @@ class Settings:
     # A feed one scheduler tick past due is normal, not overdue.
     metrics_feed_overdue_grace_seconds: int = 300
     openrouter_api_key: str | None = None
+    openrouter_base_url: str = DEFAULT_OPENROUTER_BASE_URL
+    openrouter_extra_body: dict = field(default_factory=dict)
     news_agent_model: str = "nvidia/nemotron-3.5-lightning:free"
     openrouter_site_url: str | None = None
     openrouter_timeout_seconds: float = 60.0
@@ -200,6 +217,11 @@ class Settings:
                 "METRICS_FEED_OVERDUE_GRACE_SECONDS", 300
             ),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip() or None,
+            openrouter_base_url=(
+                os.getenv("OPENROUTER_BASE_URL", "").strip().rstrip("/")
+                or DEFAULT_OPENROUTER_BASE_URL
+            ),
+            openrouter_extra_body=_env_json_object("OPENROUTER_EXTRA_BODY"),
             news_agent_model=(
                 os.getenv("OPENROUTER_MODEL", "").strip()
                 or "nvidia/nemotron-3.5-lightning:free"

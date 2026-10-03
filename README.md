@@ -651,18 +651,70 @@ Endpoint hiện có:
   cùng article citations; cần `OPENROUTER_API_KEY`, còn query embedding dùng cùng
   FastEmbed model với article embeddings.
 - `POST /api/research/stream` với body `{"query":"...","thread_id":"<uuid>"}` —
-  stream trạng thái, answer và citations bằng Server-Sent Events.
+  stream trạng thái, reasoning, tool call/result, answer và citations bằng Server-Sent Events.
 - `DELETE /api/research/threads/{thread_id}` — xoá conversation memory trong
   process của một chat session.
 
 Endpoint JSON mặc định vẫn stateless; endpoint stream dùng LangGraph in-process
 memory theo `thread_id` và không ghi PostgreSQL. Cấu hình model bằng
 `OPENROUTER_MODEL` (mặc định `nvidia/nemotron-3.5-lightning:free` qua OpenRouter) và có
-thể đặt `OPENROUTER_SITE_URL` để gửi attribution header. OpenRouter prompt cache
+thể đặt `OPENROUTER_BASE_URL` (mặc định `https://openrouter.ai/api/v1`) để dùng
+endpoint Chat Completions tương thích OpenAI khác. Giữ tên biến
+`OPENROUTER_API_KEY` và `OPENROUTER_MODEL` cho cả các provider này; cần dùng key
+và model của đúng provider. `OPENROUTER_SITE_URL` chỉ gửi attribution tới OpenRouter. OpenRouter prompt cache
 được bật cho Anthropic sessions. `OPENROUTER_TIMEOUT_SECONDS` giới hạn mỗi HTTP
 request tới model (mặc định 60 giây); `NEWS_AGENT_RUN_TIMEOUT_SECONDS` giới hạn
 toàn bộ vòng LangGraph gồm nhiều model/tool call (mặc định 90 giây). Nếu không
 có key, các endpoint đọc khác vẫn hoạt động và các endpoint research trả `503`.
+
+Stream phát `reasoning` (`id`, `text`) theo từng đoạn nếu model cung cấp;
+`tool_call` (`id`, `tool`, `input`) khi arguments đã đầy đủ; `tool_result`
+(`id`, `status`, `output`) ngay khi từng tool hoàn tất. Input/output là chuỗi
+JSON được giới hạn độ dài; nội dung bài viết đầy đủ không đưa vào phần tiến trình.
+Client ghép tool call/result theo `id`. `delta` tiếp tục chỉ chứa text câu trả lời.
+Nếu model phát lời dẫn rồi mới gọi tool, lời dẫn được chuyển sang reasoning và
+`reset` có `reason: "tool_call"` báo client mở lại tiến trình.
+Integration `langchain-openrouter` giữ reasoning qua các lượt tool; cấu hình
+reasoning effort `low`, tối đa 6000 output tokens bao gồm reasoning và answer.
+Model không trả reasoning vẫn stream tool call/result bình thường.
+
+Citation chỉ hợp lệ nếu nguồn đã được lấy trong lượt hỏi hiện tại; lịch sử hội
+thoại không tự động trở thành evidence của lượt mới. Tool trả sẵn marker
+`[A<article_id>]` để model sao chép chính xác. Nếu câu trả lời dùng citation chưa
+có evidence, agent được phản hồi một lần để đọc lại nguồn bằng `get_article`
+hoặc sửa phần không được hỗ trợ. UI xoá draft chưa hợp lệ và hiển thị trạng thái
+`verifying` trong khi sửa. Lần sửa vẫn nằm trong timeout/recursion limit của lượt
+hiện tại; nếu citation vẫn sai, backend tiếp tục chặn câu trả lời. Kiểm tra này
+xác nhận nguồn đã được truy xuất, không tự động chứng minh mọi nhận định khớp
+với nội dung nguồn.
+
+Với base URL ngoài `openrouter.ai`, agent dùng client Chat Completions tổng quát:
+giữ nguyên đường dẫn base và nối `/chat/completions`, không gửi `session_id`,
+`cache_control`, attribution hay cấu hình `reasoning` riêng của OpenRouter.
+Client bảo toàn `reasoning_content`, `reasoning`, `reasoning_details` và
+`encrypted_content` từ provider qua vòng gọi tool; dữ liệu mã hoá không hiển thị
+trong UI. Các tuỳ chọn riêng có thể truyền bằng `OPENROUTER_EXTRA_BODY` (JSON object).
+Usage chunks không được yêu cầu mặc định trên endpoint tổng quát; nếu provider
+hỗ trợ, có thể thêm `"stream_options":{"include_usage":true}` vào JSON này.
+
+Ví dụ [BytePlus Coding Plan](https://docs.byteplus.com/id/docs/modelark/coding-plan-personal-ai-opencode):
+
+```dotenv
+OPENROUTER_BASE_URL=https://ark.ap-southeast.bytepluses.com/api/coding/v3
+OPENROUTER_API_KEY=<BytePlus Coding Plan API key>
+OPENROUTER_MODEL=ark-code-latest
+OPENROUTER_EXTRA_BODY={"thinking":{"type":"enabled"}}
+```
+
+Restart `news-api` sau khi đổi cấu hình. Đường dẫn `/api/coding/v3` được giữ nguyên;
+không thay sang `/api/v3` (endpoint tính phí riêng của ModelArk).
+
+Với Docker Compose, phải tạo lại container để nạp environment mới (`restart`
+không cập nhật environment). Chạy từ thư mục gốc repo:
+
+```bash
+docker compose --env-file .env -f deployments/docker-compose.yml up -d --no-deps --force-recreate api
+```
 
 Admin API chạy ở process riêng để giữ `news-api` public hoàn toàn read-only:
 
