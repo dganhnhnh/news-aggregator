@@ -35,6 +35,7 @@ from workers.base import (
     exit_busy_for,
     stale_after_for,
 )
+from workers.taxonomy_discover import TaxonomyDiscoverWorker
 from workers.classify import ClassifyWorker
 from workers.crawl import CrawlWorker
 from workers.cluster import ClusterWorker
@@ -52,6 +53,7 @@ WORKERS: dict[str, type[Worker]] = {
     EmbedWorker.name: EmbedWorker,
     ClassifyWorker.name: ClassifyWorker,
     ClusterWorker.name: ClusterWorker,
+    TaxonomyDiscoverWorker.name: TaxonomyDiscoverWorker,
 }
 
 # What `news-worker semantic` runs for each stage. The budgets are the old
@@ -69,6 +71,7 @@ SEMANTIC_STAGE_ARGV: dict[str, list[str]] = {
 # last and always runs, so a failed repair still leaves a snapshot behind.
 MAINTENANCE_STEPS: tuple[list[str], ...] = (
     ["cluster", "--repair", "--last", "7d", "--max-runtime", "30m"],
+    ["taxonomy-discover", "--strict", "--apply", "--last", "7d", "--max-runtime", "15m"],
     ["boilerplate-refresh"],
     ["cleanup-block-pages", "--limit", "200"],
     ["queue-status", "--json", "--runs-window", "24", "--fail-on-alert"],
@@ -477,6 +480,14 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Apply the cleanup; without this flag the command is a dry run",
     )
 
+    discovery = subparsers.add_parser("taxonomy-discover", help="Discover additive topics from multi-article stories")
+    _add_common_arguments(discovery)
+    discovery.add_argument("--apply", action="store_true", help="Publish validated topics and queue stale articles")
+    discovery.add_argument("--limit", type=int, default=100, help="Maximum stories (1-100)")
+    discovery.add_argument("--threshold", type=float, default=0.40)
+    discovery.add_argument("--proposal", type=Path, help="Use a saved proposal JSON instead of calling the LLM")
+    discovery.add_argument("--report", type=Path, help="Save proposal, evidence and outcomes as JSON")
+
     taxonomy_import = subparsers.add_parser(
         "taxonomy-import", help="Import topics and taxonomy trees from a YAML seed file"
     )
@@ -634,7 +645,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "maintenance",
-        help="Run the nightly steps: cluster repair, boilerplate refresh, "
+        help="Run nightly cluster repair, optional taxonomy discovery, boilerplate refresh, "
         "block-page dry run and the queue health report",
     )
 
@@ -646,7 +657,10 @@ def resolve_window(
     parser: argparse.ArgumentParser,
 ) -> RunWindow:
     try:
-        return build_window(last=args.last, since=args.since, until=args.until)
+        last = args.last
+        if args.command == "taxonomy-discover" and last is None and args.since is None:
+            last = "7d"
+        return build_window(last=last, since=args.since, until=args.until)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -754,6 +768,13 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             _validate_crawl(args, parser, adaptive=args.command == "crawl")
         elif args.command in {"embed", "classify"}:
             _validate_embed(args, parser)
+        elif args.command == "taxonomy-discover":
+            if not 1 <= args.limit <= 100:
+                parser.error("--limit must be between 1 and 100")
+            if not 0.30 <= args.threshold <= 0.65:
+                parser.error("--threshold must be between 0.30 and 0.65")
+            if args.proposal and not args.proposal.is_file():
+                parser.error("--proposal file not found")
         elif args.command == "cluster":
             _validate_cluster(args, parser)
     elif args.command in {"replay", "cleanup-block-pages"}:
@@ -849,6 +870,8 @@ async def _run_maintenance(settings: Settings) -> int:
     parser = build_parser(settings)
     failed: list[str] = []
     for argv in MAINTENANCE_STEPS:
+        if argv[0] == "taxonomy-discover" and not settings.taxonomy_discovery_enabled:
+            continue
         step = " ".join(argv)
         step_args = parser.parse_args(argv)
         validate(step_args, parser)

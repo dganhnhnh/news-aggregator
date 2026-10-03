@@ -257,6 +257,13 @@ services:
     environment:
       <<: *worker-environment
       TZ: UTC
+      TAXONOMY_DISCOVERY_ENABLED: ${TAXONOMY_DISCOVERY_ENABLED:-false}
+      TAXONOMY_LLM_EXTRA_BODY: ${TAXONOMY_LLM_EXTRA_BODY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_EXTRA_BODY: ${OPENROUTER_EXTRA_BODY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-nvidia/nemotron-3.5-lightning:free}
+      OPENROUTER_TIMEOUT_SECONDS: ${OPENROUTER_TIMEOUT_SECONDS:-60}
     depends_on:
       db:
         condition: service_healthy
@@ -268,6 +275,7 @@ services:
         source: ./crontab
         target: /etc/news-radar/crontab
         read_only: true
+      - model_cache:/models
     stop_grace_period: 60s
     restart: unless-stopped
     deploy:

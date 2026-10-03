@@ -21,6 +21,7 @@ def build_openrouter_model(
     timeout_seconds: float = MODEL_TIMEOUT_SECONDS,
     base_url: str = DEFAULT_OPENROUTER_BASE_URL,
     extra_body: dict | None = None,
+    max_retries: int = MODEL_MAX_RETRIES,
 ):
     """Keep the existing factory name; the endpoint selects the wire protocol."""
     base_url = base_url.strip().rstrip("/")
@@ -37,7 +38,7 @@ def build_openrouter_model(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout_seconds,
-            max_retries=MODEL_MAX_RETRIES,
+            max_retries=max_retries,
             streaming=True,
             # Optional usage chunks are not supported by every compatible server.
             stream_usage=False,
@@ -58,7 +59,7 @@ def build_openrouter_model(
         base_url=base_url,
         api_key=api_key,
         timeout=round(timeout_seconds * 1000),
-        max_retries=MODEL_MAX_RETRIES,
+        max_retries=max_retries,
         streaming=True,
         stream_usage=True,
         default_headers=headers,

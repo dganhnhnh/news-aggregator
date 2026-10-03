@@ -137,6 +137,8 @@ class Settings:
     openrouter_site_url: str | None = None
     openrouter_timeout_seconds: float = 60.0
     news_agent_run_timeout_seconds: float = 90.0
+    taxonomy_discovery_enabled: bool = False
+    taxonomy_llm_extra_body: dict = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -150,6 +152,11 @@ class Settings:
             if origin.strip()
         )
         return cls(
+            taxonomy_llm_extra_body=_env_json_object("TAXONOMY_LLM_EXTRA_BODY"),
+            taxonomy_discovery_enabled=(
+                os.getenv("TAXONOMY_DISCOVERY_ENABLED", "false").strip().lower()
+                in {"1", "true", "yes"}
+            ),
             tavily_api_key=os.getenv("TAVILY_API_KEY") or None,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             database_url=os.getenv("DATABASE_URL", "").strip() or None,

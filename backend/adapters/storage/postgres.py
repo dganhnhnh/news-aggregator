@@ -4269,6 +4269,113 @@ class PostgresRawStorage:
             result = await connection.execute(stmt)
             return {row[0] for row in result if row[0] is not None}
 
+    async def classification_evaluation_ids(
+        self, *, since: datetime, until: datetime, after_id: int = 0, limit: int = 100
+    ) -> list[int]:
+        """Keyset pagination for bounded, reproducible evaluation snapshots."""
+        async with self._engine.connect() as connection:
+            return list((await connection.execute(
+                select(raw_articles.c.id).join(article_embeddings,
+                    article_embeddings.c.article_id == raw_articles.c.id)
+                .where(raw_articles.c.event_at >= since, raw_articles.c.event_at < until,
+                       raw_articles.c.id > after_id)
+                .order_by(raw_articles.c.id).limit(limit)
+            )).scalars())
+
+    async def taxonomy_discovery_stories(
+        self, *, since: datetime, until: datetime, limit: int = 100,
+        story_ids: Sequence[int] | None = None,
+    ) -> list[dict]:
+        """At most three representatives per real multi-member story in the window."""
+        async with self._engine.connect() as connection:
+            result = await connection.execute(text("""
+                WITH members AS (
+                    SELECT c.id, left(c.headline, 300) headline, a.id article_id,
+                           left(a.title, 300) title,
+                           left(coalesce(nullif(a.feed_summary, ''), a.content), 500) summary,
+                           count(*) OVER (PARTITION BY c.id) member_count,
+                           row_number() OVER (PARTITION BY c.id ORDER BY
+                               cm.similarity DESC, a.id) position
+                    FROM clusters c JOIN cluster_members cm ON cm.cluster_id = c.id
+                    JOIN raw_articles a ON a.id = cm.article_id
+                    WHERE c.status != 'merged' AND a.event_at >= :since AND a.event_at < :until
+                      AND (CAST(:story_ids AS bigint[]) IS NULL
+                           OR c.id = ANY(CAST(:story_ids AS bigint[])))
+                )
+                SELECT id, headline, max(member_count) n_articles,
+                       json_agg(json_build_object('id', article_id, 'title', title,
+                           'summary', summary) ORDER BY position) members
+                FROM members WHERE member_count > 1 AND position <= 3
+                GROUP BY id, headline ORDER BY max(member_count) DESC, id
+                LIMIT :limit
+            """), {"since": since, "until": until, "limit": limit,
+                      "story_ids": list(story_ids) if story_ids is not None else None})
+            return [dict(row) for row in result.mappings()]
+
+    async def create_discovered_topics(
+        self, seed: TaxonomySeed, vectors: Mapping[str, Sequence[float]],
+        *, model: str, dim: int,
+    ) -> list[str]:
+        """Publish complete new topics atomically; never overwrite a registry edit.
+
+        Signals, prototypes and an additive 'discovered' navigation tree become
+        visible together. A concurrent import winning a slug is left untouched.
+        """
+        from services.taxonomy import validate_seed
+        validate_seed(seed)
+        if any(len(vectors[t.slug]) != dim for t in seed.topics):
+            raise ValueError("Discovered prototype dimension mismatch")
+        created = []
+        async with self._engine.begin() as connection:
+            for topic in seed.topics:
+                topic_id = (await connection.execute(
+                    pg_insert(topics).values(
+                        slug=topic.slug, display_name=topic.name,
+                        description=topic.description, threshold=topic.threshold,
+                        active=True, classifier_revision=1,
+                    ).on_conflict_do_nothing(index_elements=[topics.c.slug])
+                    .returning(topics.c.id)
+                )).scalar_one_or_none()
+                if topic_id is None:
+                    continue
+                signals = [dict(topic_id=topic_id, kind="exemplar", value=x,
+                                weight=1.0, active=True) for x in topic.exemplars]
+                signals += [dict(topic_id=topic_id, kind="keyword", value=x.value,
+                                 weight=x.weight, active=True) for x in topic.keywords]
+                await connection.execute(topic_signals.insert(), signals)
+                await connection.execute(topic_prototypes.insert().values(
+                    topic_id=topic_id, model=model, dim=dim,
+                    embedding=list(vectors[topic.slug]),
+                    definition_hash=definition_hash(topic.exemplars),
+                ))
+                tree_id = (await connection.execute(
+                    pg_insert(taxonomies).values(slug="discovered", display_name="Discovered topics")
+                    .on_conflict_do_update(index_elements=[taxonomies.c.slug],
+                        set_={"revision": taxonomies.c.revision + 1})
+                    .returning(taxonomies.c.id)
+                )).scalar_one()
+                node_id = (await connection.execute(
+                    pg_insert(taxonomy_nodes).values(taxonomy_id=tree_id, slug=topic.slug,
+                        display_name=topic.name, sort_order=0)
+                    .on_conflict_do_update(index_elements=[taxonomy_nodes.c.taxonomy_id, taxonomy_nodes.c.slug],
+                        index_where=taxonomy_nodes.c.parent_id.is_(None),
+                        set_={"display_name": topic.name})
+                    .returning(taxonomy_nodes.c.id)
+                )).scalar_one()
+                await connection.execute(taxonomy_node_topics.insert().values(node_id=node_id, topic_id=topic_id))
+                created.append(topic.slug)
+        return created
+
+    async def taxonomy_discovery_cached(self, input_hash: str) -> dict | None:
+        """Reuse only validated successful proposals, including preview runs."""
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(select(worker_runs.c.stats).where(
+                worker_runs.c.worker == "taxonomy-discover",
+                worker_runs.c.status == "succeeded",
+                worker_runs.c.stats["input_hash"].astext == input_hash,
+            ).order_by(worker_runs.c.id.desc()).limit(1))).scalar_one_or_none()
+            return row.get("proposal") if row else None
+
     async def import_taxonomy(
         self, seed: TaxonomySeed, *, prune: bool = False
     ) -> TaxonomyImportSummary:
