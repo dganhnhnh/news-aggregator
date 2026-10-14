@@ -2,7 +2,7 @@
 
 import useSWRInfinite from 'swr/infinite'
 import { buildArticlesKey, fetcher } from '@/lib/client-api'
-import type { ArticlePage } from '@/lib/types'
+import type { ArticlePage, FeedPriority } from '@/lib/types'
 
 export type UseArticlesOptions = {
   base?: string
@@ -13,16 +13,18 @@ export type UseArticlesOptions = {
   q?: string
   limit?: number
   maxPerSource?: number
+  feed?: string
+  tier?: FeedPriority
 }
 
 export function useArticles(options: UseArticlesOptions) {
-  const { base = '/api/articles', since, until, sources, topics, q, limit = 25, maxPerSource } = options
+  const { base = '/api/articles', since, until, sources, topics, q, limit = 25, maxPerSource, feed, tier } = options
 
   const getKey = (pageIndex: number, previousPage: ArticlePage | null) => {
     if (previousPage && previousPage.next_cursor === null) return null
     const cursor = pageIndex === 0 ? null : previousPage?.next_cursor
     if (pageIndex !== 0 && !cursor) return null
-    return buildArticlesKey(base, { since, until, sources, topics, q, limit, cursor, maxPerSource })
+    return buildArticlesKey(base, { since, until, sources, topics, q, limit, cursor, maxPerSource, feed, tier })
   }
 
   const { data, error, isLoading, isValidating, size, setSize, mutate } =

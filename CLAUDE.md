@@ -64,6 +64,17 @@ future Next.js UI.
   `taxonomies`, `taxonomy_nodes`, `taxonomy_node_topics`) and classification
   (`article_classifications`, `article_topics`, `cluster_topics`). Raw HTML
   and historical article versions are intentionally not stored.
+- `article_feeds` links an article to every RSS/Atom feed that carried it
+  (`article_id`, `feed_url`; insert-only, no FK on `feed_url` because
+  `news-pipeline rss --persist` accepts unseeded feeds). The feed URL travels
+  in the crawl result `context["feed_url"]` and, for a failed crawl, in
+  `crawl_failures.feed_url`, so a later successful retry still links the
+  article. Instant/normal is **not** stored here: it is read live from
+  `feed_state.priority` (an unseeded feed counts as normal), so moving a feed
+  between tiers re-sorts its whole history. `GET /api/feeds` and the
+  `feed`/`tier` params of `/api/articles` drop the per-domain
+  `max_per_source` cap — an instant feed such as Hacker News links to many
+  domains. The migration backfill is heuristic (source label, then host).
 - `cluster_topics` is derived data with no source of truth of its own: it is
   always fully replaced from `article_topics` by
   `_refresh_cluster_topics_locked`, which classify, cluster attach, merge and

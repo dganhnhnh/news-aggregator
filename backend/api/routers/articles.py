@@ -18,6 +18,7 @@ from api.schemas import (
     TopicRef,
 )
 from core.config import Settings
+from models.storage_models import FeedTier
 
 
 router = APIRouter(prefix="/api/articles", tags=["articles"])
@@ -33,6 +34,8 @@ async def list_articles(
     topic: list[str] | None = Query(None),
     q: str | None = None,
     max_per_source: int = Query(3, ge=1, le=20),
+    feed: str | None = None,
+    tier: FeedTier | None = None,
     storage: PostgresRawStorage = Depends(get_storage),
     settings: Settings = Depends(get_settings),
 ) -> CursorPage[ArticleSummary]:
@@ -49,6 +52,8 @@ async def list_articles(
         topic_slugs=topic,
         query=q,
         max_per_source=max_per_source,
+        feed_url=feed,
+        tier=tier,
     )
     next_cursor = (
         encode_cursor(items[-1].event_at, items[-1].id) if len(items) == limit else None

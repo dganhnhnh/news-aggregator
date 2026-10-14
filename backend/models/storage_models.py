@@ -39,6 +39,9 @@ class CrawlFailureOccurrence:
     # an article). Storage dead-letters it on the first occurrence instead of
     # burning MAX_FAILURE_ATTEMPTS on a deterministic outcome.
     permanent: bool = False
+    # The feed the entry was discovered in. Carried through the retry queue so
+    # an article that only crawls on a later attempt is still linked to it.
+    feed_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,9 @@ class RawArticle:
     crawled_at: datetime
     feed_summary: str = ""
     content_source: ContentSource = "crawl"
+    # Every feed this URL was discovered in during the batch. Persisted to
+    # `article_feeds`, never onto the article row itself.
+    feed_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -295,6 +301,21 @@ class SourceItem:
     slug: str
     name: str
     homepage: str | None
+
+
+# Reader-facing name for `feed_state.priority`: 0 is polled continuously by
+# `instant-crawl`, anything above it by the periodic `crawl`.
+FeedTier = Literal["instant", "normal"]
+
+
+@dataclass(frozen=True)
+class ArticleFeedSource:
+    """A feed that has articles, as the sidebar lists it."""
+
+    feed_url: str
+    source_label: str | None
+    tier: FeedTier
+    article_count: int
 
 
 @dataclass

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 from models.storage_models import (
     ArticleFeedItem,
     DailyArticleCount,
+    FeedTier,
     HighlightSegment,
     StoryFeedItem,
     TopicRefItem,
@@ -172,6 +173,15 @@ class SourceItem(BaseModel):
     slug: str
     name: str
     homepage: str | None
+
+
+class FeedSourceItem(BaseModel):
+    """A subscribed feed that has articles in the requested window."""
+
+    feed_url: str
+    label: str | None
+    tier: FeedTier
+    article_count: int
 
 
 class FeedWindow(BaseModel):

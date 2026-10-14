@@ -85,6 +85,7 @@ def _enrich_retry_result(
         {
             "feed_title": failure.source or "",
             "query_label": failure.source or "",
+            "feed_url": failure.feed_url or "",
             "published_date": failure.published_at,
             "feed_entry_url": failure.url,
         }
@@ -181,6 +182,7 @@ async def iter_retry_batches(
                             source=failure.source,
                             title=failure.title,
                             published_at=failure.published_at,
+                            feed_url=failure.feed_url,
                             error_type=crawl_failure_error_type(outcome.context),
                             error_message=(
                                 outcome.error_message or "Unknown crawl failure"

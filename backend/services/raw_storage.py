@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import re
@@ -95,6 +96,11 @@ def article_source(result: CrawlResult, normalized_url: str) -> str:
     )
 
 
+def _feed_urls(result: CrawlResult) -> tuple[str, ...]:
+    feed_url = _optional_text(result.context.get("feed_url"))
+    return (feed_url,) if feed_url else ()
+
+
 def _content_source(result: CrawlResult, content: str) -> ContentSource:
     if not content:
         return "feed_summary"
@@ -132,6 +138,7 @@ def crawl_result_to_article(result: CrawlResult) -> RawArticle:
         content_source=_content_source(result, content),
         published_at=_published_at(result),
         crawled_at=result.fetched_at,
+        feed_urls=_feed_urls(result),
     )
 
 
@@ -150,6 +157,9 @@ def _supersedes(candidate: RawArticle, current: RawArticle) -> bool:
 def prepare_articles(results: list[CrawlResult]) -> tuple[list[RawArticle], int]:
     """Convert valid results and keep the best result for each normalized URL."""
     by_url: dict[str, RawArticle] = {}
+    # The winning result per URL may come from one feed while a losing one came
+    # from another; the article belongs to both, so feeds are unioned.
+    feeds_by_url: dict[str, dict[str, None]] = {}
     rejected = 0
     for result in results:
         try:
@@ -157,7 +167,11 @@ def prepare_articles(results: list[CrawlResult]) -> tuple[list[RawArticle], int]
         except ValueError:
             rejected += 1
             continue
+        feeds_by_url.setdefault(article.url, {}).update(dict.fromkeys(article.feed_urls))
         current = by_url.get(article.url)
         if current is None or _supersedes(article, current):
             by_url[article.url] = article
-    return list(by_url.values()), rejected
+    return [
+        replace(article, feed_urls=tuple(feeds_by_url[url]))
+        for url, article in by_url.items()
+    ], rejected

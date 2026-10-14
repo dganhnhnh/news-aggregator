@@ -15,6 +15,7 @@ def test_article_retry_preserves_context_and_resolves_original_failure() -> None
         source="Example Engineering",
         title="RSS title",
         published_at=published_at,
+        feed_url="https://example.com/feed.xml",
         error_type="TimeoutError",
         error_message="timeout",
     )
@@ -48,6 +49,7 @@ def test_article_retry_preserves_context_and_resolves_original_failure() -> None
     assert batch.results[0].metadata.title == "RSS title"
     assert batch.results[0].context["feed_title"] == "Example Engineering"
     assert batch.results[0].context["published_date"] == published_at
+    assert batch.results[0].context["feed_url"] == "https://example.com/feed.xml"
     assert [(item.failure_kind, item.url) for item in batch.resolved_failures] == [
         ("article", failure.url)
     ]
@@ -98,6 +100,7 @@ def test_retrying_a_malformed_queued_url_dead_letters_it_instead_of_looping() ->
     failure = StoredCrawlFailure(
         failure_kind="article",
         url="/2020/06/22/post.html",
+        feed_url="https://example.com/feed.xml",
         error_type="CrawlError",
         error_message="crawler runtime error",
     )
@@ -132,6 +135,7 @@ def test_retrying_a_malformed_queued_url_dead_letters_it_instead_of_looping() ->
     assert len(batch.failures) == 1
     assert batch.failures[0].permanent is True
     assert batch.failures[0].error_type == "UnusableUrl:relative"
+    assert batch.failures[0].feed_url == "https://example.com/feed.xml"
 
 
 def test_a_retry_keeps_the_stored_feed_title_over_the_block_pages() -> None:

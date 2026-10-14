@@ -12,6 +12,7 @@ from api.main import create_app
 from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
+    ArticleFeedSource,
     DailyArticleCount,
     SourceItem,
     StoryDetailItem,
@@ -136,9 +137,23 @@ class FakeStorage:
         topic_slugs=None,
         query=None,
         max_per_source=3,
+        feed_url=None,
+        tier=None,
     ):
         self.feed_article_topic_slugs = topic_slugs
+        self.feed_article_scope = {"feed_url": feed_url, "tier": tier}
         return self._feed_items[:limit]
+
+    async def list_article_feeds(self, *, since, until, tier=None):
+        self.listed_feeds = {"since": since, "until": until, "tier": tier}
+        return [
+            ArticleFeedSource(
+                feed_url="https://example.com/feed.xml",
+                source_label="Example",
+                tier="instant",
+                article_count=4,
+            )
+        ]
 
     async def daily_article_counts(
         self, *, since, until, query, source_slugs=None, topic_slugs=None
@@ -254,6 +269,55 @@ def test_list_articles_passes_topic_filter() -> None:
 
     assert response.status_code == 200
     assert storage.feed_article_topic_slugs == ["artificial-intelligence", "open-source"]
+
+
+def test_list_articles_passes_feed_and_tier_scope() -> None:
+    app = create_app()
+    storage = FakeStorage()
+    app.dependency_overrides[get_storage] = lambda: storage
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/articles",
+        params={"feed": "https://example.com/feed.xml?x=1", "tier": "instant"},
+    )
+
+    assert response.status_code == 200
+    assert storage.feed_article_scope == {
+        "feed_url": "https://example.com/feed.xml?x=1",
+        "tier": "instant",
+    }
+
+
+def test_list_articles_rejects_unknown_tier() -> None:
+    client = _client()
+    assert client.get("/api/articles?tier=urgent").status_code == 422
+
+
+def test_list_feeds() -> None:
+    app = create_app()
+    storage = FakeStorage()
+    app.dependency_overrides[get_storage] = lambda: storage
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/feeds?tier=instant&since=2026-01-01T00:00:00Z&until=2026-02-01T00:00:00Z"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "feed_url": "https://example.com/feed.xml",
+            "label": "Example",
+            "tier": "instant",
+            "article_count": 4,
+        }
+    ]
+    assert storage.listed_feeds == {
+        "since": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "until": datetime(2026, 2, 1, tzinfo=timezone.utc),
+        "tier": "instant",
+    }
 
 
 def test_get_article_not_found() -> None:

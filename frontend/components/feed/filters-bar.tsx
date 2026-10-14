@@ -43,6 +43,8 @@ type FiltersBarProps = {
   selectedTopics: string[]
   onSelectedTopicsChange: (topics: string[]) => void
   lockedSourceName?: string
+  // The feed or tier chosen in the sidebar; shown so the list's scope is visible.
+  scopeLabel?: string
   resultLabel?: string
 }
 
@@ -57,6 +59,7 @@ export function FiltersBar({
   selectedTopics,
   onSelectedTopicsChange,
   lockedSourceName,
+  scopeLabel,
   resultLabel,
 }: FiltersBarProps) {
   const sourceNow = useMinuteNow()
@@ -105,6 +108,16 @@ export function FiltersBar({
             </SelectGroup>
           </SelectContent>
         </Select>
+
+        {scopeLabel && (
+          <Badge
+            variant="secondary"
+            className="h-9 max-w-64 shrink-0 rounded-md px-3 text-xs"
+            title={scopeLabel}
+          >
+            <span className="truncate">{scopeLabel}</span>
+          </Badge>
+        )}
 
         {lockedSourceName ? (
           <Badge variant="secondary" className="h-9 shrink-0 rounded-md px-3 text-xs">

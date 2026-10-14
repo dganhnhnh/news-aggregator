@@ -1,6 +1,8 @@
 import type {
   ArticleDetail,
   ArticlePage,
+  FeedPriority,
+  FeedSource,
   ManagedFeed,
   Source,
   StoryDetail,
@@ -78,6 +80,8 @@ export type ArticlesParams = {
   topics?: string[]
   q?: string
   maxPerSource?: number
+  feed?: string
+  tier?: FeedPriority
 }
 
 export type SourcesParams = {
@@ -118,6 +122,8 @@ export function buildArticlesKey(base: string, params: ArticlesParams): string {
   if (params.cursor) sp.set('cursor', params.cursor)
   if (params.q) sp.set('q', params.q)
   if (params.maxPerSource) sp.set('max_per_source', String(params.maxPerSource))
+  if (params.feed) sp.set('feed', params.feed)
+  if (params.tier) sp.set('tier', params.tier)
   for (const s of params.sources ?? []) sp.append('source', s)
   for (const topic of params.topics ?? []) sp.append('topic', topic)
   const qs = sp.toString()
@@ -153,9 +159,26 @@ export function buildSourcesKey(params: SourcesParams = {}): string {
   return qs ? `/api/sources?${qs}` : '/api/sources'
 }
 
+export type FeedsParams = {
+  since?: string
+  until?: string
+  tier?: FeedPriority
+}
+
+export function buildFeedsKey(params: FeedsParams = {}): string {
+  const sp = new URLSearchParams()
+  if (params.since) sp.set('since', params.since)
+  if (params.until) sp.set('until', params.until)
+  if (params.tier) sp.set('tier', params.tier)
+  const qs = sp.toString()
+  return qs ? `/api/feeds?${qs}` : '/api/feeds'
+}
+
 export type {
   ArticleDetail,
   ArticlePage,
+  FeedPriority,
+  FeedSource,
   ManagedFeed,
   Source,
   StoryDetail,

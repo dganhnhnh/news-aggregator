@@ -936,6 +936,23 @@ def test_full_feed_content_is_stored_without_crawling_the_page() -> None:
     assert batch.articles_from_feed_content == 1
 
 
+def test_crawled_results_and_failures_carry_their_feed_url() -> None:
+    class _FailingProvider(_RecordingProvider):
+        async def crawl_batch(self, urls, *, max_concurrency=None):
+            return [
+                CrawlResult(url=url, markdown="", success=False, error_message="boom")
+                for url in urls
+            ]
+
+    entry = _entry_with_content("")
+    ok = asyncio.run(_searcher_with(_RecordingProvider()).crawl_entries([entry]))
+    failed = asyncio.run(_searcher_with(_FailingProvider()).crawl_entries([entry]))
+
+    assert ok.results[0].context["feed_url"] == entry.feed_url
+    assert failed.results[0].context["feed_url"] == entry.feed_url
+    assert failed.failures[0].feed_url == entry.feed_url
+
+
 def test_a_teaser_still_falls_back_to_crawling() -> None:
     provider = _RecordingProvider()
     searcher = _searcher_with(provider)

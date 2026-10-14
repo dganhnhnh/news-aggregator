@@ -36,12 +36,25 @@ function statusLabel(status?: ChatMessage['status']): string {
 }
 
 function citationMarkdown(content: string, citations: ResearchCitation[]): string {
-  if (!citations.length) return content
-  const definitions = citations
+  // The API returns sources in order of first citation. Keep the same numbers
+  // while streaming, before the source metadata arrives.
+  const numbers = new Map(
+    citations.map((citation, index) => [citation.article_id, index + 1]),
+  )
+  const linkedIds = new Set(citations
     .filter((citation) => /^https?:\/\//.test(citation.url))
+    .map((citation) => citation.article_id))
+  const numberedContent = content.replace(/\[A(\d+)\]/g, (_, rawId: string) => {
+    const id = Number(rawId)
+    if (!numbers.has(id)) numbers.set(id, numbers.size + 1)
+    const label = numbers.get(id)
+    return linkedIds.has(id) ? `[${label}][A${id}]` : `[${label}]`
+  })
+  const definitions = citations
+    .filter((citation) => linkedIds.has(citation.article_id))
     .map((citation) => `[A${citation.article_id}]: <${citation.url}>`)
     .join('\n')
-  return definitions ? `${content}\n\n${definitions}` : content
+  return definitions ? `${numberedContent}\n\n${definitions}` : numberedContent
 }
 
 function publishedDate(value: string | null): string | null {
@@ -302,7 +315,7 @@ export function AskView() {
                             Sources
                           </p>
                           <div className="flex flex-col gap-1.5">
-                            {message.citations.map((citation) => {
+                            {message.citations.map((citation, index) => {
                               const date = publishedDate(citation.published_at)
                               return (
                                 <a
@@ -313,7 +326,7 @@ export function AskView() {
                                   className="group flex items-start gap-3 rounded-lg border border-border px-3 py-2.5 transition-colors hover:bg-muted/60"
                                 >
                                   <span className="rounded bg-primary/12 px-1.5 py-0.5 font-mono text-xs font-medium text-primary">
-                                    A{citation.article_id}
+                                    {index + 1}
                                   </span>
                                   <span className="min-w-0 flex-1">
                                     <span className="line-clamp-1 block text-sm font-medium group-hover:text-primary">

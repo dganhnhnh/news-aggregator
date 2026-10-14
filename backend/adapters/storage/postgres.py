@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from adapters.storage.schema import (
     article_classifications,
     article_embeddings,
+    article_feeds,
     article_topics,
     cluster_members,
     cluster_topics,
@@ -62,6 +63,7 @@ from observability.instruments import search_timer, timed_search
 from models.storage_models import (
     ArticleDetailItem,
     ArticleFeedItem,
+    ArticleFeedSource,
     ArticleSearchHit,
     BoilerplateRefreshStats,
     ClassifiableArticle,
@@ -81,6 +83,7 @@ from models.storage_models import (
     FailureTarget,
     FailureTypeCount,
     FeedFailureOutcome,
+    FeedTier,
     FailureQueueStatus,
     FeedMetrics,
     FeedPollTarget,
@@ -1577,6 +1580,11 @@ class PostgresRawStorage:
                             int(previous.priority) if previous else priority,
                             priority,
                         ),
+                        "feed_url": (
+                            failure.feed_url
+                            if failure.feed_url is not None
+                            else previous.feed_url if previous else None
+                        ),
                         "error_type": failure.error_type[:200],
                         "error_message": failure.error_message[:2000],
                         "attempt_count": attempt,
@@ -1703,6 +1711,10 @@ class PostgresRawStorage:
                     connection, written_article_ids, priority=priority
                 )
 
+            # Unchanged articles are not in `written_article_ids`, yet they can
+            # still turn up in a feed they were not linked to before.
+            await self._link_articles_to_feeds(connection, articles)
+
         deduplicated = max(received - rejected - len(articles), 0)
         unchanged = max(len(articles) - written, 0)
         return StorageWriteSummary(
@@ -1712,6 +1724,40 @@ class PostgresRawStorage:
             unchanged=unchanged,
             rejected=rejected,
         )
+
+    @staticmethod
+    async def _link_articles_to_feeds(
+        connection: AsyncConnection,
+        articles: Sequence[RawArticle],
+    ) -> None:
+        """Record which feeds each article was seen in; never unlinks."""
+        feeds_by_url = {
+            article.url: article.feed_urls for article in articles if article.feed_urls
+        }
+        if not feeds_by_url:
+            return
+        ids = {
+            row.url: int(row.id)
+            for row in await connection.execute(
+                select(raw_articles.c.id, raw_articles.c.url).where(
+                    raw_articles.c.url.in_(list(feeds_by_url))
+                )
+            )
+        }
+        values = [
+            {"article_id": ids[url], "feed_url": feed_url}
+            for url, feed_urls in feeds_by_url.items()
+            if url in ids
+            for feed_url in feed_urls
+        ]
+        if values:
+            await connection.execute(
+                pg_insert(article_feeds)
+                .values(values)
+                .on_conflict_do_nothing(
+                    index_elements=[article_feeds.c.article_id, article_feeds.c.feed_url]
+                )
+            )
 
     @staticmethod
     async def _enqueue_embed_jobs(
@@ -2694,6 +2740,76 @@ class PostgresRawStorage:
         return filters
 
     @staticmethod
+    def _feed_scope_filter(
+        *, feed_url: str | None, tier: FeedTier | None
+    ) -> Any:
+        """Articles seen in a given feed and/or in a feed of a given tier.
+
+        The tier is read from `feed_state.priority` at query time instead of
+        being copied onto the article, so moving a feed between instant and
+        normal re-sorts its history too. A link to a feed that was never seeded
+        has no priority and counts as normal.
+        """
+        priority = func.coalesce(feed_state.c.priority, 1)
+        stmt = (
+            select(1)
+            .select_from(
+                article_feeds.outerjoin(
+                    feed_state, feed_state.c.feed_url == article_feeds.c.feed_url
+                )
+            )
+            .where(article_feeds.c.article_id == raw_articles.c.id)
+        )
+        if feed_url is not None:
+            stmt = stmt.where(article_feeds.c.feed_url == feed_url)
+        if tier == "instant":
+            stmt = stmt.where(priority == 0)
+        elif tier == "normal":
+            stmt = stmt.where(priority > 0)
+        return stmt.exists()
+
+    async def list_article_feeds(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        tier: FeedTier | None = None,
+    ) -> list[ArticleFeedSource]:
+        """Feeds that have at least one article in the window, for the sidebar."""
+        priority = func.coalesce(feed_state.c.priority, 1)
+        stmt = (
+            select(
+                article_feeds.c.feed_url,
+                feed_state.c.source_label,
+                priority.label("priority"),
+                func.count().label("article_count"),
+            )
+            .select_from(
+                article_feeds.join(
+                    raw_articles, raw_articles.c.id == article_feeds.c.article_id
+                ).outerjoin(feed_state, feed_state.c.feed_url == article_feeds.c.feed_url)
+            )
+            .where(raw_articles.c.event_at >= since, raw_articles.c.event_at < until)
+            .group_by(article_feeds.c.feed_url, feed_state.c.source_label, priority)
+            .order_by(article_feeds.c.feed_url)
+        )
+        if tier == "instant":
+            stmt = stmt.where(priority == 0)
+        elif tier == "normal":
+            stmt = stmt.where(priority > 0)
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(stmt)).all()
+        return [
+            ArticleFeedSource(
+                feed_url=row.feed_url,
+                source_label=row.source_label,
+                tier="instant" if row.priority == 0 else "normal",
+                article_count=int(row.article_count),
+            )
+            for row in rows
+        ]
+
+    @staticmethod
     async def _assigned_article_topics(
         connection: AsyncConnection, article_ids: Sequence[int]
     ) -> dict[int, tuple[TopicRefItem, ...]]:
@@ -2760,7 +2876,17 @@ class PostgresRawStorage:
         topic_slugs: Sequence[str] | None = None,
         query: str | None = None,
         max_per_source: int = 3,
+        feed_url: str | None = None,
+        tier: FeedTier | None = None,
     ) -> list[ArticleFeedItem]:
+        """Newest articles in the window.
+
+        By default the list is diversified: at most `max_per_source` per
+        publisher domain. Naming a feed or a tier drops that cap — the reader
+        asked for exactly that stream, and an instant feed such as Hacker News
+        would otherwise be cut to three links per linked domain.
+        """
+        scoped = feed_url is not None or tier is not None
         # Headlined columns are only meaningful (and only cost anything) when
         # a search query narrows the result set.
         tsquery = func.websearch_to_tsquery("english", query) if query else None
@@ -2789,39 +2915,52 @@ class PostgresRawStorage:
                     self._EXCERPT_HEADLINE_OPTIONS,
                 ).label("excerpt_headline_raw"),
             ]
-        inner = (
-            select(*inner_columns)
-            .where(raw_articles.c.source_id == sources.c.id)
-            .where(
-                *self._feed_filters(
-                    since=since,
-                    until=until,
-                    cursor=cursor,
-                    query=query,
-                    topic_slugs=topic_slugs,
-                )
-            )
-            .order_by(raw_articles.c.event_at.desc(), raw_articles.c.id.desc())
-            .limit(max_per_source)
-            .lateral("a")
+        filters = self._feed_filters(
+            since=since,
+            until=until,
+            cursor=cursor,
+            query=query,
+            topic_slugs=topic_slugs,
         )
-        outer_columns = [
-            inner.c.id,
-            inner.c.url,
-            inner.c.title,
-            inner.c.excerpt_raw,
-            inner.c.published_at,
-            inner.c.crawled_at,
-            inner.c.event_at,
-            sources.c.slug,
-            sources.c.name,
-        ]
-        if tsquery is not None:
-            outer_columns += [inner.c.title_headline_raw, inner.c.excerpt_headline_raw]
-        stmt = select(*outer_columns).select_from(sources.join(inner, true()))
-        if source_slugs:
-            stmt = stmt.where(sources.c.slug.in_(source_slugs))
-        stmt = stmt.order_by(inner.c.event_at.desc(), inner.c.id.desc()).limit(limit)
+        if scoped:
+            source_filter = self._source_filter(source_slugs)
+            if source_filter is not None:
+                filters.append(source_filter)
+            stmt = (
+                select(*inner_columns, sources.c.slug, sources.c.name)
+                .select_from(
+                    raw_articles.join(sources, raw_articles.c.source_id == sources.c.id)
+                )
+                .where(*filters, self._feed_scope_filter(feed_url=feed_url, tier=tier))
+                .order_by(raw_articles.c.event_at.desc(), raw_articles.c.id.desc())
+                .limit(limit)
+            )
+        else:
+            inner = (
+                select(*inner_columns)
+                .where(raw_articles.c.source_id == sources.c.id)
+                .where(*filters)
+                .order_by(raw_articles.c.event_at.desc(), raw_articles.c.id.desc())
+                .limit(max_per_source)
+                .lateral("a")
+            )
+            outer_columns = [
+                inner.c.id,
+                inner.c.url,
+                inner.c.title,
+                inner.c.excerpt_raw,
+                inner.c.published_at,
+                inner.c.crawled_at,
+                inner.c.event_at,
+                sources.c.slug,
+                sources.c.name,
+            ]
+            if tsquery is not None:
+                outer_columns += [inner.c.title_headline_raw, inner.c.excerpt_headline_raw]
+            stmt = select(*outer_columns).select_from(sources.join(inner, true()))
+            if source_slugs:
+                stmt = stmt.where(sources.c.slug.in_(source_slugs))
+            stmt = stmt.order_by(inner.c.event_at.desc(), inner.c.id.desc()).limit(limit)
 
         async with self._engine.connect() as connection:
             rows = (await connection.execute(stmt)).all()

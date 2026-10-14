@@ -1,9 +1,9 @@
 'use client'
 
-import { Fragment, useMemo } from 'react'
+import { Fragment, Suspense, useMemo } from 'react'
 import Link from 'next/link'
-import { usePathname } from 'next/navigation'
-import { Newspaper, Radio } from 'lucide-react'
+import { usePathname, useSearchParams } from 'next/navigation'
+import { Radio } from 'lucide-react'
 import {
   Sidebar,
   SidebarContent,
@@ -16,32 +16,51 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from '@/components/ui/sidebar'
-import { useSources } from '@/hooks/use-sources'
+import { useFeedSources } from '@/hooks/use-feed-sources'
+import { FEED_TIERS, feedHost, feedHref, parseTier, tierHref } from '@/lib/feed-label'
+import { cn } from '@/lib/utils'
 import { Skeleton } from '@/components/ui/skeleton'
 
-function sourceIndex(name: string): string {
-  const first = name.trim().charAt(0).toUpperCase()
+function feedIndex(display: string): string {
+  const first = display.charAt(0).toUpperCase()
   return /^[A-Z]$/.test(first) ? first : '#'
 }
 
+// `useSearchParams` opts the tree out of static rendering unless it sits under
+// a Suspense boundary, and three pages mount this sidebar.
 export function AppSidebar() {
-  const pathname = usePathname()
-  const { sources, isLoading, error } = useSources()
-  const sourceGroups = useMemo(() => {
-    const groups = new Map<string, typeof sources>()
-    const sortedSources = [...sources].sort((a, b) =>
-      a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }),
-    )
+  return (
+    <Suspense fallback={null}>
+      <SidebarBody />
+    </Suspense>
+  )
+}
 
-    for (const source of sortedSources) {
-      const index = sourceIndex(source.name)
+function SidebarBody() {
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const tier = parseTier(searchParams.get('tier'))
+  const activeFeed = pathname === '/' ? searchParams.get('feed') : null
+  const { feeds, isLoading, error } = useFeedSources({ tier })
+  const feedGroups = useMemo(() => {
+    const groups = new Map<string, { feed: (typeof feeds)[number]; display: string }[]>()
+    const sortedFeeds = feeds
+      .map((feed) => ({ feed, display: feedHost(feed.feed_url) }))
+      .sort(
+        (a, b) =>
+          a.display.localeCompare(b.display, undefined, { sensitivity: 'base', numeric: true }) ||
+          a.feed.feed_url.localeCompare(b.feed.feed_url),
+      )
+
+    for (const entry of sortedFeeds) {
+      const index = feedIndex(entry.display)
       const group = groups.get(index) ?? []
-      group.push(source)
+      group.push(entry)
       groups.set(index, group)
     }
 
     return Array.from(groups.entries())
-  }, [sources])
+  }, [feeds])
 
   return (
     <Sidebar collapsible="icon" className="data-[side=left]:left-14">
@@ -62,25 +81,27 @@ export function AppSidebar() {
 
       <SidebarContent>
         <SidebarGroup>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              <SidebarMenuItem>
-                <SidebarMenuButton
-                  render={<Link href="/" />}
-                  isActive={pathname === '/'}
-                  tooltip="All articles"
-                >
-                  <Newspaper />
-                  <span>All articles</span>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        <SidebarGroup>
           <SidebarGroupLabel>Sources</SidebarGroupLabel>
           <SidebarGroupContent>
+            <div
+              role="group"
+              aria-label="Feed tier"
+              className="mb-2 flex gap-0.5 rounded-md bg-sidebar-accent/50 p-0.5 group-data-[collapsible=icon]:hidden"
+            >
+              {FEED_TIERS.map((option) => (
+                <Link
+                  key={option.label}
+                  href={tierHref(option.value)}
+                  aria-current={tier === option.value ? 'true' : undefined}
+                  className={cn(
+                    'flex-1 rounded px-2 py-1 text-center text-xs font-medium text-sidebar-foreground/70 transition-colors hover:text-sidebar-foreground',
+                    tier === option.value && 'bg-sidebar text-sidebar-foreground shadow-sm',
+                  )}
+                >
+                  {option.label}
+                </Link>
+              ))}
+            </div>
             <SidebarMenu>
               {isLoading &&
                 Array.from({ length: 8 }).map((_, i) => (
@@ -92,24 +113,27 @@ export function AppSidebar() {
                   </SidebarMenuItem>
                 ))}
               {error && !isLoading && (
-                <p className="px-2 py-1.5 text-xs text-destructive">Sources unavailable</p>
+                <p className="px-2 py-1.5 text-xs text-destructive">Feeds unavailable</p>
               )}
-              {sourceGroups.map(([index, group], groupIndex) => (
+              {!isLoading && !error && feeds.length === 0 && (
+                <p className="px-2 py-1.5 text-xs text-muted-foreground">No feeds in this tier</p>
+              )}
+              {feedGroups.map(([index, group], groupIndex) => (
                 <Fragment key={index}>
                   <SidebarMenuItem
                     className={`px-2 pb-1 text-[10px] font-semibold uppercase tracking-widest text-sidebar-foreground/45 group-data-[collapsible=icon]:hidden ${groupIndex === 0 ? 'pt-1' : 'pt-3'}`}
                   >
                     {index}
                   </SidebarMenuItem>
-                  {group.map((source) => (
-                    <SidebarMenuItem key={source.slug}>
+                  {group.map(({ feed, display }) => (
+                    <SidebarMenuItem key={feed.feed_url}>
                       <SidebarMenuButton
-                        render={<Link href={`/sources/${source.slug}`} />}
-                        isActive={pathname === `/sources/${source.slug}`}
-                        tooltip={source.name}
+                        render={<Link href={feedHref(feed.feed_url, tier)} title={feed.feed_url} />}
+                        isActive={activeFeed === feed.feed_url}
+                        tooltip={feed.feed_url}
                       >
                         <Radio />
-                        <span className="truncate">{source.name}</span>
+                        <span className="truncate">{display}</span>
                       </SidebarMenuButton>
                     </SidebarMenuItem>
                   ))}

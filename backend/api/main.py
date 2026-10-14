@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.deps import get_settings, lifespan
-from api.routers import articles, health, research, sources, stories, topics, trends
+from api.routers import articles, feeds, health, research, sources, stories, topics, trends
 from core.logger import setup_logging
 from observability import HttpMetricsMiddleware, metrics_asgi_app
 
@@ -27,6 +27,7 @@ def create_app() -> FastAPI:
     app.add_middleware(HttpMetricsMiddleware)
     app.include_router(health.router)
     app.include_router(articles.router)
+    app.include_router(feeds.router)
     app.include_router(sources.router)
     app.include_router(stories.router)
     app.include_router(topics.router)

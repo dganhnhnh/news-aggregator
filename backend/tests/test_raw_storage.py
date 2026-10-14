@@ -306,6 +306,33 @@ def test_prepare_articles_keeps_newest_result_per_url() -> None:
     assert articles[0].content == "new"
 
 
+def test_prepare_articles_unions_feeds_across_duplicate_results() -> None:
+    now = datetime.now(timezone.utc)
+    from_hn = CrawlResult(
+        url="https://example.com/article",
+        markdown="older",
+        fetched_at=now - timedelta(minutes=1),
+        context={"feed_url": "https://news.ycombinator.com/rss"},
+    )
+    from_blog = CrawlResult(
+        url="https://example.com/article?utm_source=rss",
+        markdown="newer",
+        fetched_at=now,
+        context={"feed_url": "https://example.com/feed.xml"},
+    )
+    unlinked = CrawlResult(url="https://example.com/other", markdown="x")
+
+    articles, _ = prepare_articles([from_hn, from_blog, unlinked])
+
+    by_url = {article.url: article for article in articles}
+    assert by_url["https://example.com/article"].content == "newer"
+    assert by_url["https://example.com/article"].feed_urls == (
+        "https://news.ycombinator.com/rss",
+        "https://example.com/feed.xml",
+    )
+    assert by_url["https://example.com/other"].feed_urls == ()
+
+
 def _upper_bound(_lo: float, hi: float) -> float:
     return hi
 

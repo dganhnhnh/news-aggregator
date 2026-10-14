@@ -6,6 +6,15 @@ export type Source = {
 
 export type FeedPriority = 'instant' | 'normal'
 
+// A feed that has articles in the window; `label` is null for a feed that was
+// never seeded into the registry.
+export type FeedSource = {
+  feed_url: string
+  label: string | null
+  tier: FeedPriority
+  article_count: number
+}
+
 export type ManagedFeed = {
   feed_url: string
   source_label: string

@@ -127,6 +127,35 @@ Index("ix_raw_articles_search_tsv", raw_articles.c.search_tsv, postgresql_using=
 Index("ix_raw_articles_source_event", raw_articles.c.source_id, raw_articles.c.event_at)
 Index("ix_raw_articles_url_original", raw_articles.c.url_original)
 
+# Which feeds an article was seen in. `raw_articles` keeps one row per URL, but
+# the same URL can appear in several feeds (a Hacker News link and the
+# publisher's own feed), so the link is a join table rather than a column.
+# Rows are only ever added: leaving a feed's window does not unlink an article.
+# `feed_url` is the `feed_state` identity but deliberately not a foreign key —
+# `news-pipeline rss --persist` accepts feed URLs that were never seeded.
+article_feeds = Table(
+    "article_feeds",
+    metadata,
+    Column(
+        "article_id",
+        BigInteger,
+        ForeignKey(
+            "raw_articles.id",
+            name="fk_article_feeds_article_id_raw_articles",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    ),
+    Column("feed_url", Text, primary_key=True),
+    Column(
+        "first_seen_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+)
+Index("ix_article_feeds_feed_article", article_feeds.c.feed_url, article_feeds.c.article_id)
+
 crawl_failures = Table(
     "crawl_failures",
     metadata,
@@ -136,6 +165,9 @@ crawl_failures = Table(
     Column("title", Text),
     Column("published_at", DateTime(timezone=True)),
     Column("priority", Integer, nullable=False, server_default="1"),
+    # The feed the entry came from, so a retry that finally wins still links
+    # the article to it. NULL for rows queued before the column existed.
+    Column("feed_url", Text),
     Column("error_type", Text, nullable=False),
     Column("error_message", Text, nullable=False),
     Column("attempt_count", Integer, nullable=False),

@@ -6,6 +6,7 @@ import { FiltersBar } from './filters-bar'
 import { ArticleList } from './article-list'
 import { DetailPanel } from './detail-panel'
 import { useArticles } from '@/hooks/use-articles'
+import { feedHost, parseTier } from '@/lib/feed-label'
 import { sinceFromRange, type TimeRangeValue } from '@/lib/time'
 
 export function FeedView({
@@ -21,6 +22,9 @@ export function FeedView({
   const [range, setRange] = useState<TimeRangeValue>('all')
   const [selectedSources, setSelectedSources] = useState<string[]>([])
   const selectedTopics = searchParams.getAll('topic')
+  // The sidebar's Sources section scopes the list through these two params.
+  const feed = lockedSource ? undefined : (searchParams.get('feed') ?? undefined)
+  const tier = lockedSource ? undefined : parseTier(searchParams.get('tier'))
 
   const since = useMemo(() => sinceFromRange(range), [range])
   const base = lockedSource
@@ -34,6 +38,8 @@ export function FeedView({
     sources,
     topics: selectedTopics,
     q: q || undefined,
+    feed,
+    tier,
   })
 
   function changeSelectedTopics(topics: string[]) {
@@ -62,6 +68,7 @@ export function FeedView({
         selectedTopics={selectedTopics}
         onSelectedTopicsChange={changeSelectedTopics}
         lockedSourceName={lockedSource?.name}
+        scopeLabel={feed ? feedHost(feed) : tier ? `${tier === 'instant' ? 'Instant' : 'Normal'} feeds` : undefined}
         resultLabel={
           isLoading ? undefined : `${articles.length} article${articles.length === 1 ? '' : 's'}`
         }

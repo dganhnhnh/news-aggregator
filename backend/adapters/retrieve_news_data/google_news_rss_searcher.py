@@ -72,6 +72,7 @@ class _ArticleJob(NamedTuple):
     entry: dict
     query_label: str
     feed_title: str
+    feed_url: str = ""
 
 
 # ─── Shared decode cache + rate-limiter ───────────────────────────────────────
@@ -639,6 +640,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 },
                 entry.query_label,
                 entry.feed_title,
+                entry.feed_url,
             )
             for entry in entries
         ]
@@ -913,6 +915,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
             {
                 "query_label": job.query_label,
                 "feed_title": job.feed_title,
+                "feed_url": job.feed_url,
                 "source_name": job.entry.get("source", ""),
                 "feed_entry_url": feed_entry_url,
                 "google_news_url": (
@@ -957,6 +960,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 source=source,
                 title=job.entry.get("title") or None,
                 published_at=job.entry.get("published_date"),
+                feed_url=job.feed_url or None,
                 error_type=crawl_failure_error_type(result.context),
                 error_message=result.error_message or "Unknown crawl failure",
                 # A malformed URL can never succeed, so it is dead-lettered

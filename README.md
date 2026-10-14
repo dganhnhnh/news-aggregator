@@ -46,6 +46,22 @@ chỉ xanh sau khi DB đã migrate; container không chứa worker scheduler hay
 cron. Xem log bằng `docker compose -f deployments/docker-compose.yml
 --env-file .env logs -f api`.
 
+Nếu build dừng ở `uv sync` với `Failed to download` / `operation timed out`
+(ví dụ wheel `patchright` của `crawl4ai`), đó là timeout khi tải dependency từ
+PyPI. Hai Dockerfile dùng timeout 300 giây, 5 retries, tối đa 4 lượt tải đồng
+thời và BuildKit cache để tái sử dụng các gói đã tải thành công khi build lại.
+Compose truyền các biến này vào **build args**; có thể tăng trong `.env` nếu
+mạng chậm, ví dụ:
+
+```dotenv
+UV_HTTP_TIMEOUT=600
+UV_HTTP_RETRIES=5
+UV_CONCURRENT_DOWNLOADS=2
+```
+
+Sau đó chạy lại `docker compose --env-file .env -f deployments/docker-compose.yml
+up -d --build`. Không cần xoá image, cache hoặc volume PostgreSQL.
+
 ### Thay đổi schema và tạo migration
 
 `backend/adapters/storage/schema.py` là source of truth. Sau khi thay đổi
@@ -365,7 +381,7 @@ của `--feed-path`. Có thể đặt nguồn mặc định bằng `RSS_FEED_PAT
 
 Các nhóm dữ liệu chính:
 
-- ingest: `raw_articles`, `sources`, `feed_state`, `crawl_failures`;
+- ingest: `raw_articles`, `sources`, `feed_state`, `article_feeds` (bài viết ↔ feed RSS/Atom), `crawl_failures`;
 - orchestration: `processing_jobs`, `processing_dlq`, `worker_runs`;
 - semantic: `article_embeddings`, `clusters`, `cluster_members`,
   `article_classifications`, `article_topics`, `cluster_topics`;
