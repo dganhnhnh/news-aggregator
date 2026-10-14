@@ -179,7 +179,7 @@ export function CustomAddFeeds({ onFeedsAdded }: CustomAddFeedsProps) {
             <p className="text-destructive" role="alert">{error}</p>
           ) : (
             <p className="text-muted-foreground">
-              Searches topic-focused feed pages and specialist publishers, then validates and ranks their RSS or Atom feeds.
+              Searches topic-focused pages and specialist publishers, then checks up to 50 feed URLs and ranks them by article relevance.
             </p>
           )}
         </div>
@@ -197,10 +197,10 @@ export function CustomAddFeeds({ onFeedsAdded }: CustomAddFeedsProps) {
               />
               <div className="min-w-0 text-sm">
                 <p className="font-medium">
-                  {result.candidates.length} feed candidate(s)
+                  {result.candidates.length} feed candidate(s) · up to 25 results
                 </p>
-                <p className="truncate text-xs text-muted-foreground">
-                  {result.stats.publishers_inspected} publishers · {result.stats.pages_inspected} pages inspected · {result.stats.feeds_validated} feeds validated
+                <p className="text-xs text-muted-foreground">
+                  {result.stats.pages_inspected} pages inspected · {result.stats.feeds_attempted}/50 feed URLs checked · {result.stats.feeds_validated} valid · {result.stats.feeds_relevant} relevant before result limits
                 </p>
               </div>
             </div>
@@ -339,7 +339,7 @@ function CandidateRow({
 function feedScopeLabel(scope: FeedDiscoveryCandidate['feed_scope']) {
   if (scope === 'category') return 'Category feed'
   if (scope === 'tag') return 'Topic feed'
-  return 'Specialist publisher'
+  return 'Publisher feed'
 }
 
 function discoverySourceLabel(source: FeedDiscoveryCandidate['discovery_source']) {

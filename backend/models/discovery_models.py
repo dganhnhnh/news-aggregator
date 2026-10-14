@@ -67,6 +67,8 @@ class FeedDiscoveryStats:
     pages_inspected: int = 0
     feeds_validated: int = 0
     google_fallback_used: bool = False
+    feeds_attempted: int = 0
+    feeds_relevant: int = 0
 
 
 @dataclass(frozen=True)

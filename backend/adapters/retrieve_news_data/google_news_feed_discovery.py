@@ -37,6 +37,7 @@ from models.discovery_models import (
     FeedDiscoveryStats,
 )
 from models.storage_models import FeedPollTarget
+from models.search_and_crawl_models import SearchResult
 
 
 logger = get_logger(__name__)
@@ -203,6 +204,39 @@ class GoogleNewsFeedDiscovery:
                     google_fallback_used=True,
                 ),
             )
+        finally:
+            if own_client:
+                await client.aclose()
+
+    async def search_publishers(
+        self,
+        query: str,
+        *,
+        language: str = "en",
+        country: str = "US",
+    ) -> list[SearchResult]:
+        """Return publisher pages without probing their feeds.
+
+        Topic discovery performs all page/feed checks in its own shared budget
+        and cache. The standalone discover() API remains available separately.
+        """
+        search_url = self.build_search_feed_url(query, language=language, country=country)
+        own_client = self._http_client is None
+        client = self._http_client or httpx.AsyncClient()
+        try:
+            entries = await self._search_entries(search_url, client)
+            publishers = await self._publishers(entries[:self._max_articles])
+            return [
+                SearchResult(
+                    id=item.website_url,
+                    url=item.discovery_url,
+                    title=item.source_label,
+                    content_snippet="",
+                    score=0.0,
+                    source="google_news",
+                )
+                for item in publishers[:self._max_publishers]
+            ]
         finally:
             if own_client:
                 await client.aclose()

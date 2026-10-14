@@ -51,6 +51,8 @@ export type FeedDiscoveryResponse = {
     pages_inspected: number
     feeds_validated: number
     google_fallback_used: boolean
+    feeds_attempted: number
+    feeds_relevant: number
   }
   warnings: string[]
 }

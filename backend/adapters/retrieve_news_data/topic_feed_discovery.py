@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import calendar
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 import re
 from typing import Literal, Protocol
-from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urldefrag, urljoin, urlsplit, urlunsplit
 
 import feedparser
 import httpx
 import tldextract
 
+from adapters.retrieve_news_data.feed_topics import matches_topic
 from adapters.retrieve_news_data.feed_http import (
     UnsafeFeedUrl,
     fetch_discovery_url,
@@ -55,13 +56,6 @@ _FEED_INDEX_HINT_RE = re.compile(
     r"(?:rss|atom|feed|syndication).*(?:list|directory|all|available)|"
     r"(?:list|directory|all|available).*(?:rss|atom|feed|syndication)",
     re.I,
-)
-_TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
-_STOP_WORDS = frozenset(
-    {
-        "a", "an", "and", "about", "for", "from", "in", "of", "on", "or",
-        "the", "to", "with", "news", "feed", "feeds", "rss", "atom",
-    }
 )
 _COMMON_FEED_PATHS = ("feed", "rss", "rss.xml", "feed.xml", "atom.xml")
 _COUNTRY_NAMES = {
@@ -104,6 +98,7 @@ class _SearchSeed:
 class _Link:
     url: str
     label: str
+    declared: bool = True
 
 
 @dataclass(frozen=True)
@@ -124,6 +119,7 @@ class _ValidatedFeed:
     categories: tuple[str, ...]
     sample_titles: tuple[str, ...]
     last_published_at: datetime | None
+    entry_texts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -131,13 +127,110 @@ class _RankedCandidate:
     candidate: FeedDiscoveryCandidate
     provider_score: float
     evidence_count: int
+    article_coverage: float = 0.0
+    matching_articles: int = 0
+    sample_size: int = 0
 
 
 @dataclass(frozen=True)
-class _Inspection:
-    candidates: tuple[_RankedCandidate, ...]
-    pages_inspected: int
-    feeds_validated: int
+class _Resource:
+    page: _Page | None = None
+    feed: _ValidatedFeed | None = None
+
+
+@dataclass(frozen=True)
+class _PreparedSeed:
+    seed: _SearchSeed
+    page: _Page | None
+    links: tuple[_Link, ...]
+
+
+class _DiscoverySession:
+    """One request's feed budget and parsed-resource cache, including fallback.
+
+    Page reads temporarily reserve a slot because an arbitrary search URL may
+    return RSS. HTML releases that slot unless the URL was also a feed probe.
+    Reservations happen before scheduling I/O, so concurrent workers cannot
+    overshoot the limit. Redirect hops belong to the original URL attempt.
+    """
+
+    def __init__(
+        self, discovery: TopicFeedDiscovery, client: httpx.AsyncClient, limit: int
+    ) -> None:
+        self.discovery = discovery
+        self.client = client
+        self.limit = limit
+        self.attempts: set[str] = set()
+        self.pending_pages: set[str] = set()
+        self.tasks: dict[str, asyncio.Task[_Resource | None]] = {}
+        self.aliases: dict[str, str] = {}
+        self.pages_inspected = 0
+
+    @staticmethod
+    def key(url: str) -> str:
+        return urldefrag(validate_public_url(url))[0]
+
+    @property
+    def remaining(self) -> int:
+        return self.limit - len(self.attempts | self.pending_pages)
+
+    @property
+    def validated_count(self) -> int:
+        return len({
+            resource.feed.url
+            for task in set(self.tasks.values())
+            if task.done() and not task.cancelled() and task.exception() is None
+            if (resource := task.result()) is not None and resource.feed is not None
+        })
+
+    async def read(self, url: str, *, as_feed: bool) -> _Resource | None:
+        try:
+            key = self.key(url)
+            key = self.aliases.get(key, key)
+        except (ValueError, UnsafeFeedUrl):
+            return None
+        task = self.tasks.get(key)
+        if as_feed and key not in self.attempts:
+            if key not in self.pending_pages and self.remaining <= 0:
+                return None
+            self.pending_pages.discard(key)
+            self.attempts.add(key)
+        if task is None:
+            if key not in self.attempts:
+                if self.remaining <= 0:
+                    return None
+                self.pending_pages.add(key)
+            task = asyncio.create_task(self._load(key))
+            self.tasks[key] = task
+        return await task
+
+    async def _load(self, key: str) -> _Resource | None:
+        try:
+            response = await self.discovery._fetch(self.client, key)
+            final_key = self.key(response.url)
+            # Reuse parsed results when a later seed names the redirect target.
+            if final_key != key and final_key not in self.tasks:
+                self.aliases.setdefault(final_key, key)
+            parsed = feedparser.parse(response.body)
+            if parsed.get("version"):
+                self.attempts.add(key)
+                return _Resource(feed=await self.discovery._validate_feed(
+                    key, self.client, response=response
+                ))
+            self.pages_inspected += 1
+            return _Resource(page=self.discovery._parse_page(response.url, response.body))
+        except (httpx.HTTPError, ValueError, UnsafeFeedUrl) as exc:
+            logger.debug("Feed discovery fetch failed for %s: %s", key, exc)
+            return None
+        finally:
+            self.pending_pages.discard(key)
+
+    async def close(self) -> None:
+        tasks = set(self.tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class _DiscoveryHtmlParser(HTMLParser):
@@ -202,17 +295,23 @@ class TopicFeedDiscovery:
         google_fallback: GoogleNewsFeedDiscovery | None = None,
         http_client: httpx.AsyncClient | None = None,
         max_search_results_per_intent: int = 10,
-        max_search_results: int = 20,
-        max_publishers: int = 15,
+        max_search_results: int = 30,
+        max_publishers: int = 24,
         max_seed_pages_per_host: int = 2,
         max_concurrent_pages: int = 4,
-        max_feeds_per_publisher: int = 3,
+        max_feed_attempts_per_page: int = 24,
+        max_feed_urls_checked: int = 50,
         max_results_per_publisher: int = 2,
         fallback_min_candidates: int = 6,
         request_timeout_seconds: float = 8.0,
         user_agent: str = DEFAULT_USER_AGENT,
         resolve_dns: bool | None = None,
     ) -> None:
+        if not 1 <= max_feed_urls_checked <= 50:
+            raise ValueError("max_feed_urls_checked must be between 1 and 50")
+        if max_concurrent_pages < 1 or max_feed_attempts_per_page < 1:
+            raise ValueError("discovery concurrency and per-page attempts must be positive")
+        self._max_feed_urls_checked = max_feed_urls_checked
         self._search_provider = search_provider
         self._google_fallback = google_fallback
         self._http_client = http_client
@@ -221,7 +320,7 @@ class TopicFeedDiscovery:
         self._max_publishers = max_publishers
         self._max_seed_pages_per_host = max_seed_pages_per_host
         self._max_concurrent_pages = max_concurrent_pages
-        self._max_feeds_per_publisher = max_feeds_per_publisher
+        self._max_feed_attempts_per_page = max_feed_attempts_per_page
         self._max_results_per_publisher = max_results_per_publisher
         self._fallback_min_candidates = fallback_min_candidates
         self._request_timeout_seconds = request_timeout_seconds
@@ -239,47 +338,60 @@ class TopicFeedDiscovery:
         cleaned_query = query.strip()
         if not cleaned_query:
             raise ValueError("query must not be blank")
-        result_limit = 12 if limit is None else limit
+        result_limit = 25 if limit is None else limit
         if result_limit < 1:
             raise ValueError("limit must be at least 1")
 
         own_client = self._http_client is None
         client = self._http_client or httpx.AsyncClient()
         warnings: list[str] = []
+        session = _DiscoverySession(self, client, self._max_feed_urls_checked)
         try:
             seeds, search_errors = await self._search_seeds(
                 cleaned_query, language=language, country=country
             )
             warnings.extend(search_errors)
-            inspection = await self._inspect_seeds(seeds, cleaned_query, client)
-            ranked = list(inspection.candidates)
+            ranked = await self._inspect_seeds(seeds, cleaned_query, session)
             feed_first = self._select_diverse(ranked, result_limit)
 
             fallback_used = False
-            fallback_stats = FeedDiscoveryStats()
             fallback_threshold = min(self._fallback_min_candidates, result_limit)
-            if len(feed_first) < fallback_threshold and self._google_fallback is not None:
+            if (
+                len(feed_first) < fallback_threshold
+                and self._google_fallback is not None
+                and session.remaining > 0
+            ):
                 fallback_used = True
                 warnings.append(
                     "Feed-first discovery returned fewer than "
                     f"{fallback_threshold} candidates; Google News fallback was used."
                 )
                 try:
-                    fallback = await self._google_fallback.discover(
-                        cleaned_query,
-                        language=language,
-                        country=country,
-                        limit=result_limit,
+                    publishers = await self._google_fallback.search_publishers(
+                        cleaned_query, language=language, country=country
                     )
-                    fallback_stats = fallback.stats
-                    warnings.extend(fallback.warnings)
+                    fallback_ranked = await self._inspect_seeds(
+                        [
+                            _SearchSeed(item.url, item.title, "", 0.0, "publisher")
+                            for item in publishers
+                        ],
+                        cleaned_query,
+                        session,
+                    )
                     ranked.extend(
-                        _RankedCandidate(item, 0.0, len(item.relevance_reasons))
-                        for item in fallback.candidates
+                        replace(item, candidate=replace(
+                            item.candidate, discovery_source="google_fallback"
+                        ))
+                        for item in fallback_ranked
                     )
                 except FeedDiscoveryError as exc:
                     warnings.append(f"Google News fallback failed: {exc}")
 
+            if len(session.attempts) >= session.limit:
+                warnings.append(
+                    f"Reached the limit of {session.limit} feed URLs checked; "
+                    "returning candidates found within this budget."
+                )
             selected = self._select_diverse(ranked, result_limit)
             if not seeds and search_errors and not selected:
                 raise FeedDiscoveryError("; ".join(search_errors))
@@ -290,17 +402,16 @@ class TopicFeedDiscovery:
                 stats=FeedDiscoveryStats(
                     search_results=len(seeds),
                     publishers_inspected=len({self._host(seed.url) for seed in seeds}),
-                    pages_inspected=(
-                        inspection.pages_inspected + fallback_stats.pages_inspected
-                    ),
-                    feeds_validated=(
-                        inspection.feeds_validated + fallback_stats.feeds_validated
-                    ),
+                    pages_inspected=session.pages_inspected,
+                    feeds_validated=session.validated_count,
                     google_fallback_used=fallback_used,
+                    feeds_attempted=len(session.attempts),
+                    feeds_relevant=len({item.candidate.feed_url for item in ranked}),
                 ),
                 warnings=tuple(self._dedupe(warnings)),
             )
         finally:
+            await session.close()
             if own_client:
                 await client.aclose()
 
@@ -332,7 +443,9 @@ class TopicFeedDiscovery:
                 return intent, [], f"Tavily {intent} search failed: {exc}"
 
         outcomes = await asyncio.gather(
-            run("direct", direct_query), run("publisher", publisher_query)
+            run("direct", direct_query), run("publisher", publisher_query),
+            run("direct", f'{query} RSS feed'),
+            run("publisher", f'{query} news analysis blog'),
         )
         seeds: list[_SearchSeed] = []
         errors: list[str] = []
@@ -356,7 +469,7 @@ class TopicFeedDiscovery:
 
         merged_by_url: dict[str, _SearchSeed] = {}
         for seed in seeds:
-            key = seed.url.casefold()
+            key = _DiscoverySession.key(seed.url)
             current = merged_by_url.get(key)
             if current is None:
                 merged_by_url[key] = seed
@@ -376,7 +489,7 @@ class TopicFeedDiscovery:
         host_counts: Counter[str] = Counter()
         accepted_hosts: set[str] = set()
         for seed in seeds:
-            key = seed.url.casefold()
+            key = _DiscoverySession.key(seed.url)
             host = self._host(seed.url)
             if key in seen_urls or not host:
                 continue
@@ -392,120 +505,150 @@ class TopicFeedDiscovery:
                 break
         return selected, errors
 
-    async def _inspect_seeds(
-        self,
-        seeds: list[_SearchSeed],
-        query: str,
-        client: httpx.AsyncClient,
-    ) -> _Inspection:
-        iterator = iter(seeds)
-        inspections: list[_Inspection] = []
+    async def _run_workers(self, items, operation) -> None:
+        iterator = iter(items)
 
         async def worker() -> None:
-            for seed in iterator:
-                inspections.append(await self._inspect_seed(seed, query, client))
+            for item in iterator:
+                await operation(item)
 
         workers = [
             asyncio.create_task(worker())
-            for _ in range(min(self._max_concurrent_pages, len(seeds)))
+            for _ in range(min(self._max_concurrent_pages, len(items)))
         ]
-        if workers:
-            await asyncio.gather(*workers)
-        return _Inspection(
-            candidates=tuple(
-                candidate
-                for inspection in inspections
-                for candidate in inspection.candidates
-            ),
-            pages_inspected=sum(item.pages_inspected for item in inspections),
-            feeds_validated=sum(item.feeds_validated for item in inspections),
-        )
-
-    async def _inspect_seed(
-        self, seed: _SearchSeed, query: str, client: httpx.AsyncClient
-    ) -> _Inspection:
-        pages_inspected = 0
-        candidate_links: list[_Link] = []
-        page: _Page | None = None
         try:
-            response = await self._fetch(client, seed.url)
-            pages_inspected += 1
-            parsed = feedparser.parse(response.body)
-            if parsed.get("version") or "":
-                candidate_links.append(_Link(seed.url, seed.title))
-            else:
-                page = self._parse_page(response.url, response.body)
-                candidate_links.extend(page.feed_links)
-                candidate_links.extend(self._cms_candidates(page.url))
-                if seed.intent in {"publisher", "both"}:
-                    root = self._website_url(page.url)
-                    candidate_links.extend(
-                        _Link(urljoin(root, path), path) for path in _COMMON_FEED_PATHS
-                    )
-                if page.index_links:
-                    index_url = page.index_links[0]
-                    try:
-                        index_response = await self._fetch(client, index_url)
-                        pages_inspected += 1
-                        index_page = self._parse_page(
-                            index_response.url, index_response.body
-                        )
-                        candidate_links.extend(index_page.feed_links)
-                    except (httpx.HTTPError, ValueError, UnsafeFeedUrl):
-                        pass
-        except (httpx.HTTPError, ValueError, UnsafeFeedUrl) as exc:
-            logger.debug("Feed seed fetch failed for %s: %s", seed.url, exc)
-            return _Inspection((), pages_inspected, 0)
+            await asyncio.gather(*workers)
+        finally:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _inspect_seeds(
+        self, seeds: list[_SearchSeed], query: str, session: _DiscoverySession
+    ) -> list[_RankedCandidate]:
+        # Discover links before spending the validation budget. Network timing
+        # cannot let the first directory monopolize all 50 feed checks.
+        prepared: list[_PreparedSeed | None] = [None] * len(seeds)
+
+        async def prepare(index):
+            prepared[index] = await self._prepare_seed(seeds[index], session)
+
+        await self._run_workers(list(range(len(seeds))), prepare)
+        pool: dict[str, tuple[_PreparedSeed, _Link]] = {}
+
+        def priority(item):
+            source, link = item
+            return (
+                not self._has_query_overlap(query, f"{link.label} {link.url}"),
+                not link.declared,
+                not self._looks_like_feed_url(link.url),
+                -source.seed.score,
+                link.url,
+            )
+
+        for source in prepared:
+            if source is None:
+                continue
+            links = sorted(source.links, key=lambda link: priority((source, link)))
+            for link in links[:self._max_feed_attempts_per_page]:
+                if self._is_comment_feed(link.url, link.label):
+                    continue
+                try:
+                    key = session.key(link.url)
+                except (ValueError, UnsafeFeedUrl):
+                    continue
+                item = (source, link)
+                if key not in pool or priority(item) < priority(pool[key]):
+                    pool[key] = item
+
+        # Within each evidence tier, try one URL per publisher per round.
+        tiers = defaultdict(lambda: defaultdict(deque))
+        for item in sorted(pool.values(), key=priority):
+            tiers[priority(item)[:3]][self._publisher_host(item[1].url)].append(item)
+        queue = []
+        for tier in sorted(tiers):
+            publishers = tiers[tier]
+            while publishers:
+                for host in list(publishers):
+                    queue.append(publishers[host].popleft())
+                    if not publishers[host]:
+                        del publishers[host]
 
         found: list[_RankedCandidate] = []
-        validated_urls: set[str] = set()
-        for link in self._dedupe_links(candidate_links):
-            validated = await self._validate_feed(link.url, client)
-            if validated is None:
-                continue
-            key = validated.url.casefold()
-            if key in validated_urls:
-                continue
-            validated_urls.add(key)
-            scope = self._feed_scope(validated.url, link.label)
+
+        async def inspect(item):
+            source, link = item
+            resource = await session.read(link.url, as_feed=True)
+            if resource is None or resource.feed is None:
+                return
+            feed = resource.feed
+            scope = self._feed_scope(feed.url, link.label)
+            if not self._is_relevant(query, feed, scope):
+                return
             reasons = self._relevance_reasons(
-                query=query,
-                seed=seed,
-                page=page,
-                link=link,
-                feed=validated,
-                scope=scope,
+                query=query, seed=source.seed, page=source.page,
+                link=link, feed=feed, scope=scope,
             )
-            if not self._is_relevant(seed, scope, reasons):
-                continue
-            website_url = validated.website_url or self._website_url(validated.url)
-            found.append(
-                _RankedCandidate(
-                    candidate=FeedDiscoveryCandidate(
-                        feed_url=validated.url,
-                        source_label=(
-                            validated.title or infer_feed_source_label(validated.url)
-                        ),
-                        website_url=website_url,
-                        feed_scope=scope,
-                        discovery_source=self._candidate_source(seed.intent, scope),
-                        relevance_reasons=tuple(reasons),
-                        sample_titles=validated.sample_titles,
-                        last_published_at=validated.last_published_at,
-                    ),
-                    provider_score=seed.score,
-                    evidence_count=len(reasons),
-                )
+            matches, total = self._article_matches(query, feed)
+            found.append(_RankedCandidate(
+                candidate=FeedDiscoveryCandidate(
+                    feed_url=feed.url,
+                    source_label=feed.title or infer_feed_source_label(feed.url),
+                    website_url=feed.website_url or self._website_url(feed.url),
+                    feed_scope=scope,
+                    discovery_source=self._candidate_source(source.seed.intent, scope),
+                    relevance_reasons=tuple(reasons),
+                    sample_titles=feed.sample_titles,
+                    last_published_at=feed.last_published_at,
+                ),
+                provider_score=source.seed.score,
+                evidence_count=len(reasons),
+                article_coverage=matches / total if total else 0.0,
+                matching_articles=matches,
+                sample_size=total,
+            ))
+
+        await self._run_workers(queue, inspect)
+        return found
+
+    async def _prepare_seed(
+        self, seed: _SearchSeed, session: _DiscoverySession
+    ) -> _PreparedSeed | None:
+        resource = await session.read(
+            seed.url, as_feed=self._looks_like_feed_url(seed.url)
+        )
+        if resource is None:
+            return None
+        if resource.feed is not None:
+            return _PreparedSeed(seed, None, (_Link(resource.feed.url, seed.title),))
+        page = resource.page
+        if page is None:
+            return None
+        links = list(page.feed_links)
+        links.extend(self._cms_candidates(page.url))
+        if seed.intent in {"publisher", "both"}:
+            root = self._website_url(page.url)
+            links.extend(
+                _Link(urljoin(root, path), path, declared=False)
+                for path in _COMMON_FEED_PATHS
             )
-            if len(found) >= self._max_feeds_per_publisher:
-                break
-        return _Inspection(tuple(found), pages_inspected, len(validated_urls))
+        for index_url in page.index_links[:2]:
+            # This is a page-discovery read. HTML does not spend the feed
+            # budget, but an RSS response still does and is never fetched twice.
+            index = await session.read(index_url, as_feed=False)
+            if index is not None and index.page is not None:
+                links = [link for link in links if urldefrag(link.url)[0] != index_url]
+                links.extend(index.page.feed_links)
+            elif index is not None and index.feed is not None:
+                links.append(_Link(index.feed.url, "RSS feed"))
+        return _PreparedSeed(seed, page, tuple(self._dedupe_links(links)))
 
     async def _validate_feed(
-        self, url: str, client: httpx.AsyncClient
+        self, url: str, client: httpx.AsyncClient, *, response=None
     ) -> _ValidatedFeed | None:
         try:
-            response = await self._fetch(client, url)
+            response = response or await self._fetch(client, url)
             parsed = feedparser.parse(response.body)
             if not (parsed.get("version") or "") or not parsed.entries:
                 return None
@@ -514,6 +657,8 @@ class TopicFeedDiscovery:
             return None
 
         feed = parsed.feed or {}
+        if self._is_comment_feed(final_url, str(feed.get("title") or "")):
+            return None
         website_url = ""
         if feed.get("link"):
             try:
@@ -523,16 +668,23 @@ class TopicFeedDiscovery:
             except (ValueError, UnsafeFeedUrl):
                 pass
         entries = list(parsed.entries[:12])
+        # News Radar ingests articles, not a directory's comments or podcasts.
+        media_entries = sum(
+            any(str(item.get("type", "")).startswith(("audio/", "video/"))
+                for item in entry.get("enclosures", []))
+            for entry in entries
+        )
+        directory_entries = sum(
+            bool(re.search(r"\b(?:rss|podcast) feeds?\b", str(entry.get("title", "")), re.I))
+            for entry in entries
+        )
+        if media_entries > len(entries) / 2 or (
+            len(entries) >= 3 and directory_entries / len(entries) >= 0.6
+        ):
+            return None
         categories = tuple(
             str(tag.get("term") or "").strip()
-            for tag in [
-                *(feed.get("tags") or []),
-                *(
-                    tag
-                    for entry in entries
-                    for tag in (entry.get("tags") or [])
-                ),
-            ]
+            for tag in (feed.get("tags") or [])
             if isinstance(tag, dict) and str(tag.get("term") or "").strip()
         )
         sample_titles = tuple(
@@ -559,6 +711,11 @@ class TopicFeedDiscovery:
             categories=categories,
             sample_titles=sample_titles,
             last_published_at=last_published_at,
+            entry_texts=tuple(
+                " ".join((str(entry.get("title") or ""),
+                          re.sub(r"<[^>]+>", " ", str(entry.get("summary") or ""))[:1200]))
+                for entry in entries
+            ),
         )
 
     async def _fetch(self, client: httpx.AsyncClient, url: str):
@@ -579,7 +736,13 @@ class TopicFeedDiscovery:
         ]
         index_links: list[str] = []
         for href, label in parser.anchors:
-            absolute = urljoin(page_url, href)
+            if not href or href.startswith("#"):
+                continue
+            absolute = urldefrag(urljoin(page_url, href))[0]
+            if urlsplit(absolute).scheme not in {"http", "https"}:
+                continue
+            if absolute == urldefrag(page_url)[0]:
+                continue
             hint = f"{href} {label}"
             if self._looks_like_feed_url(absolute) or _FEED_HINT_RE.search(hint):
                 feed_links.append(_Link(absolute, label))
@@ -588,6 +751,9 @@ class TopicFeedDiscovery:
                 and self._host(absolute) == self._host(page_url)
             ):
                 index_links.append(absolute)
+            elif re.fullmatch(r"/?(?:rss|feeds?)/?", urlsplit(absolute).path, re.I):
+                if self._host(absolute) == self._host(page_url):
+                    index_links.append(absolute)
         return _Page(
             url=page_url,
             title=parser.title.strip(),
@@ -605,8 +771,8 @@ class TopicFeedDiscovery:
         if any(marker in lower for marker in ("/category/", "/tag/", "/topic/")):
             base = urlunsplit((parts.scheme, parts.netloc, path + "/", "", ""))
             candidates.extend(
-                (_Link(urljoin(base, "feed/"), "category feed"),
-                 _Link(urljoin(base, "rss/"), "topic RSS"))
+                (_Link(urljoin(base, "feed/"), "category feed", declared=False),
+                 _Link(urljoin(base, "rss/"), "topic RSS", declared=False))
             )
             query = parse_qs(parts.query)
             query["feed"] = ["rss2"]
@@ -614,17 +780,17 @@ class TopicFeedDiscovery:
                 f"{key}={value}" for key, values in query.items() for value in values
             )
             candidates.append(
-                _Link(urlunsplit((parts.scheme, parts.netloc, parts.path, query_string, "")), "category feed")
+                _Link(urlunsplit((parts.scheme, parts.netloc, parts.path, query_string, "")), "category feed", declared=False)
             )
         if parts.hostname in {"medium.com", "www.medium.com"} and "/tag/" in lower:
             slug = path.split("/tag/", 1)[1].split("/", 1)[0]
             if slug:
                 candidates.append(
-                    _Link(f"https://medium.com/feed/tag/{slug}", "Medium topic feed")
+                    _Link(f"https://medium.com/feed/tag/{slug}", "Medium topic feed", declared=False)
                 )
         if parts.hostname and parts.hostname.endswith("substack.com"):
             candidates.append(
-                _Link(urlunsplit((parts.scheme, parts.netloc, "/feed", "", "")), "Substack feed")
+                _Link(urlunsplit((parts.scheme, parts.netloc, "/feed", "", "")), "Substack feed", declared=False)
             )
         return candidates
 
@@ -639,44 +805,44 @@ class TopicFeedDiscovery:
         scope: Literal["category", "tag", "sitewide"],
     ) -> list[str]:
         reasons: list[str] = []
-        feed_text = " ".join(
-            (feed.title, feed.subtitle, " ".join(feed.categories), link.label, feed.url)
-        )
-        page_text = " ".join(
-            (seed.title, seed.snippet, page.title if page else "", page.description if page else "")
-        )
+        # A listicle/search snippet can describe the topic without its own feed
+        # covering it. Only feed-owned evidence determines acceptance.
+        feed_text = " ".join((feed.title, feed.subtitle, " ".join(feed.categories)))
         if self._has_query_overlap(query, feed_text):
             reasons.append(f'Feed metadata matches “{query}”')
+        path_matches = self._has_query_overlap(query, feed.url)
+        if path_matches and scope in {"category", "tag"}:
+            reasons.append(f'Dedicated feed path matches “{query}”')
+        matches, total = self._article_matches(query, feed)
+        if total:
+            reasons.append(f'Recent articles match “{query}” ({matches}/{total})')
+        if total < 3:
+            reasons.append("Limited article sample; topic focus is less certain")
         if scope in {"category", "tag"}:
             reasons.append("Publisher exposes a dedicated category or topic feed")
-        if self._has_query_overlap(query, page_text):
-            reasons.append(
-                f'Containing page or publisher profile focuses on “{query}”'
-            )
-        if seed.intent in {"direct", "both"} and feed.url.casefold() == seed.url.casefold():
-            reasons.append(f'Tavily ranked this feed URL for “{query}”')
-        elif seed.intent in {"direct", "both"}:
-            reasons.append(f'Tavily ranked the containing feed page for “{query}”')
-        if seed.intent in {"publisher", "both"} and self._has_query_overlap(query, page_text):
-            reasons.append(f'Tavily identified this as a specialist publisher for “{query}”')
         if feed.last_published_at is not None:
             reasons.append("Feed has recently dated entries")
         return self._dedupe(reasons)
 
-    @staticmethod
+    def _article_matches(self, query: str, feed: _ValidatedFeed) -> tuple[int, int]:
+        texts = feed.entry_texts or feed.sample_titles
+        return sum(self._has_query_overlap(query, text) for text in texts), len(texts)
+
     def _is_relevant(
-        seed: _SearchSeed,
+        self,
+        query: str,
+        feed: _ValidatedFeed,
         scope: Literal["category", "tag", "sitewide"],
-        reasons: list[str],
     ) -> bool:
-        if scope in {"category", "tag"}:
-            return any(
-                "Feed metadata matches" in reason or "this feed URL" in reason
-                for reason in reasons
-            )
-        if seed.intent not in {"publisher", "both"}:
-            return any("matches" in reason for reason in reasons)
-        return any("specialist publisher" in reason for reason in reasons)
+        matches, total = self._article_matches(query, feed)
+        if total >= 3:
+            # Metadata/path cannot override contradictory article evidence.
+            return matches >= 3 and matches / total >= 0.6
+        metadata = " ".join((feed.title, feed.subtitle, " ".join(feed.categories)))
+        return total > 0 and matches == total and (
+            self._has_query_overlap(query, metadata)
+            or (scope in {"category", "tag"} and self._has_query_overlap(query, feed.url))
+        )
 
     @staticmethod
     def _candidate_source(
@@ -687,28 +853,33 @@ class TopicFeedDiscovery:
             return "tavily_direct"
         return "tavily_publisher"
 
+    @staticmethod
+    def _rank_key(item: _RankedCandidate) -> tuple:
+        source_order = {"tavily_direct": 0, "tavily_publisher": 1, "google_fallback": 2}
+        scope_order = {"category": 0, "tag": 0, "sitewide": 1}
+        return (
+            item.sample_size < 3,
+            -item.article_coverage,
+            -item.matching_articles,
+            scope_order[item.candidate.feed_scope],
+            -item.evidence_count,
+            source_order[item.candidate.discovery_source],
+            -item.provider_score,
+            item.candidate.source_label.casefold(),
+            item.candidate.feed_url,
+        )
+
     def _select_diverse(
         self, ranked: list[_RankedCandidate], limit: int
     ) -> list[FeedDiscoveryCandidate]:
-        source_order = {"tavily_direct": 0, "tavily_publisher": 1, "google_fallback": 2}
-        scope_order = {"category": 0, "tag": 0, "sitewide": 1}
-        ranked.sort(
-            key=lambda item: (
-                source_order[item.candidate.discovery_source],
-                scope_order[item.candidate.feed_scope],
-                -item.provider_score,
-                -item.evidence_count,
-                item.candidate.source_label.casefold(),
-                item.candidate.feed_url,
-            )
-        )
+        ranked.sort(key=self._rank_key)
         selected: list[FeedDiscoveryCandidate] = []
         seen_urls: set[str] = set()
         seen_feed_identities: set[tuple[str, str]] = set()
         host_counts: Counter[str] = Counter()
         for item in ranked:
             candidate = item.candidate
-            key = candidate.feed_url.casefold()
+            key = _DiscoverySession.key(candidate.feed_url)
             host = self._publisher_host(candidate.website_url or candidate.feed_url)
             identity = (host, candidate.source_label.casefold())
             if (
@@ -758,15 +929,14 @@ class TopicFeedDiscovery:
 
     @staticmethod
     def _has_query_overlap(query: str, text: str) -> bool:
-        query_tokens = {
-            token.casefold()
-            for token in _TOKEN_RE.findall(query)
-            if token.casefold() not in _STOP_WORDS and len(token) > 1
-        }
-        if not query_tokens:
-            query_tokens = {query.casefold()}
-        text_tokens = {token.casefold() for token in _TOKEN_RE.findall(text)}
-        return bool(query_tokens & text_tokens)
+        return matches_topic(query, text)
+
+    @staticmethod
+    def _is_comment_feed(url: str, title: str) -> bool:
+        return bool(
+            re.search(r"/(?:comments?)(?:/|$)|[?&]feed=comments", url, re.I)
+            or re.match(r"comments? (?:on|for|feed)\b", title, re.I)
+        )
 
     @staticmethod
     def _website_url(url: str) -> str:
@@ -784,6 +954,16 @@ class TopicFeedDiscovery:
     @staticmethod
     def _publisher_host(url: str) -> str:
         host = TopicFeedDiscovery._host(url)
+        # Each hosted publication is independent, rather than one publisher
+        # for every newsletter/blog sharing the platform's registrable domain.
+        if host.endswith((".substack.com", ".wordpress.com", ".blogspot.com")):
+            return host
+        if host in {"medium.com", "www.medium.com"}:
+            parts = urlsplit(url).path.strip("/").split("/")
+            if parts[0] == "feed":
+                parts = parts[1:]
+            if parts and parts[0] and parts[0] not in {"tag", "topic"}:
+                return f"{host}/{parts[0]}"
         extracted = _extract_domain(host)
         return ".".join(part for part in (extracted.domain, extracted.suffix) if part) or host
 
@@ -803,14 +983,19 @@ class TopicFeedDiscovery:
 
     @staticmethod
     def _dedupe_links(values: Iterable[_Link]) -> list[_Link]:
-        result: list[_Link] = []
-        seen: set[str] = set()
+        result: dict[str, _Link] = {}
         for value in values:
             if not value.url:
                 continue
-            key = value.url.casefold()
-            if key in seen:
+            try:
+                key = _DiscoverySession.key(value.url)
+            except (ValueError, UnsafeFeedUrl):
                 continue
-            seen.add(key)
-            result.append(value)
-        return result
+            current = result.get(key)
+            result[key] = _Link(
+                key,
+                " · ".join(TopicFeedDiscovery._dedupe((current.label, value.label)))
+                if current else value.label,
+                declared=value.declared or (current.declared if current else False),
+            )
+        return list(result.values())

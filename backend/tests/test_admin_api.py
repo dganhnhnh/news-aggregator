@@ -221,6 +221,8 @@ def test_discover_feeds_marks_existing_candidates() -> None:
         "pages_inspected": 3,
         "feeds_validated": 2,
         "google_fallback_used": False,
+        "feeds_attempted": 0,
+        "feeds_relevant": 0,
     }
     assert body["warnings"] == ["Partial discovery"]
     assert body["candidates"][0]["feed_scope"] == "category"

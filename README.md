@@ -19,9 +19,23 @@ uv run crawl4ai-setup
 ```
 
 Điền `TAVILY_API_KEY` trong `.env` nếu dùng lệnh `search` hoặc tính năng
-**Feeds → Custom Add feeds**. Admin API chạy hai Tavily `basic` searches cho
+**Feeds → Custom Add feeds**. Admin API chạy bốn Tavily `basic` searches cho
 mỗi yêu cầu discovery; nếu để trống, endpoint trả `503` thay vì âm thầm quay
 về kết quả Google News chất lượng thấp hơn.
+
+Mỗi lần **Find feeds** kiểm tra tối đa **50 feed URL**, kể cả URL lỗi và
+nhánh Google News fallback, rồi trả tối đa 25 kết quả. Các nhánh dùng chung
+budget và cache trong một request; đọc trang HTML để tìm link không tiêu
+budget feed, còn các redirect được tính trong lượt thử URL ban đầu. Link
+feed được khai báo và khớp chủ đề được ưu tiên, với lượt thử luân phiên giữa
+các publisher. Khi hết budget, API trả kết quả đã tìm được kèm thông báo.
+
+Độ liên quan dựa trên title/summary của tối đa 12 bài đầu trong feed: cần
+ít nhất 3 bài khớp và coverage ≥60% khi có từ 3 bài mẫu trở lên. Metadata
+hay đường dẫn category/tag không thể ghi đè bằng chứng bài viết trái ngược.
+Với 1–2 bài mẫu, cả metadata/path lẫn toàn bộ bài mẫu phải khớp, và kết quả
+được ghi chú ít chắc chắn hơn. Xếp hạng ưu tiên mẫu đủ lớn và coverage bài
+viết trước loại feed; matching dùng từ khóa/alias, chưa gọi LLM.
 
 ## Khởi động PostgreSQL và API
 

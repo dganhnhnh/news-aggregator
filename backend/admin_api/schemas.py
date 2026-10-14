@@ -44,7 +44,7 @@ class FeedDiscoveryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=300)
     language: str = Field(default="en", pattern=r"^[A-Za-z]{2,8}$")
     country: str = Field(default="US", pattern=r"^[A-Za-z]{2}$")
-    limit: int = Field(default=12, ge=1, le=25)
+    limit: int = Field(default=25, ge=1, le=25)
 
     @field_validator("query")
     @classmethod
@@ -75,6 +75,8 @@ class FeedDiscoveryStatsResponse(BaseModel):
     pages_inspected: int
     feeds_validated: int
     google_fallback_used: bool
+    feeds_attempted: int
+    feeds_relevant: int
 
 
 class FeedDiscoveryResponse(BaseModel):
@@ -112,6 +114,8 @@ class FeedDiscoveryResponse(BaseModel):
                 pages_inspected=result.stats.pages_inspected,
                 feeds_validated=result.stats.feeds_validated,
                 google_fallback_used=result.stats.google_fallback_used,
+                feeds_attempted=result.stats.feeds_attempted,
+                feeds_relevant=result.stats.feeds_relevant,
             ),
             warnings=list(result.warnings),
         )
