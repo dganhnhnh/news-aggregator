@@ -18,6 +18,7 @@ from crawl4ai import (
 )
 
 from core.content_quality import BLOCK_PAGE_CONTEXT_KEY, block_page_reason
+from core.crawl_errors import ERROR_TYPE_KEY, error_context
 from core.logger import get_logger
 from core.urls import URL_ERROR_CONTEXT_KEY, UnusableUrl, resolve_crawl_url
 
@@ -103,9 +104,13 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
 
     title = raw_meta.get("title") if isinstance(raw_meta, dict) else None
 
-    effective_success = success and bool(raw_markdown.strip())
+    status_code = getattr(inner, "status_code", None)
+    http_failed = isinstance(status_code, int) and status_code >= 400
+    effective_success = success and bool(raw_markdown.strip()) and not http_failed
     error_message = getattr(inner, "error_message", "") or ""
-    if success and not effective_success:
+    if http_failed:
+        error_message = error_message or f"HTTP {status_code}"
+    elif success and not effective_success:
         error_message = "Crawler returned empty Markdown content"
 
     # An anti-bot interstitial that renders as a normal document arrives here
@@ -136,6 +141,12 @@ def _build_crawl_result(url: str, inner, success: bool) -> CrawlResult:
         error_message=error_message,
     )
     result.context["requested_url"] = url
+    if not effective_success:
+        result.context.update(error_context(
+            error_message, http_status=getattr(inner, "status_code", None)
+        ))
+        if success and not raw_markdown.strip() and not http_failed:
+            result.context[ERROR_TYPE_KEY] = "EmptyContent"
     if blocked:
         result.context[BLOCK_PAGE_CONTEXT_KEY] = blocked
     return result
@@ -197,6 +208,7 @@ class Crawl4aiProvider(CrawlerProvider):
                 markdown="",
                 success=False,
                 error_message=str(exc),
+                context=error_context(exc, default="BrowserError"),
             )
 
         inner, _ = _unwrap_result(container)
@@ -300,6 +312,7 @@ class Crawl4aiProvider(CrawlerProvider):
                     markdown="",
                     success=False,
                     error_message="Crawler returned no result for this URL",
+                    context={ERROR_TYPE_KEY: "BatchError"},
                 )
             results.append(result)
 

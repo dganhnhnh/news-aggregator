@@ -24,7 +24,7 @@ from models.storage_models import (
     StageJobMetrics,
     WorkerHealthMetrics,
     WorkerRunCount,
-    WorkerStatDelta,
+    WorkerStatObservation,
 )
 
 
@@ -188,6 +188,46 @@ def test_idle_worker_reports_no_heartbeat_age() -> None:
     )
 
 
+def test_partial_completion_and_progress_are_separate_from_strict_success():
+    samples = _samples(_snapshot(workers=(WorkerHealthMetrics(
+        worker="crawl", last_completed_at=NOW, last_progress_at=NOW - timedelta(seconds=5),
+    ),)))
+    assert samples["news_radar_worker_last_completed_timestamp_seconds[('worker', 'crawl')]"] == NOW.timestamp()
+    assert samples["news_radar_worker_last_progress_timestamp_seconds[('worker', 'crawl')]"] == NOW.timestamp() - 5
+    assert not any(key.startswith("news_radar_worker_last_success_timestamp") for key in samples)
+
+
+def test_live_checkpoints_and_late_finishes_are_counted_once():
+    storage = FakeMetricsStorage([
+        (WorkerStatObservation("crawl", 1, {"crawl_failed": 2, "failure_counts": {"article:Timeout": 2}}, False),),
+        (
+            WorkerStatObservation("crawl", 1, {"crawl_failed": 3, "failure_counts": {"article:Timeout": 3}}, False),
+            WorkerStatObservation("crawl", 2, {"crawl_failed": 4}, True),
+        ),
+        (WorkerStatObservation("crawl", 1, {"crawl_failed": 5, "failure_counts": {"article:Timeout": 5}}, True),),
+        (),
+    ])
+    collector = MetricsCollector(storage, cache_seconds=0)
+
+    async def scenario():
+        texts = [(await collector.expose()).decode() for _ in range(4)]
+        assert collector._active_stats == {}
+        return texts
+
+    texts = asyncio.run(scenario())
+    for text, count in zip(texts, (2, 7, 9, 9), strict=True):
+        assert f'news_radar_worker_stat_total{{stat="crawl_failed",worker="crawl"}} {count}.0' in text
+    assert 'news_radar_worker_errors_total{error_type="Timeout",failure_kind="article",worker="crawl"} 5.0' in texts[-1]
+    assert storage.active_run_ids == [(), (1,), (1,), ()]
+
+
+def test_counter_high_water_survives_a_decreased_checkpoint():
+    collector = MetricsCollector(FakeMetricsStorage())
+    for count in (5, 2, 6):
+        collector._accumulate([WorkerStatObservation("crawl", 1, {"crawl_failed": count}, False)])
+    assert collector._totals[("crawl", "crawl_failed")] == 6
+
+
 def test_ingestion_lag_renders_as_a_counter_histogram() -> None:
     ingestion = IngestionLagDelta(
         bounds=BOUNDS,
@@ -312,11 +352,12 @@ def test_quality_families_are_absent_when_nothing_was_collected() -> None:
 class FakeMetricsStorage:
     def __init__(
         self,
-        deltas: list[tuple[WorkerStatDelta, ...]] | None = None,
+        deltas: list[tuple[WorkerStatObservation, ...]] | None = None,
         lag_deltas: list[IngestionLagDelta] | None = None,
     ) -> None:
         self.snapshot_calls = 0
         self.watermarks: list[dict[str, int]] = []
+        self.active_run_ids: list[tuple[int, ...]] = []
         self.lag_watermarks: list[int] = []
         self._deltas = deltas or [()]
         self._lag_deltas = lag_deltas or [IngestionLagDelta(bounds=BOUNDS)]
@@ -325,8 +366,9 @@ class FakeMetricsStorage:
         self.snapshot_calls += 1
         return _snapshot()
 
-    async def worker_stat_totals(self, after):
+    async def worker_stat_observations(self, after, active_run_ids=()):
         self.watermarks.append(dict(after))
+        self.active_run_ids.append(tuple(active_run_ids))
         index = min(len(self.watermarks) - 1, len(self._deltas) - 1)
         return self._deltas[index]
 
@@ -366,8 +408,8 @@ def test_collector_serves_the_cache_until_it_expires() -> None:
 def test_collector_accumulates_stats_and_advances_watermarks() -> None:
     storage = FakeMetricsStorage(
         [
-            (WorkerStatDelta("crawl", "articles_persisted", 10.0, 7),),
-            (WorkerStatDelta("crawl", "articles_persisted", 4.0, 9),),
+            (WorkerStatObservation("crawl", 7, {"articles_persisted": 10}, True),),
+            (WorkerStatObservation("crawl", 9, {"articles_persisted": 4}, True),),
         ]
     )
     clock = FrozenClock()

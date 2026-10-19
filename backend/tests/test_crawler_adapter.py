@@ -370,3 +370,11 @@ def test_crawl4ai_provider_default_excluded_tags() -> None:
     assert provider._run_config.excluded_tags == ["nav", "header", "footer", "aside", "form"]
     assert provider._run_config.only_text is True
 
+
+def test_http_error_body_cannot_be_a_successful_article():
+    inner = SimpleNamespace(markdown="# Not found", metadata={}, status_code=404)
+    result = _build_crawl_result("https://example.com/gone", inner, success=True)
+    from core.content_quality import crawl_failure_error_type
+    assert not result.success
+    assert crawl_failure_error_type(result.context) == "HttpError:404"
+

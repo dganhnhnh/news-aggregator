@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import (
+    DateTime,
     and_,
     case,
     delete,
@@ -124,6 +125,7 @@ from models.storage_models import (
     WorkerHealthMetrics,
     WorkerRunCount,
     WorkerStatDelta,
+    WorkerStatObservation,
     WorkerTrigger,
 )
 from services.raw_storage import (
@@ -760,7 +762,7 @@ class PostgresRawStorage:
                     status=status,
                     finished_at=datetime.now(timezone.utc),
                     heartbeat_at=datetime.now(timezone.utc),
-                    stats=self._stats_payload(stats),
+                    stats=worker_runs.c.stats.op("||")(self._stats_payload(stats)),
                     error_message=(error_message or "")[:2000] or None,
                 )
             )
@@ -777,7 +779,10 @@ class PostgresRawStorage:
                 update(worker_runs)
                 .where(worker_runs.c.id == run_id)
                 .values(
-                    stats=self._stats_payload(stats),
+                    stats=worker_runs.c.stats.op("||")({
+                        **self._stats_payload(stats),
+                        "_progress_at": datetime.now(timezone.utc).isoformat(),
+                    }),
                     heartbeat_at=datetime.now(timezone.utc),
                 )
             )
@@ -936,6 +941,12 @@ class PostgresRawStorage:
                         func.max(worker_runs.c.finished_at)
                         .filter(worker_runs.c.status == "succeeded")
                         .label("last_success"),
+                        func.max(worker_runs.c.finished_at)
+                        .filter(worker_runs.c.status.in_(("succeeded", "partial")))
+                        .label("last_completed"),
+                        func.max(
+                            worker_runs.c.stats["_progress_at"].astext.cast(DateTime(timezone=True))
+                        ).label("last_progress"),
                         func.count()
                         .filter(worker_runs.c.status == "running")
                         .label("running"),
@@ -1129,6 +1140,8 @@ class PostgresRawStorage:
             WorkerHealthMetrics(
                 worker=row.worker,
                 last_success_at=row.last_success,
+                last_completed_at=row.last_completed,
+                last_progress_at=row.last_progress,
                 last_run_duration_seconds=durations.get(row.worker),
                 running=int(row.running),
                 oldest_heartbeat_age_seconds=(
@@ -1193,6 +1206,40 @@ class PostgresRawStorage:
                     ("cluster", int(recent_row.cluster)),
                 ),
             ),
+        )
+
+    async def worker_stat_observations(
+        self,
+        after: Mapping[str, int],
+        active_run_ids: Sequence[int] = (),
+    ) -> tuple[WorkerStatObservation, ...]:
+        """Read new runs plus previously observed unfinished runs in one query.
+
+        Retaining active ids prevents a newer finished run from hiding an
+        older run's late checkpoint/finish when workers share a lock.
+        """
+        unseen = or_(
+            worker_runs.c.worker.notin_(list(after)),
+            *[
+                and_(worker_runs.c.worker == worker, worker_runs.c.id > run_id)
+                for worker, run_id in after.items()
+            ],
+        )
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(
+                select(
+                    worker_runs.c.id, worker_runs.c.worker,
+                    worker_runs.c.stats, worker_runs.c.finished_at,
+                )
+                .where(or_(unseen, worker_runs.c.id.in_(list(active_run_ids))))
+                .order_by(worker_runs.c.id)
+            )).all()
+        return tuple(
+            WorkerStatObservation(
+                worker=row.worker, run_id=row.id,
+                stats=row.stats or {}, finished=row.finished_at is not None,
+            )
+            for row in rows
         )
 
     async def worker_stat_totals(
@@ -1521,6 +1568,8 @@ class PostgresRawStorage:
         priority: int = 1,
     ) -> StorageWriteSummary:
         written = 0
+        full_content_written = 0
+        summary_only_written = 0
         written_article_ids: list[int] = []
         async with self._engine.begin() as connection:
             article_slugs = {
@@ -1699,12 +1748,16 @@ class PostgresRawStorage:
                         raw_articles.c.published_at.is_distinct_from(merged_published),
                         raw_articles.c.url_original.is_distinct_from(incoming.url_original),
                     ),
-                ).returning(raw_articles.c.id)
+                ).returning(raw_articles.c.id, raw_articles.c.content_source)
                 result = await connection.execute(statement)
-                written_id = result.scalar_one_or_none()
-                if written_id is not None:
+                written_row = result.one_or_none()
+                if written_row is not None:
                     written += 1
-                    written_article_ids.append(int(written_id))
+                    written_article_ids.append(int(written_row.id))
+                    if written_row.content_source == "feed_summary":
+                        summary_only_written += 1
+                    else:
+                        full_content_written += 1
 
             if written_article_ids:
                 await self._enqueue_embed_jobs(
@@ -1723,6 +1776,8 @@ class PostgresRawStorage:
             written=written,
             unchanged=unchanged,
             rejected=rejected,
+            full_content_written=full_content_written,
+            summary_only_written=summary_only_written,
         )
 
     @staticmethod

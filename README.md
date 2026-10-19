@@ -518,13 +518,16 @@ nằm ở admin API chứ không phải `news-api`: queue depth, kích thước 
 số lần crawl thất bại là thông tin vận hành, và admin API chỉ publish trên
 loopback (`127.0.0.1:8001`). Prometheus scrape job `news-radar` mỗi 30 giây.
 
-Worker là container ephemeral — Airflow chạy `news-worker` rồi `auto_remove`
-xóa container — nên không có process nào để scrape. Vì vậy collector đọc thẳng
+Worker có thể chạy trong container ephemeral hoặc service dài hạn. Collector đọc thẳng
 PostgreSQL: `processing_jobs`, `worker_runs`, `crawl_failures`, `feed_state` và
 các bảng corpus. Counter của worker (`news_radar_worker_stat_total`) được cộng
-dồn từ `worker_runs.stats` theo watermark từng worker, nên mỗi lần collect chỉ
-đọc các run vừa kết thúc và giá trị chỉ tăng; process restart sẽ đọc lại lịch
-sử và quay về đúng tổng cũ thay vì reset.
+dồn từ `worker_runs.stats` ở mỗi checkpoint và khi run kết thúc. Watermark từng
+worker cùng các run đang chạy giúp chỉ cộng phần tăng thêm, kể cả khi run cũ
+kết thúc sau run mới. Process restart đọc lại stats còn được giữ trong database.
+`news_radar_worker_errors_total{worker,failure_kind,error_type}` đếm số lần lỗi
+theo cùng cơ chế; khác với gauge `crawl_failures`, counter này không giảm khi
+retry thành công. Xem [hợp đồng metrics cho alert](docs/crawl-monitoring.md)
+để chọn đúng tín hiệu completion, progress, full content và error rate.
 
 Mỗi lần collect đều đụng các bảng vận hành, nên kết quả được cache
 `METRICS_CACHE_SECONDS` (mặc định 15s, thấp hơn scrape interval 30s).

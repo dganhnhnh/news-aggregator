@@ -8,6 +8,7 @@ from dataclasses import replace
 from adapters.retrieve_news_data.google_news_rss_searcher import RssFeedSearcher
 from adapters.storage.postgres import PostgresRawStorage
 from core.content_quality import crawl_failure_error_type
+from core.crawl_errors import error_context
 from core.urls import URL_ERROR_CONTEXT_KEY
 from models.search_and_crawl_models import CrawlMetadata, CrawlResult
 from models.storage_models import (
@@ -160,6 +161,7 @@ async def iter_retry_batches(
                         markdown="",
                         success=False,
                         error_message=str(exc),
+                        context=error_context(exc, default="BatchError"),
                     )
                     for failure in failures
                 ]

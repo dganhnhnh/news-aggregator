@@ -16,7 +16,11 @@ pulling in any I/O dependencies.
 """
 import asyncio
 from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import suppress
 import csv
+import json
+import subprocess
+import sys
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 from dataclasses import replace
@@ -26,7 +30,6 @@ from typing import NamedTuple, Optional
 
 import feedparser
 import httpx
-from googlenewsdecoder import new_decoderv1
 
 from core.html_content import (
     FEED_CONTENT_KEY,
@@ -37,6 +40,7 @@ from core.html_content import (
     render_feed_summary,
 )
 from core.config import DEFAULT_USER_AGENT
+from core.crawl_errors import ERROR_TYPE_KEY, error_context
 from core.content_quality import crawl_failure_error_type
 from core.logger import get_logger
 from core.urls import (
@@ -79,73 +83,69 @@ class _ArticleJob(NamedTuple):
 #
 # Cache: Google News URL → decoded real URL.
 # Persists for the lifetime of the process (survives across feed runs).
-# Key = full Google News URL so each unique URL is decoded at most once.
+# Key = full Google News URL so successful URLs are decoded at most once; failures are never cached.
 _DECODE_CACHE: dict[str, str] = {}
 
-# Rate-limit: max N concurrent decode calls, with a pause between each.
+# Rate-limit: at most two decoder processes and one backoff retry on 429.
 # Reduces 429 Too Many Requests from Google.
 _DECODE_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(2)
-_DECODE_DELAY: float = 0.5  # seconds between consecutive decode attempts
+
+
+# The decoder uses synchronous HTTP without a configurable timeout. A child
+# process can be killed; cancelling a to_thread() call would leave HTTP running.
+_DECODE_TIMEOUT_SECONDS = 30.0
+_DECODE_COMMAND = (
+    "import json, sys; from googlenewsdecoder import new_decoderv1; "
+    "print(json.dumps(new_decoderv1(sys.argv[1])))"
+)
+
+
+async def _run_decoder(url: str) -> dict:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", _DECODE_COMMAND, url,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        stdout, _ = await process.communicate()
+        if process.returncode:
+            raise RuntimeError(f"Google News decoder exited {process.returncode}")
+        return json.loads(stdout.decode().splitlines()[-1])
+    finally:
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
 
 
 async def _decode_google_news_url_async(goog_url: str) -> str:
+    """Decode with a deadline including semaphore wait, HTTP and one 429 retry.
+
+    Cache only successes so a transient failure can recover on the next run.
+    The fallback original URL is turned into DecodeError by article callers.
     """
-    Decode a Google News redirect URL to the real article URL.
-
-    Uses ``googlenewsdecoder.new_decoderv1`` (synchronous HTTP call).
-    Returns the original URL on failure so the caller still gets something to crawl.
-
-    Thread-safe cache + rate-limiting to avoid Google 429 errors.
-    """
-    if not goog_url:
-        return ""
-
-    # Already a clean URL — skip decoding
-    if "news.google.com" not in goog_url:
+    if not goog_url or "news.google.com" not in goog_url:
         return goog_url
-
-    # Cache hit — avoid re-decode entirely
     if goog_url in _DECODE_CACHE:
-        cached = _DECODE_CACHE[goog_url]
-        logger.debug("[GoogleNews] cache hit  %s → %s", goog_url[:60], cached[:60])
-        return cached
-
-    # Rate-limit: serialize decode calls
-    async with _DECODE_SEMAPHORE:
-        # Double-check cache after acquiring semaphore (another task may have filled it)
-        if goog_url in _DECODE_CACHE:
-            return _DECODE_CACHE[goog_url]
-
-        try:
-            result = await asyncio.to_thread(new_decoderv1, goog_url)
-            if result.get("status"):
-                decoded = result.get("decoded_url", "").strip()
-                if decoded and decoded != goog_url:
-                    logger.debug(
-                        "[GoogleNews] decoded  %s → %s", goog_url[:60], decoded[:60]
-                    )
-                    _DECODE_CACHE[goog_url] = decoded
-                    return decoded
-            else:
-                # 429 / rate-limit from Google — back off and retry once
-                if result.get("message", "").__contains__("429"):
-                    logger.warning(
-                        "[GoogleNews] Rate-limited (429) for %s — backing off 5s…",
-                        goog_url[:60],
-                    )
-                    await asyncio.sleep(5)
-                    result = await asyncio.to_thread(new_decoderv1, goog_url)
+        return _DECODE_CACHE[goog_url]
+    try:
+        async with asyncio.timeout(_DECODE_TIMEOUT_SECONDS):
+            async with _DECODE_SEMAPHORE:
+                if goog_url in _DECODE_CACHE:
+                    return _DECODE_CACHE[goog_url]
+                for attempt in range(2):
+                    result = await _run_decoder(goog_url)
                     if result.get("status"):
                         decoded = result.get("decoded_url", "").strip()
                         if decoded and decoded != goog_url:
                             _DECODE_CACHE[goog_url] = decoded
                             return decoded
-        except Exception as exc:
-            logger.warning("[GoogleNews] decode failed for %s: %s", goog_url[:60], exc)
-
-        # Fallback: use the Google News URL as-is
-        _DECODE_CACHE[goog_url] = goog_url
-        return goog_url
+                    if attempt == 0 and "429" in result.get("message", ""):
+                        await asyncio.sleep(5)
+                        continue
+                    break
+    except Exception as exc:
+        logger.warning("[GoogleNews] decode failed for %s: %s", goog_url[:60], exc)
+    return goog_url
 
 
 # ─── Sync wrapper (kept for backward compat, prefer async version) ──────────────
@@ -163,16 +163,20 @@ def _decode_google_news_url(goog_url: str) -> str:
         return _DECODE_CACHE[goog_url]
 
     try:
-        result = new_decoderv1(goog_url)
+        completed = subprocess.run(
+            [sys.executable, "-c", _DECODE_COMMAND, goog_url],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=_DECODE_TIMEOUT_SECONDS, check=True,
+        )
+        result = json.loads(completed.stdout.decode().splitlines()[-1])
         if result.get("status"):
             decoded = result.get("decoded_url", "").strip()
             if decoded and decoded != goog_url:
                 _DECODE_CACHE[goog_url] = decoded
                 return decoded
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("[GoogleNews] decode failed for %s: %s", goog_url[:60], exc)
 
-    _DECODE_CACHE[goog_url] = goog_url
     return goog_url
 
 
@@ -575,7 +579,10 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                             failure_kind="feed",
                             url=target.feed_url,
                             source=target.source_label,
-                            error_type=type(outcome).__name__,
+                            error_type=crawl_failure_error_type(error_context(
+                                outcome,
+                                default="FeedParseError" if isinstance(outcome, ValueError) else "CrawlError",
+                            )),
                             error_message=str(outcome),
                             permanent=_is_permanent_feed_error(outcome),
                         ),
@@ -810,6 +817,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                     markdown="",
                     success=False,
                     error_message="Empty URL after decoding",
+                    context={ERROR_TYPE_KEY: "DecodeError"},
                 )
             elif "news.google.com" in feed_entry_url and real_url == feed_entry_url:
                 outcomes[index] = CrawlResult(
@@ -817,6 +825,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                     markdown="",
                     success=False,
                     error_message="Unable to decode Google News redirect URL",
+                    context={ERROR_TYPE_KEY: "DecodeError"},
                 )
             else:
                 crawl_indexes.append(index)
@@ -841,6 +850,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                         markdown="",
                         success=False,
                         error_message=str(exc),
+                        context=error_context(exc, default="BatchError"),
                     )
                     for url in crawl_urls
                 ]
@@ -987,6 +997,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 markdown="",
                 success=False,
                 error_message="Empty URL after decoding",
+                context={ERROR_TYPE_KEY: "DecodeError"},
             )
         if google_url and real_url == google_url:
             return CrawlResult(
@@ -994,6 +1005,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 markdown="",
                 success=False,
                 error_message="Unable to decode Google News redirect URL",
+                context={ERROR_TYPE_KEY: "DecodeError"},
             )
 
         return await self._do_crawl(
@@ -1061,6 +1073,7 @@ class GoogleNewsRssSearcher(CrawlerProvider):
                 markdown="",
                 success=False,
                 error_message="Unable to decode Google News redirect URL",
+                context={ERROR_TYPE_KEY: "DecodeError"},
             )
 
         return await self._do_crawl(

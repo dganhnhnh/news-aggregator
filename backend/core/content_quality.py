@@ -33,6 +33,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from core.urls import URL_ERROR_CONTEXT_KEY
+from core.crawl_errors import ERROR_TYPE_KEY, ERROR_TYPES, HTTP_STATUS_KEY
 
 
 __all__ = [
@@ -193,4 +194,10 @@ def crawl_failure_error_type(context: Mapping[str, Any]) -> str:
         return f"UnusableUrl:{rejection}"
     if context.get(BLOCK_PAGE_CONTEXT_KEY):
         return "BlockedPage"
+    category = context.get(ERROR_TYPE_KEY)
+    if category in ERROR_TYPES:
+        status = context.get(HTTP_STATUS_KEY)
+        if category == "HttpError" and isinstance(status, int) and 400 <= status <= 599:
+            return f"HttpError:{status}"
+        return category
     return "CrawlError"

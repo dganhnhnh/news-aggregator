@@ -126,6 +126,9 @@ class CrawlWorker(Worker):
             stats.retries_succeeded += retries_succeeded
             stats.articles_written += retry_summary.written
             stats.articles_unchanged += retry_summary.unchanged
+            stats.storage_rejected += retry_summary.rejected
+            stats.articles_full_content_written += retry_summary.full_content_written
+            stats.articles_summary_only_written += retry_summary.summary_only_written
             has_failures = has_failures or bool(retry_batch.failures)
             await ctx.checkpoint(stats)
             if args.emit_jsonl:
@@ -198,11 +201,13 @@ class CrawlWorker(Worker):
                         not_modified=True,
                         resolved_url=poll.resolved_url,
                     )
+                    await ctx.checkpoint(stats)
                     continue
 
                 if poll.status == "failed":
                     assert poll.error is not None
                     stats.feeds_failed += 1
+                    stats.add_failure(poll.error)
                     has_failures = True
                     outcome = await storage.record_feed_failure(
                         poll.target.feed_url,
@@ -230,6 +235,7 @@ class CrawlWorker(Worker):
                                 outcome.consecutive_failures,
                                 poll.target.feed_url,
                             )
+                    await ctx.checkpoint(stats)
                     continue
 
                 # poll.status == "fetched"
@@ -325,6 +331,9 @@ class CrawlWorker(Worker):
                         stats.add_batch(batch)
                         stats.articles_written += summary.written
                         stats.articles_unchanged += summary.unchanged
+                        stats.storage_rejected += summary.rejected
+                        stats.articles_full_content_written += summary.full_content_written
+                        stats.articles_summary_only_written += summary.summary_only_written
                         has_failures = has_failures or bool(batch.failures)
                         await ctx.checkpoint(stats)
                         if args.emit_jsonl:
@@ -353,6 +362,7 @@ class CrawlWorker(Worker):
                     observed_publish_gap_count=cadence.gap_count,
                     resolved_url=poll.resolved_url,
                 )
+                await ctx.checkpoint(stats)
 
         logger.info(
             "Crawl run %d: feeds=%d not_modified=%d failed=%d disabled=%d "

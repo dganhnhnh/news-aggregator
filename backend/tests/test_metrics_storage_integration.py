@@ -141,6 +141,53 @@ async def _test_worker_stat_totals_resume_from_a_watermark() -> None:
         await engine.dispose()
 
 
+def test_live_stats_preserve_checkpoints_and_distinguish_completion():
+    if not DATABASE_URL:
+        pytest.skip("TEST_DATABASE_URL is not set")
+    asyncio.run(_live_stats_preserve_checkpoints())
+
+
+async def _live_stats_preserve_checkpoints():
+    storage = PostgresRawStorage(DATABASE_URL)
+    engine = create_async_engine(DATABASE_URL)
+    try:
+        await storage.check_ready()
+        await _cleanup(engine)
+        first = await storage.start_run(worker=WORKER, trigger="manual")
+        initial = next(w for w in (await storage.metrics_snapshot()).workers if w.worker == WORKER)
+        assert initial.last_completed_at is None and initial.last_progress_at is None
+        await storage.update_run(first, IngestRunStats(
+            articles_written=3, failure_counts={"article:Timeout": 1},
+        ))
+        checkpoint = next(w for w in (await storage.metrics_snapshot()).workers if w.worker == WORKER)
+        assert checkpoint.last_progress_at is not None
+        assert checkpoint.last_completed_at is None
+        observed = [r for r in await storage.worker_stat_observations({}) if r.worker == WORKER]
+        assert len(observed) == 1 and not observed[0].finished
+        assert observed[0].stats["articles_written"] == 3
+
+        # A newer run finishing must not hide an older shared worker's row.
+        second = await storage.start_run(worker=WORKER, trigger="manual")
+        await storage.finish_run(second, "partial", IngestRunStats(articles_written=4))
+        health = next(w for w in (await storage.metrics_snapshot()).workers if w.worker == WORKER)
+        assert health.last_completed_at is not None and health.last_success_at is None
+        assert health.last_progress_at == checkpoint.last_progress_at
+        newer = [r for r in await storage.worker_stat_observations({WORKER: first}, [first]) if r.worker == WORKER]
+        assert {r.run_id for r in newer} == {first, second}
+
+        await storage.finish_run(first, "failed", None, "next chunk failed")
+        late = [r for r in await storage.worker_stat_observations({WORKER: second}, [first]) if r.worker == WORKER]
+        assert len(late) == 1 and late[0].finished
+        assert late[0].stats["articles_written"] == 3
+        assert late[0].stats["failure_counts"] == {"article:Timeout": 1}
+        assert late[0].stats["_progress_at"] == observed[0].stats["_progress_at"]
+        assert not [r for r in await storage.worker_stat_observations({WORKER: second}) if r.worker == WORKER]
+    finally:
+        await _cleanup(engine)
+        await storage.close()
+        await engine.dispose()
+
+
 def test_ingestion_lag_buckets_each_article_once() -> None:
     if not DATABASE_URL:
         pytest.skip("TEST_DATABASE_URL is not set")

@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>News Radar – Architecture</title>
+
+<style>
+  /* ==================================================================
+     TUNING KNOBS  — edit here, then refresh the page.
+     Add ?debug to the URL to outline (red) any node whose text overflows.
+     ================================================================== */
+  :root {
+    --fs-scale: 1;            /* multiplies EVERY font size below */
+
+    --fs-title: 30;           /* page title */
+    --fs-section: 22;         /* section heading */
+    --fs-section-sub: 14.5;   /* section subtitle */
+    --fs-node-title: 16;      /* node heading (bold) */
+    --fs-node-sub: 13.5;      /* node description / bullets */
+    --fs-kb-title: 19;        /* title inside a cylinder */
+    --fs-label: 12.5;         /* arrow labels */
+    --fs-group-title: 13;     /* dashed group heading */
+    --fs-group-sub: 11.5;     /* dashed group description */
+
+    --line-height: 1.22;      /* line spacing (× font size) */
+    --pad-x: 8;               /* min horizontal gap between text and node edge (px) */
+    --pad-y: 4;               /* min vertical gap between text and node edge (px) */
+
+    /* palette */
+    --blue:  #6c8ebf; --blue-fill:  #dae8fc;
+    --green: #82b366;
+    --orange:#d79b00;
+    --red:   #b85450; --red-fill:   #f8cecc;
+    --purple:#9673a6; --purple-fill:#e1d5e7;
+    --teal:  #5fb3ad;
+    --ink: #1f2d3d; --ink-soft: #4d5d6e;
+    --arrow-blue: #2a6ebb; --arrow-green: #2e8b57; --arrow-red: #d64545; --arrow-purple: #8a4fc0;
+  }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: #f5f6f8; }
+  .diagram-wrapper { width: 100%; overflow-x: auto; }
+  svg {
+    display: block; width: 100%; max-width: 1860px; height: auto; margin: 0 auto;
+    background: #fff; border: 1px solid #dde3ea;
+    font-family: Helvetica, Arial, sans-serif;
+  }
+  text { text-anchor: middle; dominant-baseline: central; }
+  .start { text-anchor: start; }
+
+  /* font sizes (driven by the variables above) */
+  .title   { font-size: calc(var(--fs-title) * var(--fs-scale) * 1px); font-weight: 700; fill: #1f4e8c; }
+  .st      { font-size: calc(var(--fs-section) * var(--fs-scale) * 1px); font-weight: 700; text-anchor: start; }
+  .ss      { font-size: calc(var(--fs-section-sub) * var(--fs-scale) * 1px); fill: #5b6b7b; text-anchor: start; }
+  .t       { font-size: calc(var(--fs-node-title) * var(--fs-scale) * 1px); font-weight: 700; fill: var(--ink); }
+  .s       { font-size: calc(var(--fs-node-sub) * var(--fs-scale) * 1px); fill: var(--ink-soft); }
+  .kb      { font-size: calc(var(--fs-kb-title) * var(--fs-scale) * 1px); font-weight: 700; fill: var(--ink); }
+  .lb      { font-size: calc(var(--fs-label) * var(--fs-scale) * 1px); font-weight: 600; }
+  .gt      { font-size: calc(var(--fs-group-title) * var(--fs-scale) * 1px); font-weight: 700; fill: var(--arrow-green); }
+  .gs      { font-size: calc(var(--fs-group-sub) * var(--fs-scale) * 1px); fill: var(--arrow-green); }
+
+  /* sections */
+  .sec { stroke-width: 1.5; }
+  .sec.blue   { fill: #f1f6fc; stroke: var(--blue); }
+  .sec.green  { fill: #f3f9f1; stroke: var(--green); }
+  .sec.orange { fill: #fff6e9; stroke: var(--orange); }
+  .sec.teal   { fill: #eef9f8; stroke: var(--teal); }
+  .sec.purple { fill: #f8f3fc; stroke: var(--purple); stroke-dasharray: 7 4; }
+  .st.blue { fill: #1f4e8c; } .st.green { fill: #2d6a2d; }
+  .st.orange { fill: #a8531a; } .st.teal { fill: #1b6b68; } .st.purple { fill: #5b2d91; }
+
+  /* nodes */
+  .node { stroke-width: 1.5; }
+  .n-blue    { fill: var(--blue-fill);   stroke: var(--blue); }
+  .n-bluew   { fill: #fff;               stroke: var(--blue); }
+  .n-greenw  { fill: #fff;               stroke: var(--green); }
+  .n-orangew { fill: #fff;               stroke: var(--orange); }
+  .n-purplew { fill: #fff;               stroke: var(--purple); }
+  .n-red     { fill: var(--red-fill);    stroke: var(--red); }
+  .n-purple  { fill: var(--purple-fill); stroke: var(--purple); }
+  .node.overflow { stroke: #ff0000; stroke-width: 3; }
+
+  .grp { fill: none; stroke: var(--arrow-green); stroke-width: 1.5; stroke-dasharray: 7 5; }
+  .db, .db-top { stroke: var(--blue); stroke-width: 1.5; }
+  .db { fill: var(--blue-fill); } .db-top { fill: none; }
+
+  /* connectors */
+  .a { fill: none; stroke-width: 2; stroke-linejoin: round; }
+  .a-blue   { stroke: var(--arrow-blue);   marker-end: url(#h-blue); }
+  .a-green  { stroke: var(--arrow-green);  marker-end: url(#h-green); }
+  .a-red    { stroke: var(--arrow-red);    marker-end: url(#h-red); }
+  .a-purple { stroke: var(--arrow-purple); marker-end: url(#h-purple); }
+  .a.nohead { marker-end: none; }
+  .a.dashed { stroke-dasharray: 7 5; }
+  .l-blue { fill: var(--arrow-blue); } .l-green { fill: var(--arrow-green); }
+  .l-purple { fill: var(--arrow-purple); }
+</style>
+</head>
+
+<body>
+<div class="diagram-wrapper">
+<svg id="d" xmlns="http://www.w3.org/2000/svg">
+  <defs></defs>
+</svg>
+</div>
+
+<script>
+/* ====================================================================
+   ENGINE  — do not edit unless you need a new primitive.
+   The DIAGRAM section at the bottom is the only part you normally change.
+   ==================================================================== */
+
+/* ---------- canvas size (plain numbers; adjust to the diagram) ---------- */
+const W = 2000;
+const TOP = 80, BOT = 660;             // main-row section top / bottom
+const BAND = 690, BAND_BOT = 960;
+const H = BAND_BOT + 20;
+
+const NS = 'http://www.w3.org/2000/svg';
+const svg = document.getElementById('d');
+svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+const cs = getComputedStyle(document.documentElement);
+const cssNum = n => parseFloat(cs.getPropertyValue(n));
+const SCALE = cssNum('--fs-scale');
+const fs = n => cssNum('--fs-' + n) * SCALE;
+const LH = cssNum('--line-height');
+const PADX = cssNum('--pad-x'), PADY = cssNum('--pad-y');
+const FAMILY = 'Helvetica, Arial, sans-serif';
+const ctx = document.createElement('canvas').getContext('2d');
+const textW = (s, size, bold) => { ctx.font = `${bold ? 700 : 400} ${size}px ${FAMILY}`; return ctx.measureText(s).width; };
+
+function el(tag, attrs = {}, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  svg.appendChild(e);
+  return e;
+}
+
+// Greedy word-wrap. Arrays are used as-is (explicit line breaks).
+function wrap(text, size, bold, maxW) {
+  if (Array.isArray(text)) return text;
+  const lines = []; let cur = '';
+  for (const w of String(text).split(' ')) {
+    const t = cur ? cur + ' ' + w : w;
+    if (cur && textW(t, size, bold) > maxW) { lines.push(cur); cur = w; } else cur = t;
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+const N = {};                 // id -> {x,y,w,h,cx,cy}
+const checks = [];            // overflow checks, run after render
+// connector anchors on a registered node; dx/dy shift along the edge
+const L = (id, dy = 0) => [N[id].x, N[id].cy + dy];
+const R = (id, dy = 0) => [N[id].x + N[id].w, N[id].cy + dy];
+const T = (id, dx = 0) => [N[id].cx + dx, N[id].y];
+const B = (id, dx = 0) => [N[id].cx + dx, N[id].y + N[id].h];
+
+/* ---------- primitives ---------- */
+function section(x, y, w, h, cls, title, sub) {
+  el('rect', { class: `sec ${cls}`, x, y, width: w, height: h, rx: 12 });
+  el('text', { class: `st ${cls}`, x: x + 20, y: y + 30 }, title);
+  if (sub) el('text', { class: 'ss', x: x + 20, y: y + 55 }, sub);
+}
+
+// title: string (auto-wrap) | array (explicit lines);  sub: same.
+// cls: blue | bluew | greenw | orangew | purplew | red | purple
+function node(id, x, y, w, h, title, sub = [], cls = 'bluew') {
+  const tS = fs('node-title'), sS = fs('node-sub');
+  const maxW = w - 2 * PADX;
+  const tl = wrap(title, tS, true, maxW), sl = wrap(sub, sS, false, maxW);
+  const tH = tS * LH, sH = sS * LH, gap = sl.length ? tS * 0.3 : 0;
+  const total = tH * tl.length + gap + sH * sl.length;
+  let cy = y + (h - total) / 2;
+  const rect = el('rect', { class: `node n-${cls}`, x, y, width: w, height: h, rx: 8 });
+  const texts = [];
+  const cx = x + w / 2;
+  tl.forEach(l => { texts.push(el('text', { class: 't', x: cx, y: cy + tH / 2 }, l)); cy += tH; });
+  cy += gap;
+  sl.forEach(l => { texts.push(el('text', { class: 's', x: cx, y: cy + sH / 2 }, l)); cy += sH; });
+  N[id] = { x, y, w, h, cx, cy: y + h / 2 };
+  checks.push({ id, rect, texts, x, y, w, h });
+}
+
+// database cylinder; registers N[id] as its bounding box (rims included)
+function cylinder(id, cx, top, rx, ry, bodyH, title, sub, bullets = []) {
+  const bot = top + bodyH;
+  el('path', { class: 'db', d: `M${cx - rx} ${top} A${rx} ${ry} 0 0 1 ${cx + rx} ${top} V${bot} A${rx} ${ry} 0 0 1 ${cx - rx} ${bot} Z` });
+  el('path', { class: 'db-top', d: `M${cx - rx} ${top} A${rx} ${ry} 0 0 0 ${cx + rx} ${top}` });
+  el('text', { class: 'kb', x: cx, y: top + 46 }, title);
+  if (sub) el('text', { class: 's', x: cx, y: top + 70 }, sub);
+  bullets.forEach((l, i) => bullet(cx - rx * 0.6, top + 96 + 17 * i, l));
+  N[id] = { x: cx - rx, y: top - ry, w: 2 * rx, h: bodyH + 2 * ry, cx, cy: top + bodyH / 2 };
+}
+
+function bullet(x, y, text) {
+  el('text', { class: 's start', x, y }, '•');
+  return el('text', { class: 's start', x: x + 13, y }, text);
+}
+
+// orthogonal polyline arrow. kind: blue | green | red | purple; o.dashed, o.nohead
+function path(pts, kind = 'blue', o = {}) {
+  const d = pts.map((p, i) => `${i ? 'L' : 'M'}${p[0]} ${p[1]}`).join(' ');
+  el('path', { class: `a a-${kind}${o.dashed ? ' dashed' : ''}${o.nohead ? ' nohead' : ''}`, d });
+}
+
+function label(x, y, text, kind = 'blue', anchor = 'middle') {
+  el('text', { class: `lb l-${kind}${anchor === 'start' ? ' start' : ''}`, x, y }, text);
+}
+
+// vertical stack: nodes with given heights spread evenly between y0 and y1 -> array of y
+function stackY(heights, y0, y1) {
+  const gap = (y1 - y0 - heights.reduce((a, b) => a + b, 0)) / (heights.length - 1);
+  let y = y0; return heights.map(h => { const r = y; y += h + gap; return r; });
+}
+
+// arrow-head markers
+const defs = svg.querySelector('defs');
+for (const [k, c] of Object.entries({ blue: '--arrow-blue', green: '--arrow-green', red: '--arrow-red', purple: '--arrow-purple' })) {
+  const m = document.createElementNS(NS, 'marker');
+  Object.entries({ id: `h-${k}`, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 9, markerHeight: 9, markerUnits: 'userSpaceOnUse', orient: 'auto' })
+    .forEach(([a, v]) => m.setAttribute(a, v));
+  m.innerHTML = `<path d="M0 0 L10 5 L0 10 z" fill="${cs.getPropertyValue(c).trim()}"/>`;
+  defs.appendChild(m);
+}
+
+/* ====================================================================
+   DIAGRAM  — News Radar (nguồn: CLAUDE.md, deployments/docker-compose.yml, backend/)
+   ==================================================================== */
+el('text', { class: 'title', x: W / 2, y: 36 }, 'News Radar – Kiến trúc hệ thống');
+
+/* ---------- sections ---------- */
+section(20,   TOP, 300, BOT - TOP, 'blue',   'Nguồn dữ liệu', 'RSS/Atom, Google News, web');
+section(360,  TOP, 520, BOT - TOP, 'green',  'Ingest',        'news-worker crawl · instant-crawl');
+section(920,  TOP, 380, BOT - TOP, 'green',  'PostgreSQL 16', 'nguồn sự thật duy nhất');
+section(1340, TOP, 640, BOT - TOP, 'orange', 'Xử lý ngữ nghĩa', 'news-worker semantic · maintenance (cron)');
+section(20, BAND, 1960, BAND_BOT - BAND, 'blue', 'Phục vụ & quan sát', 'API chỉ đọc · UI · agent nghiên cứu');
+
+/* ---------- nguồn dữ liệu ---------- */
+const Y2 = stackY([70, 70, 80, 80, 60], 160, 640);   // ingest pipeline rows
+node('feeds',  40, 160, 260, 80, 'RSS/Atom feeds',   'data/*.opml, TSV · lịch poll trong feed_state');
+node('gnews',  40, Y2[1] + 35 - 40, 260, 80, 'Google News RSS', 'giải mã link bằng googlenewsdecoder');
+node('pages',  40, 350, 260, 80, 'Trang bài báo',    'HTML qua crawl4ai + Chromium');
+node('tavily', 40, Y2[4], 260, 60, 'Tavily Search (optional)', 'CLI search · feed discovery', 'purplew');
+
+/* ---------- ingest ---------- */
+node('a', 380, Y2[0], 480, 70, 'Crawl workers', 'workers/crawl.py, instant_crawl.py: ingest mỗi 5 phút, instant-crawl cho feed ưu tiên 0; ghi worker_runs', 'greenw');
+node('b', 380, Y2[1], 480, 70, 'Retrieve adapters', 'feed_http · crawler (crawl4ai) · rss_discovery · google_news_rss', 'greenw');
+node('c', 380, Y2[2], 480, 80, 'core/ — chính sách không I/O', 'urls · html_content (HTML → Markdown) · content_quality: block page bị loại, nav-dense bị hạ ưu tiên', 'greenw');
+node('d', 380, Y2[3], 480, 80, 'services/ingestion + raw_storage', 'chuẩn hoá URL · hash · dedupe · upsert theo batch; lỗi vào crawl_failures để retry', 'greenw');
+node('e', 380, Y2[4], 480, 60, 'news-pipeline CLI (one-shot)', 'crawl / rss --persist · search không bao giờ lưu', 'purplew');
+
+/* ---------- storage ---------- */
+node('q', 960, 155, 300, 60, 'JobQueue + NOTIFY', 'processing_jobs: SKIP LOCKED, lease, DLQ', 'orangew');
+cylinder('db', 1110, 267, 150, 22, 290, 'PostgreSQL', 'pgvector · Alembic', [
+  'raw_articles · sources',
+  'article_feeds · feed_state',
+  'crawl_failures · worker_runs',
+  'article_embeddings (vector)',
+  'clusters · cluster_members',
+  'topics · taxonomies',
+  'article_classifications',
+  'article_topics · cluster_topics',
+]);
+
+/* ---------- semantic ---------- */
+node('sup',  1360, 155, 600, 60, 'news-worker semantic', 'LISTEN news_radar_jobs · timer dự phòng 300s · nạp MiniLM một lần', 'orangew');
+node('emb',  1360, 240, 600, 56, 'embed', 'fastembed all-MiniLM-L6-v2 → article_embeddings', 'orangew');
+node('cls',  1360, 345, 290, 90, 'classify', ['prototype 0.80 + keyword 0.20', 'ngưỡng 0.40 → article_topics'], 'orangew');
+node('clu',  1670, 345, 290, 90, 'cluster', ['gom bài thành storyline', 'attach 0.75 · merge 0.85 · repair'], 'orangew');
+node('ref',  1360, 480, 600, 56, 'refresh cluster_topics', 'dẫn xuất từ article_topics · classify --refresh-clusters', 'orangew');
+node('mnt',  1360, 560, 290, 86, 'maintenance (03:00 UTC)', 'supercronic: cluster --repair, boilerplate-refresh, cleanup-block-pages, queue-status', 'orangew');
+node('tax',  1670, 560, 290, 86, 'taxonomy-discover', 'LLM đề xuất topic mới từ story, validate rồi --apply', 'orangew');
+
+/* ---------- serving ---------- */
+node('fe',    40,   775, 300, 90, 'Next.js frontend', 'frontend/app: /ask, /stories, /trends, /feeds; route handlers proxy tới API', 'bluew');
+node('api',   390,  775, 340, 90, 'news-api (FastAPI :8000)', 'chỉ đọc: articles · feeds · sources · stories · topics · trends · research (SSE)', 'blue');
+node('agent', 780,  775, 320, 90, 'Research agent', 'LangGraph ReAct · 4 tool chỉ đọc · trích dẫn [A<id>] · InMemorySaver', 'bluew');
+node('llm',   1150, 775, 300, 90, 'OpenRouter LLM (optional)', 'chat model cho agent và taxonomy-discover', 'purplew');
+node('admin', 1500, 775, 460, 90, 'news-admin-api (:8001, loopback)', 'feeds CRUD · discover feed (Tavily / Google News) · /metrics', 'bluew');
+node('obs',   390,  892, 1570, 56, 'Prometheus + Grafana', 'scrape news-api :8002 và admin /metrics (suy ra từ worker_runs vì worker là container tạm) · dashboard pipeline, quality, services', 'greenw');
+
+/* ---------- connectors ---------- */
+// sources -> adapters (fan-in through trunk x=340)
+path([R('feeds'), [340, N.feeds.cy], [340, N.b.cy]], 'blue', { nohead: true });
+path([R('pages'), [340, N.pages.cy], [340, N.b.cy]], 'blue', { nohead: true });
+path([R('gnews'), L('b')]);
+path([R('tavily'), L('e')], 'purple', { dashed: true });
+
+// ingest spine
+const SP = N.a.cx;
+path([B('a'), T('b', SP - N.b.cx)]);
+path([B('b'), T('c', SP - N.c.cx)]);
+path([B('c'), T('d', SP - N.d.cx)]);
+path([T('e'), B('d')], 'purple', { dashed: true });
+label(SP + 10, (N.d.y + N.d.h + N.e.y) / 2, '--persist', 'purple', 'start');
+
+// ingest -> db (lane x=895)
+path([R('a'), [895, N.a.cy], [895, 300], [N.db.x, 300]]);
+path([R('d'), [895, N.d.cy], [895, 450], [N.db.x, 450]]);
+// queue
+path([B('q'), T('db', 0)], 'blue');
+label(N.q.cx + 10, (N.q.y + N.q.h + N.db.y) / 2, 'enqueue', 'blue', 'start');
+
+// db -> semantic
+path([R('q'), L('sup')], 'blue');
+label(1280, N.q.cy - 12, 'claim', 'blue');
+path([L('cls'), [N.db.x + N.db.w, N.cls.cy]], 'blue');
+label(1280, N.cls.cy - 12, 'write', 'blue');
+path([B('sup'), T('emb')]);
+path([B('emb'), [N.emb.cx, 320], [N.cls.cx, 320], T('cls')]);
+path([[N.emb.cx, 320], [N.clu.cx, 320], T('clu')]);
+path([B('cls'), [N.cls.cx, 458], [N.ref.cx, 458]], 'blue', { nohead: true });
+path([B('clu'), [N.clu.cx, 458], [N.ref.cx, 458], T('ref')]);
+path([B('tax'), [N.tax.cx, 705], [N.llm.cx, 705], T('llm')], 'purple', { dashed: true });
+
+// serving
+path([R('fe'), L('api')]);
+label((N.fe.x + N.fe.w + N.api.x) / 2, N.fe.cy - 12, '/api/*', 'blue');
+path([R('api'), L('agent')]);
+path([R('agent'), L('llm')], 'purple', { dashed: true });
+path([T('api'), [N.api.cx, 684], [1060, 684], [1060, N.db.y + N.db.h]], 'green');
+label(800, 672, 'đọc (read-only)', 'green');
+path([T('admin'), [N.admin.cx, 672], [1160, 672], [1160, N.db.y + N.db.h]], 'blue');
+label(1450, 684, 'ghi feeds', 'blue');
+path([B('api'), T('obs', N.api.cx - N.obs.cx)], 'green', { dashed: true });
+path([B('admin'), T('obs', N.admin.cx - N.obs.cx)], 'green', { dashed: true });
+
+/* ---------- overflow check (outline red with ?debug) ---------- */
+const bad = [];
+for (const c of checks) {
+  for (const t of c.texts) {
+    const b = t.getBBox();
+    if (b.x < c.x + PADX || b.x + b.width > c.x + c.w - PADX || b.y < c.y + PADY || b.y + b.height > c.y + c.h - PADY) {
+      bad.push(`${c.id}: "${t.textContent}"`); c.rect.classList.add(location.search.includes('debug') ? 'overflow' : 'ov'); break;
+    }
+  }
+}
+if (bad.length) console.warn('Text overflow in:\n' + bad.join('\n'));
+window.__overflow = bad;
+</script>
+</body>
+</html>

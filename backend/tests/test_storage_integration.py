@@ -121,8 +121,12 @@ async def _test_postgres_upsert_and_failure_state() -> None:
         updated = await storage.apply_batch([changed], [], [], received=1, rejected=0)
 
         assert inserted.written == 1
+        assert inserted.full_content_written == 1
+        assert inserted.summary_only_written == 0
         assert unchanged.unchanged == 1
+        assert unchanged.full_content_written == unchanged.summary_only_written == 0
         assert updated.written == 1
+        assert updated.full_content_written == 1
         assert unchanged_row.updated_at == inserted_row.updated_at
 
         metadata_change = RawArticle(
@@ -357,9 +361,9 @@ async def _test_a_summary_only_row_is_searchable_and_never_blanks_a_crawled_body
         summary_only = article(
             content="", feed_summary=summary, content_source="feed_summary"
         )
-        assert (
-            await storage.apply_batch([summary_only], [], [], received=1, rejected=0)
-        ).written == 1
+        rescued = await storage.apply_batch([summary_only], [], [], received=1, rejected=0)
+        assert rescued.written == rescued.summary_only_written == 1
+        assert rescued.full_content_written == 0
 
         # A row with no content is still findable: search_tsv covers the dek.
         found = await storage.feed_articles(
@@ -377,9 +381,9 @@ async def _test_a_summary_only_row_is_searchable_and_never_blanks_a_crawled_body
             feed_summary=summary,
             content_source="crawl",
         )
-        assert (
-            await storage.apply_batch([crawled], [], [], received=1, rejected=0)
-        ).written == 1
+        upgraded = await storage.apply_batch([crawled], [], [], received=1, rejected=0)
+        assert upgraded.written == upgraded.full_content_written == 1
+        assert upgraded.summary_only_written == 0
 
         # The retry queue can hand back the same failure long after the crawl
         # succeeded. Re-applying the summary-only row must be a no-op, not a

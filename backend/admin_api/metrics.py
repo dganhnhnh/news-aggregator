@@ -30,13 +30,14 @@ from prometheus_client.core import (
 from prometheus_client.utils import floatToGoString
 
 from adapters.storage import PostgresRawStorage
+from core.crawl_errors import monitoring_error_type
 from models.storage_models import (
     Distribution,
     IngestionLagDelta,
     LagBucketCounts,
     MetricsSnapshot,
     QualityMetrics,
-    WorkerStatDelta,
+    WorkerStatObservation,
 )
 
 
@@ -57,6 +58,7 @@ def build_families(
     collect_seconds: float = 0.0,
     quality: QualityMetrics | None = None,
     ingestion: IngestionLagDelta | None = None,
+    error_totals: Mapping[tuple[str, str, str], float] = {},
 ) -> list[Metric]:
     """Shape one snapshot into Prometheus metric families.
 
@@ -121,6 +123,16 @@ def build_families(
         "Wall-clock duration of each worker's most recent finished run.",
         labels=["worker"],
     )
+    last_completed = GaugeMetricFamily(
+        f"{PREFIX}_worker_last_completed_timestamp_seconds",
+        "Unix time of the last succeeded or partial run; partial is not a crash.",
+        labels=["worker"],
+    )
+    last_progress = GaugeMetricFamily(
+        f"{PREFIX}_worker_last_progress_timestamp_seconds",
+        "Unix time of the last committed checkpoint, excluding run start/finish.",
+        labels=["worker"],
+    )
     running = GaugeMetricFamily(
         f"{PREFIX}_worker_running",
         "Runs currently marked running, by worker.",
@@ -132,6 +144,10 @@ def build_families(
         labels=["worker"],
     )
     for worker in snapshot.workers:
+        if worker.last_completed_at is not None:
+            last_completed.add_metric([worker.worker], worker.last_completed_at.timestamp())
+        if worker.last_progress_at is not None:
+            last_progress.add_metric([worker.worker], worker.last_progress_at.timestamp())
         running.add_metric([worker.worker], float(worker.running))
         if worker.last_success_at is not None:
             last_success.add_metric(
@@ -147,16 +163,24 @@ def build_families(
             heartbeat.add_metric(
                 [worker.worker], worker.oldest_heartbeat_age_seconds
             )
-    families += [last_success, last_duration, running, heartbeat]
+    families += [last_success, last_completed, last_progress, last_duration, running, heartbeat]
 
     stats = CounterMetricFamily(
         f"{PREFIX}_worker_stat",
-        "Cumulative numeric stats reported by finished worker runs.",
+        "Cumulative numeric stats observed at worker checkpoints and completion.",
         labels=["worker", "stat"],
     )
     for (worker_name, stat), total in sorted(stat_totals.items()):
         stats.add_metric([worker_name, stat], total)
     families.append(stats)
+    errors = CounterMetricFamily(
+        f"{PREFIX}_worker_errors",
+        "Failure occurrences observed at checkpoints; distinct from queue size.",
+        labels=["worker", "failure_kind", "error_type"],
+    )
+    for (worker, kind, error_type), total in sorted(error_totals.items()):
+        errors.add_metric([worker, kind, error_type], total)
+    families.append(errors)
 
     failures = GaugeMetricFamily(
         f"{PREFIX}_crawl_failures",
@@ -493,7 +517,7 @@ class MetricsCollector:
     decouples the cost of a collection from how often anyone scrapes. The
     accumulated totals and per-worker watermarks are what let ephemeral
     workers' stats be exposed as real counters: each collection adds only the
-    runs finished since the last one, so the numbers climb monotonically for
+    new runs and checkpoint deltas since the last one, so the numbers climb for
     as long as the process lives, and a restart re-reads history from zero and
     arrives back at the same totals instead of resetting them.
 
@@ -527,6 +551,8 @@ class MetricsCollector:
         self._expires_at = 0.0
         self._totals: dict[tuple[str, str], float] = {}
         self._watermarks: dict[str, int] = {}
+        self._active_stats: dict[int, dict[tuple[str, ...], float]] = {}
+        self._error_totals: dict[tuple[str, str, str], float] = {}
         # The ingestion histogram accumulates the same way, keyed by content
         # source, behind a single article-id watermark.
         self._lag_bounds: tuple[float, ...] = ()
@@ -546,7 +572,9 @@ class MetricsCollector:
                 feed_overdue_grace_seconds=self._feed_overdue_grace_seconds,
                 max_error_types=self._max_error_types,
             )
-            self._accumulate(await self._storage.worker_stat_totals(self._watermarks))
+            self._accumulate(await self._storage.worker_stat_observations(
+                self._watermarks, tuple(self._active_stats)
+            ))
             delta = await self._storage.ingestion_lag_since(self._lag_watermark)
             if self._lag_primed:
                 self._accumulate_lag(delta)
@@ -572,17 +600,53 @@ class MetricsCollector:
                     elapsed,
                     quality,
                     self._ingestion_totals(),
+                    error_totals=dict(self._error_totals),
                 )
             )
             self._expires_at = self._clock() + self._cache_seconds
             return self._payload
 
-    def _accumulate(self, deltas: Sequence[WorkerStatDelta]) -> None:
-        for delta in deltas:
-            key = (delta.worker, delta.stat)
-            self._totals[key] = self._totals.get(key, 0.0) + delta.total
-            self._watermarks[delta.worker] = max(
-                self._watermarks.get(delta.worker, 0), delta.through_run_id
+    def _accumulate(self, observations: Sequence[WorkerStatObservation]) -> None:
+        """Add checkpoint deltas once, including late finishes of older runs.
+
+        A terminal observation replaces an active checkpoint, rather than
+        counting its full totals again. Keep only active runs in memory.
+        """
+        observed_ids = {sample.run_id for sample in observations}
+        for run_id in set(self._active_stats) - observed_ids:
+            # A retention job may remove an unfinished row. Its observed work
+            # remains in the counters, but there is nothing left to track.
+            self._active_stats.pop(run_id)
+        for sample in observations:
+            current = {
+                ("stat", key): float(value)
+                for key, value in sample.stats.items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            }
+            for key, value in sample.stats.get("failure_counts", {}).items():
+                kind, _, error_type = key.partition(":")
+                if kind not in ("feed", "article") or not isinstance(value, (int, float)):
+                    continue
+                label = ("error", kind, monitoring_error_type(error_type))
+                current[label] = current.get(label, 0.0) + value
+            previous = self._active_stats.get(sample.run_id, {})
+            for key, value in current.items():
+                delta = max(0.0, value - previous.get(key, 0.0))
+                if key[0] == "stat":
+                    total_key = (sample.worker, key[1])
+                    self._totals[total_key] = self._totals.get(total_key, 0.0) + delta
+                else:
+                    error_key = (sample.worker, key[1], key[2])
+                    self._error_totals[error_key] = self._error_totals.get(error_key, 0.0) + delta
+            if sample.finished:
+                self._active_stats.pop(sample.run_id, None)
+            else:
+                self._active_stats[sample.run_id] = {
+                    key: max(previous.get(key, 0.0), value)
+                    for key, value in (previous | current).items()
+                }
+            self._watermarks[sample.worker] = max(
+                self._watermarks.get(sample.worker, 0), sample.run_id
             )
 
     def _accumulate_lag(self, delta: IngestionLagDelta) -> None:

@@ -379,6 +379,17 @@ class IngestRunStats:
     # Articles whose page could not be crawled but whose feed dek was stored
     # anyway, so they still carry text to search and embed.
     articles_summary_only: int = 0
+    # Successful full bodies, independent of inserts/updates and summaries.
+    articles_full_content: int = 0
+    browser_crawl_succeeded: int = 0
+    storage_rejected: int = 0
+    articles_full_content_written: int = 0
+    articles_summary_only_written: int = 0
+    failure_counts: dict[str, int] = field(default_factory=dict)
+
+    def add_failure(self, failure: CrawlFailureOccurrence) -> None:
+        key = f"{failure.failure_kind}:{failure.error_type}"
+        self.failure_counts[key] = self.failure_counts.get(key, 0) + 1
 
     def add_batch(self, batch: CrawlBatch, *, retry: bool = False) -> None:
         self.feeds_processed += batch.feeds_processed
@@ -387,6 +398,10 @@ class IngestRunStats:
         self.crawl_failed += batch.crawl_failed
         self.articles_from_feed_content += batch.articles_from_feed_content
         self.articles_summary_only += batch.articles_summary_only
+        self.articles_full_content += batch.crawl_succeeded
+        self.browser_crawl_succeeded += batch.crawl_succeeded - batch.articles_from_feed_content
+        for failure in batch.failures:
+            self.add_failure(failure)
         if retry:
             self.retries_attempted += batch.crawl_succeeded + batch.crawl_failed
             self.retries_succeeded += batch.crawl_succeeded
@@ -399,6 +414,8 @@ class StorageWriteSummary:
     written: int
     unchanged: int
     rejected: int
+    full_content_written: int = 0
+    summary_only_written: int = 0
 
 
 @dataclass(frozen=True)
@@ -790,18 +807,15 @@ class StageJobMetrics:
 
 @dataclass(frozen=True)
 class WorkerHealthMetrics:
-    """Per-worker liveness read off `worker_runs`.
-
-    `last_success_at` is the one that matters for alerting: a worker that has
-    not succeeded in several scheduling intervals is down, whether or not it
-    has been failing loudly.
-    """
+    """Completion, checkpoint progress and strict success are distinct signals."""
 
     worker: str
     last_success_at: datetime | None = None
     last_run_duration_seconds: float | None = None
     running: int = 0
     oldest_heartbeat_age_seconds: float | None = None
+    last_completed_at: datetime | None = None
+    last_progress_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -880,6 +894,16 @@ class WorkerStatDelta:
     stat: str
     total: float
     through_run_id: int
+
+
+@dataclass(frozen=True)
+class WorkerStatObservation:
+    """One run's durable counters, including checkpoints of unfinished runs."""
+
+    worker: str
+    run_id: int
+    stats: dict
+    finished: bool
 
 
 @dataclass(frozen=True)

@@ -78,3 +78,21 @@ def test_crawl_result_has_isolated_context() -> None:
 
     assert second.context == {}
     assert first.content_length == 3
+
+
+def test_ingest_counts_full_bodies_separately_from_summary_rescues():
+    from core.html_content import FEED_CONTENT_KEY, FEED_SUMMARY_KEY
+    from models.storage_models import CrawlBatch, CrawlFailureOccurrence, IngestRunStats
+
+    batch = CrawlBatch(results=[
+        CrawlResult("https://example.com/crawl", "body"),
+        CrawlResult("https://example.com/feed", "body", context={FEED_CONTENT_KEY: True}),
+        CrawlResult("https://example.com/summary", "", success=False, context={FEED_SUMMARY_KEY: "dek"}),
+    ], failures=[CrawlFailureOccurrence("article", "https://example.com/summary", "Timeout", "slow")])
+    stats = IngestRunStats()
+    stats.add_batch(batch)
+    assert stats.articles_full_content == 2
+    assert stats.browser_crawl_succeeded == 1
+    assert stats.articles_from_feed_content == 1
+    assert stats.articles_summary_only == 1
+    assert stats.failure_counts == {"article:Timeout": 1}

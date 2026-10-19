@@ -642,3 +642,17 @@ def test_record_feed_poll_runs_after_the_last_crawl_chunk_is_persisted(
     assert len(apply_indexes) >= 2
     assert len(poll_indexes) == 1
     assert max(apply_indexes) < poll_indexes[0]
+
+
+@pytest.mark.parametrize("status", ["not_modified", "failed", "fetched"])
+def test_every_completed_feed_checkpoints_even_without_articles(monkeypatch, status):
+    target = _target()
+    storage = FakeStorage()
+    storage.set_due_feeds([target])
+    error = CrawlFailureOccurrence("feed", target.feed_url, "Timeout", "timed out")
+    poll = FeedPoll(target=target, status=status, error=error if status == "failed" else None)
+    outcome = _run(storage, FakeDiscovery([poll]), _args(), monkeypatch=monkeypatch)
+    assert storage.calls[-1][0] == "checkpoint"
+    assert outcome.stats.feeds_processed == 1
+    if status == "failed":
+        assert outcome.stats.failure_counts == {"feed:Timeout": 1}

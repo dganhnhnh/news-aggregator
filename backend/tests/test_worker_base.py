@@ -119,6 +119,16 @@ def test_lock_held_elsewhere_skips_the_run_without_bookkeeping() -> None:
     assert [call[0] for call in storage.calls] == ["reap", "lock"]
 
 
+def test_busy_lock_summary_is_skipped_instead_of_successful(tmp_path):
+    target = tmp_path / "summary.jsonl"
+    storage = FakeStorage(lock_acquired=False)
+    worker = ScriptedWorker(RunOutcome("succeeded", IngestRunStats()))
+    assert _run(worker, storage, _args(summary_json=str(target))) == EXIT_OK
+    payload = json.loads(target.read_text())
+    assert payload["status"] == "skipped" and payload["reason"] == "lock_busy"
+    assert payload["run_id"] is None and worker.executed == 0
+
+
 def test_stale_runs_are_reaped_before_the_lock_is_taken() -> None:
     # A run worth reaping belongs to a dead process that no longer holds the
     # lock, so reaping has to happen first or it would never happen at all.
@@ -154,6 +164,35 @@ def test_partial_exits_zero_unless_strict() -> None:
     assert _run(ScriptedWorker(outcome), lenient, _args()) == EXIT_OK
     assert _run(ScriptedWorker(outcome), strict, _args(strict=True)) == EXIT_FAILED
     assert ("finish", 1, "partial", "3 feeds failed") in strict.calls
+
+
+def test_exception_preserves_only_the_last_committed_checkpoint(tmp_path: Path) -> None:
+    class FailingWorker(Worker):
+        name = "crawl"
+
+        async def execute(self, ctx):
+            stats = IngestRunStats(articles_written=3)
+            await ctx.checkpoint(stats)
+            stats.articles_written = 99  # next chunk has not committed
+            raise RuntimeError("next chunk failed")
+
+    target = tmp_path / "summary.jsonl"
+    worker = FailingWorker()
+    assert _run(worker, FakeStorage(), _args(summary_json=str(target))) == EXIT_FAILED
+    assert worker.last_outcome.stats.articles_written == 3
+    assert json.loads(target.read_text())["stats"]["articles_written"] == 3
+
+
+def test_finish_bookkeeping_failure_cannot_report_success(tmp_path: Path) -> None:
+    class BrokenFinish(FakeStorage):
+        async def finish_run(self, *args, **kwargs):
+            raise RuntimeError("database unavailable")
+
+    target = tmp_path / "summary.jsonl"
+    worker = ScriptedWorker(RunOutcome("succeeded", IngestRunStats()))
+    assert _run(worker, BrokenFinish(), _args(summary_json=str(target))) == EXIT_FAILED
+    assert worker.last_outcome.status == "failed"
+    assert json.loads(target.read_text())["status"] == "failed"
 
 
 def test_explicit_window_is_recorded_as_a_backfill() -> None:

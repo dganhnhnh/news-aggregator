@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import sys
+from copy import deepcopy
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
@@ -57,10 +58,12 @@ class RunContext:
     shutdown: asyncio.Event
     args: argparse.Namespace
     storage: PostgresRawStorage = field(repr=False)
+    last_stats: Any = field(default=None, init=False, repr=False)
 
     async def checkpoint(self, stats: Any) -> None:
         """Persist progress and prove the run is still alive."""
         await self.storage.update_run(self.run_id, stats)
+        self.last_stats = deepcopy(stats)
 
 
 @contextmanager
@@ -244,6 +247,20 @@ class Worker(ABC):
                     "Another %s run holds the lock; exiting without doing work",
                     self.name,
                 )
+                if target := getattr(args, "summary_json", None):
+                    emit_summary(target, {
+                        "run_id": None,
+                        "worker": self.name,
+                        "status": "skipped",
+                        "reason": "lock_busy",
+                        "trigger": _trigger_for(args, window),
+                        "window_start": window.start.isoformat(),
+                        "window_end": window.end.isoformat(),
+                        "stats": None,
+                        "error_message": None,
+                        "orchestration": orchestration_context() or None,
+                        "emitted_at": datetime.now(timezone.utc).isoformat(),
+                    })
                 return exit_busy_for(args)
 
             if window.is_deep_backfill:
@@ -313,20 +330,25 @@ class Worker(ABC):
                 await self._finish(
                     storage,
                     run_id,
-                    RunOutcome("partial", None, "Cancelled before the run completed"),
+                    RunOutcome("partial", ctx.last_stats, "Cancelled before the run completed"),
                     args=args,
                     window=window,
                 )
                 raise
             except Exception as exc:
                 logger.exception("%s run %d failed", self.name, run_id)
-                self.last_outcome = RunOutcome("failed", None, str(exc))
+                self.last_outcome = RunOutcome("failed", ctx.last_stats, str(exc))
                 await self._finish(
                     storage, run_id, self.last_outcome, args=args, window=window
                 )
                 return EXIT_FAILED
 
-            await self._finish(storage, run_id, outcome, args=args, window=window)
+            recorded = await self._finish(storage, run_id, outcome, args=args, window=window)
+            if not recorded:
+                self.last_outcome = RunOutcome(
+                    "failed", outcome.stats, "Could not persist terminal run state"
+                )
+                return EXIT_FAILED
             self.last_outcome = outcome
             if outcome.status == "failed":
                 return EXIT_FAILED
@@ -351,13 +373,16 @@ class Worker(ABC):
         *,
         args: argparse.Namespace,
         window: RunWindow,
-    ) -> None:
+    ) -> bool:
+        recorded = True
         try:
             await storage.finish_run(
                 run_id, outcome.status, outcome.stats, outcome.error_message
             )
-        except Exception:  # pragma: no cover - best effort bookkeeping
+        except Exception:
             logger.exception("Could not close out %s run %d", self.name, run_id)
+            recorded = False
+            outcome = RunOutcome("failed", outcome.stats, "Could not persist terminal run state")
         else:
             logger.info("Finished %s run %d as %s", self.name, run_id, outcome.status)
 
@@ -379,6 +404,7 @@ class Worker(ABC):
                     "emitted_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
+        return recorded
 
 
 def exit_busy_for(args: argparse.Namespace) -> int:
