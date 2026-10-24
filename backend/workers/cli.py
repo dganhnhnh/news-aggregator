@@ -14,11 +14,12 @@ from typing import Any
 
 import yaml
 
+from adapters.retrieve_news_data.google_news_rss_searcher import RssFeedSearcher
 from adapters.storage import PostgresRawStorage, StorageError
 from core.boilerplate import MIN_DOCS_PER_SOURCE, PROFILE_SAMPLE_SIZE
 from core.config import Settings
 from core.logger import get_logger, setup_logging
-from models.storage_models import PrototypeRebuildStats, TopicPrototypeRecord
+from models.storage_models import FeedSeed, PrototypeRebuildStats, TopicPrototypeRecord
 from services.taxonomy import (
     MIN_EXEMPLARS_TO_ACTIVATE,
     TaxonomyValidationError,
@@ -46,6 +47,8 @@ from workers.window import RunWindow, build_window, parse_duration
 
 
 logger = get_logger(__name__)
+
+FEED_SEED_PATH = Path(__file__).resolve().parents[2] / "data" / "Tech.opml"
 
 WORKERS: dict[str, type[Worker]] = {
     CrawlWorker.name: CrawlWorker,
@@ -438,6 +441,11 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         help="Detect and fix drift between cluster aggregates and cluster_members "
         "instead of matching new articles",
     )
+    subparsers.add_parser(
+        "seed-feeds",
+        help="Register feeds from data/Tech.opml without fetching or crawling",
+    )
+
     replay = subparsers.add_parser(
         "replay", help="Requeue dead-lettered crawl_failures or processing_jobs rows"
     )
@@ -492,10 +500,16 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         "taxonomy-import", help="Import topics and taxonomy trees from a YAML seed file"
     )
     taxonomy_import.add_argument("--file", type=Path, required=True, help="Seed YAML path")
-    taxonomy_import.add_argument(
+    import_mode = taxonomy_import.add_mutually_exclusive_group()
+    import_mode.add_argument(
         "--prune",
         action="store_true",
         help="Deactivate topics and remove taxonomy nodes absent from the file",
+    )
+    import_mode.add_argument(
+        "--if-empty",
+        action="store_true",
+        help="Skip the entire import if any topic or taxonomy already exists",
     )
 
     taxonomy_export = subparsers.add_parser(
@@ -799,6 +813,9 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
                 f"--sample must be at least {MIN_DOCS_PER_SOURCE}, the smallest "
                 "corpus a profile is ever built from"
             )
+    elif args.command == "seed-feeds":
+        if not FEED_SEED_PATH.is_file():
+            parser.error(f"Feed seed file not found: {FEED_SEED_PATH}")
     elif args.command in {"taxonomy-import", "taxonomy-export"}:
         if args.command == "taxonomy-import" and not args.file.is_file():
             parser.error(f"Taxonomy seed file not found: {args.file}")
@@ -899,6 +916,28 @@ async def _run_maintenance(settings: Settings) -> int:
 async def _dispatch_admin(
     storage: PostgresRawStorage, args: argparse.Namespace
 ) -> int:
+    if args.command == "seed-feeds":
+        try:
+            feeds = RssFeedSearcher._load_queries_from_opml(FEED_SEED_PATH)
+        except (OSError, ValueError) as exc:
+            logger.error("Cannot load feed seed: %s", exc)
+            return EXIT_FAILED
+        seeds = {
+            feed.rss_url: FeedSeed(
+                feed_url=feed.rss_url, source_label=feed.query_label
+            )
+            for feed in feeds
+        }
+        if not seeds:
+            logger.error("No RSS/Atom feeds found in %s", FEED_SEED_PATH)
+            return EXIT_FAILED
+        created = await storage.seed_feeds(list(seeds.values()))
+        logger.info(
+            "Seeded %d new feed(s), skipped %d existing feed(s) from %s",
+            created, len(seeds) - created, FEED_SEED_PATH,
+        )
+        return EXIT_OK
+
     if args.command == "cleanup-block-pages":
         if args.apply:
             # A claimed embed job may already hold the stale title in memory,
@@ -973,6 +1012,15 @@ async def _dispatch_admin(
         return EXIT_OK
 
     if args.command == "taxonomy-import":
+        if args.if_empty:
+            current_topics, current_taxonomies = await storage.export_taxonomy()
+            if current_topics or current_taxonomies:
+                logger.info(
+                    "Skipping taxonomy import: the database already contains "
+                    "%d topic(s) and %d taxonomy(ies)",
+                    len(current_topics), len(current_taxonomies),
+                )
+                return EXIT_OK
         raw = yaml.safe_load(args.file.read_text()) or {}
         try:
             seed = parse_seed(raw)

@@ -46,6 +46,7 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
 COPY backend ./backend
+COPY data/Tech.opml ./data/Tech.opml
 
 # Large browser wheels need more time on slow links. Build-only settings can
 # be overridden with --build-arg (or the matching variables in compose's .env).

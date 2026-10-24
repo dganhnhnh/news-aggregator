@@ -1,191 +1,61 @@
-# News Aggregator
+# News Radar
 
-Repo này crawl nội dung web trực tiếp hoặc từ RSS/Atom, lưu bản mới nhất của
-mỗi article vào PostgreSQL, rồi embed, gán topic và gom article thành story
-cluster toàn cục. FastAPI phục vụ article/story/taxonomy ở chế độ read-only;
-frontend Next.js hiển thị Articles và Stories với topic tags.
+News Radar collects web articles, organizes them into topics and stories, and
+makes them searchable through a FastAPI backend and Next.js frontend.
 
-```text
-crawl → raw_articles → embed ─┬→ classify → article topics ─┐
-                             └→ cluster  → story members ──┴→ story topics → API/UI
-```
+## Features
 
-## Cài đặt
+- Crawl pages directly or ingest RSS/Atom feeds from OPML and TSV files.
+- Store the latest article as Markdown in PostgreSQL, deduplicated by URL.
+- Generate embeddings, classify topics, and group related articles into stories.
+- Browse articles and stories, manage feeds, and ask an AI research assistant
+questions with streaming answers and article citations.
+- Run continuous ingestion and semantic workers with retries, checkpoints, and
+run history; poll high-priority feeds more frequently.
+- Monitor pipeline health with queue reports, Prometheus metrics, and Grafana.
+
+
+## Quick start
+
+Requires Python 3.12+, uv, Docker Compose, and Node.js with pnpm. Run commands
+from the repository root unless shown otherwise.
+
+### 1. Configure
 
 ```bash
 cp .env_example .env
-uv sync --extra dev
-uv run crawl4ai-setup
 ```
 
-Điền `TAVILY_API_KEY` trong `.env` nếu dùng lệnh `search` hoặc tính năng
-**Feeds → Custom Add feeds**. Admin API chạy bốn Tavily `basic` searches cho
-mỗi yêu cầu discovery; nếu để trống, endpoint trả `503` thay vì âm thầm quay
-về kết quả Google News chất lượng thấp hơn.
+The default database settings work with the local Compose stack. Set
+`GRAFANA_ADMIN_PASSWORD` for monitoring. Optional keys in `.env`:
 
-Mỗi lần **Find feeds** kiểm tra tối đa **50 feed URL**, kể cả URL lỗi và
-nhánh Google News fallback, rồi trả tối đa 25 kết quả. Các nhánh dùng chung
-budget và cache trong một request; đọc trang HTML để tìm link không tiêu
-budget feed, còn các redirect được tính trong lượt thử URL ban đầu. Link
-feed được khai báo và khớp chủ đề được ưu tiên, với lượt thử luân phiên giữa
-các publisher. Khi hết budget, API trả kết quả đã tìm được kèm thông báo.
+- `TAVILY_API_KEY`: web search and feed discovery.
+- `OPENROUTER_API_KEY`: AI research; choose a model with `OPENROUTER_MODEL`.
 
-Độ liên quan dựa trên title/summary của tối đa 12 bài đầu trong feed: cần
-ít nhất 3 bài khớp và coverage ≥60% khi có từ 3 bài mẫu trở lên. Metadata
-hay đường dẫn category/tag không thể ghi đè bằng chứng bài viết trái ngược.
-Với 1–2 bài mẫu, cả metadata/path lẫn toàn bộ bài mẫu phải khớp, và kết quả
-được ghi chú ít chắc chắn hơn. Xếp hạng ưu tiên mẫu đủ lớn và coverage bài
-viết trước loại feed; matching dùng từ khóa/alias, chưa gọi LLM.
 
-## Khởi động PostgreSQL và API
 
-PostgreSQL 16 và API chạy trong Compose (`deployments/docker-compose.yml`),
-còn migration và worker chạy trên host. Khởi động DB trước, migrate schema,
-rồi mới khởi động API:
+### 2. Set up the backend with one command
 
 ```bash
-docker compose -f deployments/docker-compose.yml --env-file .env up -d db
-uv run alembic upgrade head
-docker compose -f deployments/docker-compose.yml --env-file .env up -d --build api
-curl --fail http://localhost:8000/health/db
+bash scripts/setup.sh
 ```
 
-Compose dùng named volume `news_radar_postgres_data`, vì vậy dữ liệu vẫn còn
-khi container được restart hoặc tạo lại. Nếu port `5432` trên host đã bận, đổi
-cả `POSTGRES_PORT` và port trong `DATABASE_URL`, ví dụ `55432`. `--env-file .env`
-là bắt buộc vì file compose không còn nằm cạnh `.env` ở root.
+This installs Python dependencies, waits for PostgreSQL, runs
+`[init_db.sh](scripts/init_db.sh)` to migrate and seed feeds from `data/Tech.opml`,
+initializes taxonomy, then builds and starts the complete backend stack:
+APIs, ingestion, semantic processing, maintenance, and monitoring.
+Docker images include the crawler's browser dependencies. The first setup also
+downloads the embedding model.
 
-Alembic **không** tự chạy khi service khởi động. API readiness `/health/db`
-chỉ xanh sau khi DB đã migrate; container không chứa worker scheduler hay
-cron. Xem log bằng `docker compose -f deployments/docker-compose.yml
---env-file .env logs -f api`.
+Monitoring uses the Linux configuration or automatically selects the Docker
+Desktop override. Airflow remains suspended. Open [API docs](http://localhost:8000/docs),
+[Grafana](http://localhost:3001), or [Prometheus](http://localhost:9090).
 
-Nếu build dừng ở `uv sync` với `Failed to download` / `operation timed out`
-(ví dụ wheel `patchright` của `crawl4ai`), đó là timeout khi tải dependency từ
-PyPI. Hai Dockerfile dùng timeout 300 giây, 5 retries, tối đa 4 lượt tải đồng
-thời và BuildKit cache để tái sử dụng các gói đã tải thành công khi build lại.
-Compose truyền các biến này vào **build args**; có thể tăng trong `.env` nếu
-mạng chậm, ví dụ:
+Feed seeding preserves existing feeds and their state. To run only migrations
+and feed seeding against a running database, use `bash scripts/init_db.sh`.
+PostgreSQL data persists in a named Docker volume.
 
-```dotenv
-UV_HTTP_TIMEOUT=600
-UV_HTTP_RETRIES=5
-UV_CONCURRENT_DOWNLOADS=2
-```
-
-Sau đó chạy lại `docker compose --env-file .env -f deployments/docker-compose.yml
-up -d --build`. Không cần xoá image, cache hoặc volume PostgreSQL.
-
-### Thay đổi schema và tạo migration
-
-`backend/adapters/storage/schema.py` là source of truth. Sau khi thay đổi
-schema, luôn tạo revision bằng autogenerate trên DB đang ở migration head:
-
-```bash
-uv run alembic upgrade head
-uv run alembic revision --autogenerate -m "describe schema change"
-uv run alembic upgrade head
-uv run alembic check
-```
-
-Không tạo file revision thủ công và không truyền `--rev-id`; giữ nguyên hex ID
-và filename prefix do Alembic sinh. Luôn review nội dung autogenerate trước khi
-apply vì rename và data migration có thể cần điều chỉnh thêm.
-
-## Chạy flow Week 2 end-to-end
-
-### 1. Bootstrap taxonomy và prototype
-
-PostgreSQL là runtime source of truth; YAML chỉ dùng để bootstrap/import. Sau
-migration mới hoặc sau khi exemplar/topic trong seed thay đổi:
-
-```bash
-uv run news-worker taxonomy-import --file data/taxonomy.seed.yaml
-uv run news-worker taxonomy-rebuild
-```
-
-Import dùng stable slug và idempotent. Không thêm `--prune` trừ khi chủ đích
-deactivate topic/node vắng khỏi file.
-
-### 2. Crawl và drain các stage downstream
-
-Ví dụ ingest một nhóm feed rồi xử lý toàn bộ queue vừa tạo:
-
-```bash
-uv run news-worker crawl \
-  --feed-path data/engineering_blogs.opml \
-  --max-feeds 5 \
-  --max-articles-per-feed 5 \
-  --once
-
-uv run news-worker embed --once
-uv run news-worker classify --once
-uv run news-worker cluster --once
-uv run news-worker cluster --merge-only --once
-uv run news-worker classify --refresh-clusters --last 30d --once
-```
-
-`classify` và `cluster` độc lập nên có thể đổi thứ tự; attach/classify sẽ
-refresh `cluster_topics` để hai đường cuối cùng hội tụ. Mỗi command drain queue
-theo chunk đến khi hết việc hoặc đạt `--limit`.
-
-Nếu nâng taxonomy trên database đã có embedding/cluster, requeue dữ liệu cũ
-theo cửa sổ rồi drain lại:
-
-```bash
-uv run news-worker classify --stale --last 30d --once
-uv run news-worker cluster --reprocess --last 30d --once
-uv run news-worker cluster --merge-only --once
-uv run news-worker classify --refresh-clusters --last 30d --once
-```
-
-Nếu đổi embedding model hoặc input builder, chạy `embed --model-changed`
-trước; re-embedding sẽ enqueue lại cả `classify` và `cluster`.
-
-### 2b. Profile boilerplate theo source
-
-Mỗi source lặp lại chrome của riêng nó — banner cookie, disclaimer affiliate,
-thanh menu — và phần đó lọt vào 1.200 ký tự mà embedder đọc, khiến mọi bài của
-cùng một tờ embed ra gần như một vector (xem `docs/measurements.md`, T14).
-`boilerplate-refresh` dựng lại profile từ document frequency của chính corpus,
-lưu vào `source_boilerplate`:
-
-```bash
-uv run news-worker boilerplate-refresh
-uv run news-worker boilerplate-refresh --source wired.com --sample 200
-```
-
-Source dưới `MIN_DOCS_PER_SOURCE` bài bị bỏ qua và giữ nguyên profile cũ.
-Profile không tự động embed lại: khi profile đổi, bài đã embed vẫn giữ vector cũ
-cho tới khi chạy `embed --reprocess`. DAG `news_maintenance` chạy refresh hằng
-đêm nhưng cố tình *không* kích hoạt re-embed toàn corpus.
-
-### 3. Smoke-check dữ liệu, API và Stories UI
-
-Queue, retry queue và worker runs xem bằng một lệnh:
-
-```bash
-uv run news-worker queue-status
-```
-
-Prototype, classifier coverage và cluster distribution vẫn cần truy vấn riêng:
-
-```bash
-docker compose -f deployments/docker-compose.yml --env-file .env exec db sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT model, dim, count(*) FROM topic_prototypes GROUP BY 1,2"'
-
-docker compose -f deployments/docker-compose.yml --env-file .env exec db sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT assigned_count, count(*) FROM article_classifications GROUP BY 1 ORDER BY 1"'
-
-docker compose -f deployments/docker-compose.yml --env-file .env exec db sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT n_articles, count(*) FROM clusters WHERE status <> '\''merged'\'' GROUP BY 1 ORDER BY 1"'
-
-curl --fail http://localhost:8000/health/db
-curl --fail 'http://localhost:8000/api/topics'
-curl --fail 'http://localhost:8000/api/stories?limit=5'
-```
-
-Sau đó mở frontend:
+### 3. Start the frontend
 
 ```bash
 cd frontend
@@ -194,606 +64,41 @@ pnpm install
 pnpm dev
 ```
 
-Mở `http://localhost:3000`, chọn **Stories** và click một story để xem member.
-`API_URL` chỉ dùng server-side trong Next.js và mặc định trỏ tới
-`http://localhost:8000`.
+Open the [web app](http://localhost:3000) or
+[API documentation](http://localhost:8000/docs). The public API reads article
+and story data; the separate admin API manages feeds and is bound to localhost.
 
-## Chạy pipeline một lần
+## Continuous processing
 
-Các lệnh không có `--persist` chỉ emit JSON Lines ra stdout:
-
-```bash
-uv run news-pipeline search "gold market news" --max-results 5
-uv run news-pipeline crawl https://example.com
-uv run news-pipeline rss https://example.com/feed.xml --max-articles-per-feed 5
-uv run news-pipeline rss --feed-path ./data/engineering_blogs.opml --max-feeds 5 --max-articles-per-feed 1
-uv run news-pipeline rss --tsv-path ./queries.tsv --max-articles-per-feed 5
-```
-
-`crawl` và `rss` hỗ trợ lưu article/failure và tạo một `worker_runs` bằng cờ
-`--persist`; kết quả article vẫn được emit ra stdout:
-
-```bash
-uv run news-pipeline crawl https://example.com --persist
-uv run news-pipeline rss --feed-path ./data/engineering_blogs.opml --max-feeds 5 --max-articles-per-feed 1 --persist
-```
-
-`search` của Tavily không hỗ trợ `--persist`.
-
-`news-pipeline rss` cũng nhận trực tiếp một hoặc nhiều URL RSS/Atom ở vị trí
-đối số. URL trực tiếp và `--feed-path`/`--tsv-path` loại trừ lẫn nhau.
-
-## Chạy worker
-
-`news-worker` là entry point chung cho `crawl`, `embed`, `classify`, `cluster`
-và các admin command taxonomy/replay/cleanup. Worker luôn yêu cầu PostgreSQL.
-Mỗi crawl run xử lý tối đa `MAX_RETRIES_PER_RUN` failure đến hạn trước, rồi mới
-ingest feed hiện tại. Mặc định chạy một lần rồi thoát:
-
-```bash
-uv run news-worker crawl --feed-path ./data/engineering_blogs.opml --max-feeds 5
-uv run news-worker crawl --feed-path ./data/engineering_blogs.opml --interval 1800
-```
-
-Mỗi run ghi cửa sổ thời gian đã yêu cầu vào `worker_runs`; mặc định là `--last
-3d`, hoặc chỉ định tường minh bằng `--since` / `--until` (ISO date hoặc
-datetime, naive được đọc là UTC):
-
-```bash
-uv run news-worker crawl --last 12h
-uv run news-worker crawl --since 2026-08-01 --until 2026-08-10
-```
-
-Cửa sổ dài hơn 7 ngày sẽ log WARNING vì RSS feed không giữ lại entry cũ đến
-vậy. Ở giai đoạn hiện tại cửa sổ mới chỉ được ghi nhận, chưa dùng để lọc entry.
-
-Crawler dùng giới hạn tài nguyên cố định, không tăng số browser workers theo
-tổng số article. Mặc định fetch tối đa 2 feed, crawl tối đa 2 page đồng thời và
-commit sau mỗi 10 kết quả. Có thể điều chỉnh rõ ràng:
-
-```bash
-uv run news-worker crawl \
-  --feed-path ./data/engineering_blogs.opml \
-  --max-concurrent-feeds 2 \
-  --max-concurrent-crawls 2 \
-  --crawl-batch-size 10
-```
-
-Mỗi chunk được upsert và checkpoint ngay; dừng sau đó không làm mất các chunk
-đã commit. Khi `--max-feeds` nhỏ hơn tổng nguồn, run có `--interval` tự chuyển
-sang nhóm tiếp theo trong cùng process. Dùng `--feed-offset` để chọn vị trí bắt
-đầu cho một run đơn lẻ hoặc sau khi restart.
-
-Mặc định worker chỉ log summary. Thêm `--emit-jsonl` nếu cần emit đầy đủ các
-article đã crawl:
-
-```bash
-uv run news-worker crawl --feed-path ./data/engineering_blogs.opml --emit-jsonl
-```
-
-Failure được retry theo exponential backoff từ 5 phút đến tối đa 24 giờ. Một
-failure thành công sẽ bị xóa; failure lặp lại chỉ tăng `attempt_count` trên cùng
-row.
-
-### Vận hành
-
-- **Không chạy chồng:** mỗi worker giữ một advisory lock của PostgreSQL trong
-  suốt run. Instance thứ hai log rồi thoát ngay với exit code 0 thay vì xếp
-  hàng chờ, nên đặt cron dày hơn thời lượng run vẫn an toàn.
-- **Exit code:** `0` khi run `succeeded`/`partial` hoặc khi không lấy được
-  lock; `1` khi run `failed`. Thêm `--strict` nếu muốn `partial` cũng trả `1`.
-- **`--exit-busy CODE`:** thoát `CODE` thay vì `0` khi lock đã có chủ, để
-  scheduler phân biệt "bị bỏ qua" với "chạy xong". Mặc định vẫn `0` nên cron
-  hiện có không đổi; `1` bị từ chối vì đó là mã lỗi.
-- **`--summary-json PATH`:** append đúng một dòng JSON mô tả run vừa xong
-  (`run_id`, `status`, `stats`, `error_message`). `-` hoặc `/dev/stdout` ghi
-  vào dòng **cuối cùng** của stdout, là dòng Airflow đẩy lên XCom.
-- **`--max-runtime DURATION`:** yêu cầu worker dừng êm sau ngân sách như
-  `25m`; Airflow đặt hard timeout dài hơn 5 phút để chunk hiện tại kịp
-  checkpoint và emit summary.
-- **Tắt êm:** SIGTERM/SIGINT dừng ở ranh giới chunk kế tiếp, đóng sổ run ở
-  trạng thái `partial` thay vì để kẹt `running`.
-- **Run treo:** run nào ngừng heartbeat quá `max(3 × --interval,
-  WORKER_HEARTBEAT_TIMEOUT_SECONDS)` sẽ bị run sau đánh dấu `abandoned`.
-
-`news-service` vẫn chạy được nhưng đã deprecated: nó chỉ in cảnh báo, đổi
-`--interval-seconds` thành `--interval` rồi gọi lại `news-worker crawl`.
-
-## Instant crawl
-
-Feed có `priority=0` được worker riêng poll liên tục; feed mặc định có
-`priority=1` và chỉ do `news-worker crawl` định kỳ xử lý. Số nhỏ hơn là ưu
-tiên cao hơn. Đổi tier cho một feed đã seed:
-
-```bash
-uv run news-worker set-feed-priority https://example.com/feed.xml 0
-```
-
-Chạy worker trên host:
-
-```bash
-uv run news-worker instant-crawl --last 12h --interval 30 --poll-interval 30
-```
-
-Hoặc chạy container cùng PostgreSQL và API:
-
-```bash
-docker compose --env-file .env -f deployments/docker-compose.yml up -d --build instant-crawl
-```
-
-`INSTANT_FEED_POLL_INTERVAL_SECONDS` mặc định là 30 giây. Để giới hạn peak RAM
-của Chromium, container dùng `INSTANT_MAX_CONCURRENT_CRAWLS=3` và
-`INSTANT_CRAWL_BATCH_SIZE=5`; có thể override hai biến này trong `.env`.
-Worker này chỉ lấy feed và retry crawl có priority 0; worker `crawl` của Airflow
-chỉ lấy priority 1. Bài mới tạo job semantic với cùng priority. `news_semantic`
-vẫn chạy batch 15 phút một lần và claim priority 0 trước priority 1; instant
-crawl không khởi động semantic DAG cho từng bài.
-
-## Điều phối bằng Airflow
-
-Thay cho việc chạy tay chuỗi lệnh ở §"Chạy flow Week 2 end-to-end". Thiết kế và
-lý do từng quyết định nằm ở [docs/orchestration-airflow.md](docs/orchestration-airflow.md).
-
-Sáu DAG trong `orchestration/dags/`, mỗi task là **một lệnh `news-worker` chạy
-trong container riêng** (`DockerOperator`):
-
-| DAG | Lịch | Nội dung |
-|---|---|---|
-| `news_ingest` | `*/5 * * * *` | `preflight_db → crawl`; chỉ xử lý feed priority 1 |
-| `news_semantic` | `*/15 * * * *` | queue gate → `embed → classify ‖ cluster → merge → refresh`; xử lý mọi priority |
-| `news_maintenance` | `0 3 * * *` | `cluster --repair`, cleanup dry-run, `queue-status --fail-on-alert`; không tự replay poison item |
-| `news_taxonomy_refresh` | Trigger tay | import → rebuild → reclassify; recluster là param mặc định tắt |
-| `news_backfill` | Trigger tay | full flow strict trên cửa sổ `since`/`until` tối đa 31 ngày |
-| `news_dlq_replay` | Trigger tay | preview mặc định; chỉ requeue dead letter khi `apply=true` |
-
-Khởi động (build image worker trước, vì scheduler chỉ chạy container chứ không
-build):
-
-```bash
-docker build -f deployments/Dockerfile.worker -t news-radar-worker:a1b2c3d .
-```
-
-```bash
-NEWS_RADAR_REPO=$PWD docker compose --env-file .env -f deployments/docker-compose.yml -f deployments/docker-compose.airflow.yml up -d
-```
-
-Đặt `NEWS_RADAR_WORKER_IMAGE=news-radar-worker:a1b2c3d` trong `.env` cùng tag
-vừa build. Production phải dùng Git SHA hoặc image digest bất biến; tag `dev`
-chỉ là fallback cục bộ.
-
-UI ở `http://localhost:8080`. `NEWS_RADAR_REPO` phải là đường dẫn **trên host**
-tới repo: scheduler mount `$NEWS_RADAR_REPO/data` vào từng container worker,
-và bind mount đó do Docker daemon của host giải quyết chứ không phải container
-scheduler. Trên host mà `/var/run/docker.sock` không thuộc group `999`, đặt
-thêm `AIRFLOW_DOCKER_GID`.
-
-`airflow-init` tạo sẵn bốn pool `news_crawl` / `news_embed` / `news_cluster` /
-`news_classify`, mỗi pool **1 slot**. Đó là toàn bộ mô hình concurrency: worker
-đã tự loại trừ nhau bằng advisory lock, pool chỉ để Airflow không phải khởi
-động container rồi nhận về một task `skipped`.
-
-Mỗi lần `airflow-scheduler` start (kể cả khi Docker Desktop bật lại nhờ policy
-`unless-stopped`), scheduler dọn các container DockerOperator còn sót từ phiên
-trước rồi mới nhận task mới. Task kết thúc bình thường cũng luôn tự xóa
-container; log chẩn đoán vẫn nằm trong Airflow UI.
-
-## Nguồn TSV và OPML
-
-File TSV cần tối thiểu 4 cột. Pipeline dùng cột thứ 3 làm `query_label` và cột
-thứ 4 làm `rss_url`; dòng trống và dòng bắt đầu bằng `#` được bỏ qua.
-
-Với OPML, pipeline đọc mọi `outline` có `xmlUrl` và chuyển đổi:
-
-- `title` (fallback sang `text`) → `query_label`
-- `xmlUrl` → `rss_url`
-
-`htmlUrl` không cần cho việc tải feed. `--tsv-path` là alias tương thích ngược
-của `--feed-path`. Có thể đặt nguồn mặc định bằng `RSS_FEED_PATH`; biến cũ
-`GOOGLE_NEWS_TSV_PATH` vẫn được hỗ trợ. `--max-feeds 0` nghĩa là xử lý toàn bộ.
-
-## Storage và monitoring
-
-Các nhóm dữ liệu chính:
-
-- ingest: `raw_articles`, `sources`, `feed_state`, `article_feeds` (bài viết ↔ feed RSS/Atom), `crawl_failures`;
-- orchestration: `processing_jobs`, `processing_dlq`, `worker_runs`;
-- semantic: `article_embeddings`, `clusters`, `cluster_members`,
-  `article_classifications`, `article_topics`, `cluster_topics`;
-- taxonomy: `topics`, `topic_signals`, `topic_prototypes`, `taxonomies`,
-  `taxonomy_nodes` và mapping node-topic.
-
-`raw_articles` chỉ giữ bản Markdown mới nhất theo normalized URL; không lưu raw
-HTML hay lịch sử version. `cluster_topics` là derived data có thể rebuild từ
-article scores và source-balanced aggregation. Có thể kiểm tra nhanh trạng thái bằng:
+Setup starts the background services automatically. Check their work with:
 
 ```bash
 uv run news-worker queue-status
 ```
 
-Lệnh này read-only, gộp `processing_jobs` (theo stage/state), `crawl_failures`
-(theo kind) và `worker_runs` trong 24h gần nhất. Hai cờ dành cho scheduler:
+Workers handle regular ingestion, semantic processing, nightly maintenance,
+and priority-0 feeds. See the [worker operations guide](docs/orchestration-workers.md)
+and [optional topic discovery](docs/dynamic-taxonomy.md).
 
-- `--json` in đúng một dòng JSON trên stdout, dùng được với `jq` hoặc XCom;
-- `--fail-on-alert` thoát `1` khi có job `dead_letter`, có failure đã
-  dead-letter, hoặc có run `failed`/`abandoned` trong cửa sổ. Backlog `pending`
-  **không** phải alert — nó cần lịch sử nhiều lần đo, không đọc được từ một
-  snapshot.
-
-### Monitoring hạ tầng với Prometheus và Grafana
-
-Overlay `deployments/docker-compose.monitoring.yml` dành cho **Linux
-single-host**. Node Exporter đo CPU, RAM, filesystem và network của host;
-cAdvisor đo tài nguyên của các container News Radar; `postgres-exporter` đọc
-các view thống kê của PostgreSQL (connection, lock, transaction dài nhất, cache
-hit, deadlock, kích thước bảng) — phần này cố ý không tự viết trong admin API.
-Prometheus scrape mỗi 15 giây và giữ dữ liệu tối đa 15 ngày hoặc 5 GB, điều
-kiện nào đến trước. Grafana provision sẵn năm dashboard **News Radar — Host**,
-**News Radar — Containers**, **News Radar — Pipeline**, **News Radar —
-Quality** và **News Radar — Services**.
-
-Trên Docker Desktop, các host metric mô tả Linux VM của Docker Desktop chứ
-không phải toàn bộ máy macOS. cAdvisor cần quyền `privileged` và các host mount
-read-only, vì vậy chỉ chạy overlay này trên Docker host tin cậy. Docker Desktop
-không hỗ trợ `rslave` trên root bind mount; thêm compatibility override khi
-smoke-test local:
+## One-off commands
 
 ```bash
-docker compose --env-file .env \
-  -f deployments/docker-compose.yml \
-  -f deployments/docker-compose.airflow.yml \
-  -f deployments/docker-compose.monitoring.yml \
-  -f deployments/docker-compose.monitoring.docker-desktop.yml up -d
+uv run news-pipeline search "technology news" --max-results 5
+uv run news-pipeline crawl https://example.com --persist
+uv run news-pipeline rss --feed-path data/Tech.opml --max-feeds 5 --max-articles-per-feed 5 --persist
 ```
 
-Node Exporter trên Docker Desktop có thể log `Failed to open directory` cho
-`/run/udev/data`. LinuxKit không expose udev metadata ở đường dẫn đó; exporter
-chỉ bỏ phần enrich tên thiết bị, còn `node_disk_*` metrics vẫn được thu. Đây
-không phải lỗi startup.
+Without `--persist`, crawl and RSS commands only print JSON Lines. Search
+results are never persisted. Use `--help` on any command for more options.
 
-Đặt mật khẩu Grafana trong `.env` trước khi khởi động; Compose cố ý không có
-mật khẩu mặc định:
-
-```dotenv
-GRAFANA_ADMIN_USER=admin
-GRAFANA_ADMIN_PASSWORD=replace-with-a-strong-password
-```
-
-Chạy app và monitoring:
-
-```bash
-docker compose --env-file .env \
-  -f deployments/docker-compose.yml \
-  -f deployments/docker-compose.monitoring.yml up -d
-```
-
-Chạy app, Airflow và monitoring:
-
-```bash
-docker compose --env-file .env \
-  -f deployments/docker-compose.yml \
-  -f deployments/docker-compose.airflow.yml \
-  -f deployments/docker-compose.monitoring.yml up -d
-```
-
-Sau lần thêm label đầu tiên, Compose sẽ recreate các container liên quan;
-named volume PostgreSQL, model cache và Airflow metadata không bị xóa. Mở
-Grafana tại `http://127.0.0.1:3001`; Prometheus chỉ nghe tại
-`http://127.0.0.1:9090`. Node Exporter (`9100`) và cAdvisor (`18080`) cũng chỉ
-nghe trên loopback.
-
-Kiểm tra nhanh sau khi start:
-
-```bash
-curl --fail http://127.0.0.1:9090/-/ready
-curl --fail http://127.0.0.1:3001/api/health
-curl --fail --get http://127.0.0.1:9090/api/v1/query \
-  --data-urlencode 'query=up{job=~"prometheus|node-exporter|cadvisor|postgres|news-radar|news-radar-api"}'
-curl --fail --get http://127.0.0.1:9090/api/v1/query \
-  --data-urlencode 'query=node_uname_info'
-```
-
-Container Airflow worker do `DockerOperator` tạo mang group `worker`; time
-series của nó vẫn còn sau khi container thành công được auto-remove. Dashboard
-container chỉ hiển thị container có label dự án `news-radar`, dù cAdvisor nhìn
-thấy Docker host rộng hơn.
-
-Để rollback mà không xóa lịch sử hoặc volume ứng dụng, chỉ stop và remove bốn
-service monitoring; không chạy `down -v`:
-
-```bash
-docker compose --env-file .env \
-  -f deployments/docker-compose.monitoring.yml stop \
-  grafana prometheus cadvisor node-exporter
-docker compose --env-file .env \
-  -f deployments/docker-compose.monitoring.yml rm -f \
-  grafana prometheus cadvisor node-exporter
-```
-
-Stack này chưa cung cấp HTTP probe, alert rule hoặc notification.
-
-### Application metrics (`/metrics`)
-
-`news-admin-api` expose `GET /metrics` theo Prometheus text format. Endpoint
-nằm ở admin API chứ không phải `news-api`: queue depth, kích thước corpus và
-số lần crawl thất bại là thông tin vận hành, và admin API chỉ publish trên
-loopback (`127.0.0.1:8001`). Prometheus scrape job `news-radar` mỗi 30 giây.
-
-Worker có thể chạy trong container ephemeral hoặc service dài hạn. Collector đọc thẳng
-PostgreSQL: `processing_jobs`, `worker_runs`, `crawl_failures`, `feed_state` và
-các bảng corpus. Counter của worker (`news_radar_worker_stat_total`) được cộng
-dồn từ `worker_runs.stats` ở mỗi checkpoint và khi run kết thúc. Watermark từng
-worker cùng các run đang chạy giúp chỉ cộng phần tăng thêm, kể cả khi run cũ
-kết thúc sau run mới. Process restart đọc lại stats còn được giữ trong database.
-`news_radar_worker_errors_total{worker,failure_kind,error_type}` đếm số lần lỗi
-theo cùng cơ chế; khác với gauge `crawl_failures`, counter này không giảm khi
-retry thành công. Xem [hợp đồng metrics cho alert](docs/crawl-monitoring.md)
-để chọn đúng tín hiệu completion, progress, full content và error rate.
-
-Mỗi lần collect đều đụng các bảng vận hành, nên kết quả được cache
-`METRICS_CACHE_SECONDS` (mặc định 15s, thấp hơn scrape interval 30s).
-`news_radar_metrics_collect_duration_seconds` cho biết thời gian nằm trong
-PostgreSQL; nếu nó tăng dần thì nâng cache hoặc thu hẹp
-`METRICS_RECENT_WINDOW_HOURS`.
-
-```bash
-curl --fail http://127.0.0.1:8001/metrics | head -40
-curl --fail --get http://127.0.0.1:9090/api/v1/query \
-  --data-urlencode 'query=news_radar_jobs{state="pending"}'
-```
-
-Dashboard **News Radar — Pipeline** dựng sẵn queue depth theo stage, tuổi job
-pending lâu nhất, backlog trong cửa sổ gần đây, throughput và sức khỏe worker,
-hàng đợi crawl failure, feed và độ phủ corpus. `news-worker queue-status` vẫn
-là cách đọc nhanh cùng dữ liệu đó từ CLI. Phần đo *chất lượng* đầu ra — độ trễ
-publication-to-ingestion, lag từng stage, hình dạng cluster, độ cũ của taxonomy
-— nằm ở [Quality metrics](#quality-metrics-metrics).
-
-### Quality metrics (`/metrics`)
-
-Queue depth trả lời "pipeline có chạy không". Nhóm này trả lời "thứ nó tạo ra
-có tốt không" — cùng nằm trên `GET /metrics` của `news-admin-api`, cùng cache
-`METRICS_CACHE_SECONDS`, và dựng sẵn thành dashboard **News Radar — Quality**.
-
-**Publication-to-ingestion.**
-`news_radar_ingestion_lag_seconds{content_source}` là histogram thật (có
-bucket `le`, dùng được `histogram_quantile`) đo `crawled_at - published_at`:
-khoảng cách giữa dấu thời gian của chính nhà xuất bản và lúc bài trở thành một
-row ở đây. Đây là độ trễ duy nhất chứa mọi thứ nằm ngoài hệ thống — nhà xuất
-bản cập nhật thưa hay dày, feed nằm ở đâu trong vòng quay, retry queue giữ
-trang bao lâu — nên nó trả lời "corpus có tươi không" trong khi không queue
-depth nào trả lời được.
-
-Mỗi bài chỉ được đo **đúng một lần, ở lần nhìn thấy đầu tiên**, qua watermark
-trên `raw_articles.id`. Lý do là `crawled_at` dịch chuyển khi trang bị crawl
-lại: đo lần hai có thể rơi vào bucket thấp hơn, mà counter thì không được phép
-giảm. Khác với `news_radar_worker_stat_total`, histogram này **không** đọc lại
-lịch sử khi restart — nó lấy watermark từ corpus hiện tại rồi đếm từ 0, vì dồn
-nhiều tháng lịch sử vào một scrape interval sẽ phá hỏng mọi `rate()`. Hai
-counter đi kèm đếm phần không thể bucket: `news_radar_articles_undated_total`
-(feed không cho ngày) và `news_radar_articles_published_ahead_total` (feed ghi
-ngày sau lúc crawl — lỗi clock/timezone, cố ý không kẹp về 0 vì làm vậy sẽ
-khiến feed hỏng trông như feed nhanh nhất).
-
-**Gauge histogram.** Các phân phối còn lại mô tả trạng thái bảng *hiện tại*,
-nên chúng được phép giảm — merge một cluster hay tắt một feed là thật sự bớt
-đi một quan sát. Text format 0.0.4 không có kiểu `gaugehistogram`, nên chúng
-xuất hiện dưới dạng `_bucket` cộng `_gcount`/`_gsum` và **không** có
-`_count`/`_sum`; đừng bao giờ `rate()` chúng.
-
-- `news_radar_pipeline_lag_seconds{stage}` — crawl đến embed / cluster /
-  classify, trong cửa sổ `METRICS_RECENT_WINDOW_HOURS`. Chỉ tính các row có
-  timestamp downstream muộn hơn `crawled_at`; một lần crawl lại có thể đẩy
-  `crawled_at` vượt qua dấu thời gian ghi trước đó, đó không phải thời gian
-  chờ âm mà là cùng một bài đo qua hai phiên bản.
-- `news_radar_cluster_size` và `news_radar_cluster_sources` — trên cluster
-  `open`. Bucket `le="1.0"` của cái thứ nhất chính là số cluster singleton;
-  phần chênh giữa `le="1.0"` của cái thứ hai và `_gcount` là số câu chuyện
-  được nhiều hơn một nguồn đưa tin, tức là lý do tồn tại của clustering.
-- `news_radar_feed_poll_interval_seconds` — các tier polling thích ứng thực sự
-  rơi vào đâu. Feed chưa từng poll chưa có tier, được đếm riêng ở
-  `news_radar_feeds_without_poll_interval` thay vì mặc định coi là chậm.
-
-**Gauge thường.** `news_radar_recent_articles_by_content_source{content_source}`
-(khác với `news_radar_articles` vốn tính toàn thời gian) —
-`feed_summary` tăng nghĩa là crawl đang hỏng *ngay lúc này* và row chỉ còn dek.
-`news_radar_stale_classifications` là số row sinh ra bởi classifier set đã
-không còn active (`news-worker classify --stale`), mẫu số dùng
-`sum(news_radar_classified_articles)`. `news_radar_stale_prototypes` là số
-topic có exemplar đổi sau lần compile prototype gần nhất — vẫn phân loại được,
-nhưng bằng định nghĩa cũ (`news-worker taxonomy-rebuild`);
-`news_radar_active_topics` là mẫu số của nó.
-
-```bash
-curl --fail --get http://127.0.0.1:9090/api/v1/query --data-urlencode \
-  'query=histogram_quantile(0.9, sum by (le) (rate(news_radar_ingestion_lag_seconds_bucket[1h])))'
-```
-
-### Service metrics (in-process)
-
-Metric ở trên suy ra từ PostgreSQL nên không biết gì về chính request. Phần
-này đo trong process đang phục vụ: `backend/observability/` cài middleware
-ASGI (không dùng `BaseHTTPMiddleware`, vì `/api/research/stream` là SSE và
-wrapper request/response sẽ giữ stream lại trong queue) và vài instrument
-đặt thẳng ở nơi thời gian thực sự trôi qua.
-
-- `news_radar_http_request_duration_seconds{method,route,status}` và
-  `news_radar_http_requests_in_progress{method}` — cả `news-api` lẫn
-  `news-admin-api`. Label `route` luôn là template
-  (`/api/articles/{article_id}`), không bao giờ là path thật: một series cho
-  mỗi article id sẽ chôn Prometheus, và một scanner dò URL ngẫu nhiên có thể
-  cố tình làm điều đó. Request không khớp route nào gom vào `__unmatched__`.
-- `news_radar_search_duration_seconds{mode}` và
-  `news_radar_search_requests_total{mode,outcome}` với `mode` là `lexical`,
-  `semantic` hoặc `hybrid` — hai nửa của hybrid search được đo riêng lẫn đo
-  chung, vì "BM25 hay vector scan làm chậm" là câu hỏi một con số `hybrid`
-  không trả lời được.
-- `news_radar_agent_runs_total{model,outcome}`,
-  `news_radar_agent_run_duration_seconds{model}`,
-  `news_radar_llm_calls_total{model}` và
-  `news_radar_llm_tokens_total{model,kind}` — một run bị client đóng giữa
-  chừng có outcome riêng (`abandoned`) để không bị đếm như một câu trả lời đã
-  giao.
-- `news_radar_tavily_requests_total{operation,outcome}` và
-  `news_radar_tavily_request_duration_seconds{operation}` — Tavily tính theo
-  quota trả phí, nên số lần gọi đáng theo dõi như latency.
-
-`news-admin-api` nối phần in-process này vào ngay sau phần đọc từ PostgreSQL
-trên cùng `GET /metrics`. `news-api` thì public trên `0.0.0.0:8000`, nên nó mở
-**listener thứ hai** chỉ để expose registry (`API_METRICS_HOST`/
-`API_METRICS_PORT`, mặc định `8002`) và Compose publish port đó ở
-`127.0.0.1:8002` — process bind `0.0.0.0` bên trong container vì port publish
-lên loopback không thể với tới thứ gì khác, còn tính riêng tư nằm ở chỗ
-publish. Prometheus scrape job `news-radar-api`.
-
-```bash
-curl --fail http://127.0.0.1:8002/ | grep news_radar_http_request_duration
-```
-
-Dashboard **News Radar — Services** ghép ba nguồn: RED của HTTP (request rate,
-tỉ lệ 5xx, p95, in-flight, tách theo route và status), research agent (số run
-theo outcome, latency percentile, token và số lần gọi model, Tavily) và
-PostgreSQL internals từ `postgres-exporter` (connection, lock, transaction dài
-nhất, cache hit, deadlock, rollback, bảng lớn nhất).
-
-## Chạy API
-
-`backend/api/` là FastAPI app read-only trên cùng schema, dùng chung
-`PostgresRawStorage`
-([backend/adapters/storage/postgres.py](backend/adapters/storage/postgres.py))
-với pipeline/service. Yêu cầu PostgreSQL đã migrate:
-
-```bash
-uv run news-api
-```
-
-Mặc định lắng nghe `API_HOST`/`API_PORT` (`0.0.0.0:8000`); `CORS_ALLOW_ORIGINS`
-trong `.env` là danh sách origin (phân tách bởi dấu phẩy) được phép gọi API,
-mặc định `http://localhost:3000` cho frontend dev. Cùng process còn mở một
-listener thứ hai ở `API_METRICS_HOST`/`API_METRICS_PORT` (`0.0.0.0:8002`) chỉ
-phục vụ Prometheus exposition — xem [Service metrics](#service-metrics-in-process).
-Endpoint hiện có:
-
-- `GET /health`, `GET /health/db`
-- `GET /api/articles?limit=&cursor=&source=&topic=&q=`
-- `GET /api/articles/{id}`
-- `GET /api/sources`, `GET /api/sources/{slug}/articles`
-- `GET /api/topics?taxonomy=default`
-- `GET /api/stories?limit=&cursor=&source=&topic=&min_sources=&min_articles=`
-- `GET /api/stories/{id}`
-- `POST /api/research` với body `{"query":"..."}` — research agent trả Markdown
-  cùng article citations; cần `OPENROUTER_API_KEY`, còn query embedding dùng cùng
-  FastEmbed model với article embeddings.
-- `POST /api/research/stream` với body `{"query":"...","thread_id":"<uuid>"}` —
-  stream trạng thái, reasoning, tool call/result, answer và citations bằng Server-Sent Events.
-- `DELETE /api/research/threads/{thread_id}` — xoá conversation memory trong
-  process của một chat session.
-
-Endpoint JSON mặc định vẫn stateless; endpoint stream dùng LangGraph in-process
-memory theo `thread_id` và không ghi PostgreSQL. Cấu hình model bằng
-`OPENROUTER_MODEL` (mặc định `nvidia/nemotron-3.5-lightning:free` qua OpenRouter) và có
-thể đặt `OPENROUTER_BASE_URL` (mặc định `https://openrouter.ai/api/v1`) để dùng
-endpoint Chat Completions tương thích OpenAI khác. Giữ tên biến
-`OPENROUTER_API_KEY` và `OPENROUTER_MODEL` cho cả các provider này; cần dùng key
-và model của đúng provider. `OPENROUTER_SITE_URL` chỉ gửi attribution tới OpenRouter. OpenRouter prompt cache
-được bật cho Anthropic sessions. `OPENROUTER_TIMEOUT_SECONDS` giới hạn mỗi HTTP
-request tới model (mặc định 60 giây); `NEWS_AGENT_RUN_TIMEOUT_SECONDS` giới hạn
-toàn bộ vòng LangGraph gồm nhiều model/tool call (mặc định 90 giây). Nếu không
-có key, các endpoint đọc khác vẫn hoạt động và các endpoint research trả `503`.
-
-Stream phát `reasoning` (`id`, `text`) theo từng đoạn nếu model cung cấp;
-`tool_call` (`id`, `tool`, `input`) khi arguments đã đầy đủ; `tool_result`
-(`id`, `status`, `output`) ngay khi từng tool hoàn tất. Input/output là chuỗi
-JSON được giới hạn độ dài; nội dung bài viết đầy đủ không đưa vào phần tiến trình.
-Client ghép tool call/result theo `id`. `delta` tiếp tục chỉ chứa text câu trả lời.
-Nếu model phát lời dẫn rồi mới gọi tool, lời dẫn được chuyển sang reasoning và
-`reset` có `reason: "tool_call"` báo client mở lại tiến trình.
-Integration `langchain-openrouter` giữ reasoning qua các lượt tool; cấu hình
-reasoning effort `low`, tối đa 6000 output tokens bao gồm reasoning và answer.
-Model không trả reasoning vẫn stream tool call/result bình thường.
-
-Citation chỉ hợp lệ nếu nguồn đã được lấy trong lượt hỏi hiện tại; lịch sử hội
-thoại không tự động trở thành evidence của lượt mới. Tool trả sẵn marker
-`[A<article_id>]` để model sao chép chính xác. Nếu câu trả lời dùng citation chưa
-có evidence, agent được phản hồi một lần để đọc lại nguồn bằng `get_article`
-hoặc sửa phần không được hỗ trợ. UI xoá draft chưa hợp lệ và hiển thị trạng thái
-`verifying` trong khi sửa. Lần sửa vẫn nằm trong timeout/recursion limit của lượt
-hiện tại; nếu citation vẫn sai, backend tiếp tục chặn câu trả lời. Kiểm tra này
-xác nhận nguồn đã được truy xuất, không tự động chứng minh mọi nhận định khớp
-với nội dung nguồn.
-
-Với base URL ngoài `openrouter.ai`, agent dùng client Chat Completions tổng quát:
-giữ nguyên đường dẫn base và nối `/chat/completions`, không gửi `session_id`,
-`cache_control`, attribution hay cấu hình `reasoning` riêng của OpenRouter.
-Client bảo toàn `reasoning_content`, `reasoning`, `reasoning_details` và
-`encrypted_content` từ provider qua vòng gọi tool; dữ liệu mã hoá không hiển thị
-trong UI. Các tuỳ chọn riêng có thể truyền bằng `OPENROUTER_EXTRA_BODY` (JSON object).
-Usage chunks không được yêu cầu mặc định trên endpoint tổng quát; nếu provider
-hỗ trợ, có thể thêm `"stream_options":{"include_usage":true}` vào JSON này.
-
-Ví dụ [BytePlus Coding Plan](https://docs.byteplus.com/id/docs/modelark/coding-plan-personal-ai-opencode):
-
-```dotenv
-OPENROUTER_BASE_URL=https://ark.ap-southeast.bytepluses.com/api/coding/v3
-OPENROUTER_API_KEY=<BytePlus Coding Plan API key>
-OPENROUTER_MODEL=ark-code-latest
-OPENROUTER_EXTRA_BODY={"thinking":{"type":"enabled"}}
-```
-
-Restart `news-api` sau khi đổi cấu hình. Đường dẫn `/api/coding/v3` được giữ nguyên;
-không thay sang `/api/v3` (endpoint tính phí riêng của ModelArk).
-
-Với Docker Compose, phải tạo lại container để nạp environment mới (`restart`
-không cập nhật environment). Chạy từ thư mục gốc repo:
-
-```bash
-docker compose --env-file .env -f deployments/docker-compose.yml up -d --no-deps --force-recreate api
-```
-
-Admin API chạy ở process riêng để giữ `news-api` public hoàn toàn read-only:
-
-```bash
-uv run news-admin-api
-```
-
-Mặc định service lắng nghe `ADMIN_API_HOST`/`ADMIN_API_PORT`
-(`0.0.0.0:8001`). Service này chưa có authentication và chỉ nên được expose
-trong môi trường private/trusted. Endpoint quản lý feed:
-
-- `GET /api/admin/feeds?status=active|inactive|all`
-- `POST /api/admin/feeds`
-- `PATCH /api/admin/feeds`
-
-## Frontend
-
-`frontend/` là Next.js app. Browser gọi route `/api/*` cùng origin; Next.js
-server proxy request đọc tới FastAPI theo `API_URL` và request quản trị theo
-`ADMIN_API_URL`, nên không expose các URL nội bộ ra client. Xem
-[frontend/README.md](frontend/README.md) cho cấu hình local. Tab **Ask AI** hỗ
-trợ chat nhiều lượt, streaming và article citations.
-
-## Kiểm thử
-
-Suite mặc định không tải embedding model thật; semantic suite được tách bằng
-marker. Unit test không yêu cầu DB:
+## Development
 
 ```bash
 uv run --extra dev pytest -m "not integration"
+# Integration tests require a migrated test database:
+TEST_DATABASE_URL=postgresql+asyncpg://user:password@localhost:5433/news_radar_test uv run --extra dev pytest
 ```
 
-Integration test yêu cầu một DB đã migrate:
-
-```bash
-TEST_DATABASE_URL="$DATABASE_URL" uv run --extra dev pytest
-```
-
-Golden semantic suite dùng đúng MiniLM production và đúng 10 scenario:
-
-```bash
-uv run --extra dev pytest backend/tests/test_semantic_golden.py -m semantic
-```
-
-Frontend build gate:
-
-```bash
-cd frontend && pnpm build
-```
+See the [frontend guide](frontend/README.md) for frontend configuration and checks.
+Source code lives in `backend/` and `frontend/`; deployment files are in
+`deployments/`.

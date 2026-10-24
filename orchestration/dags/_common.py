@@ -39,7 +39,7 @@ DOCKER_NETWORK = os.environ.get("NEWS_RADAR_DOCKER_NETWORK", "news-radar_default
 REPO = os.environ.get("NEWS_RADAR_REPO", "/opt/news-radar")
 
 # Feed source and taxonomy seed, mounted read-only from the repo checkout.
-FEED_PATH = "/data/engineering_blogs.opml"
+FEED_PATH = "/data/Tech.opml"
 TAXONOMY_SEED_PATH = "/data/taxonomy.seed.yaml"
 
 DEFAULT_ARGS = {

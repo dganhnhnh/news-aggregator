@@ -1,11 +1,17 @@
 import argparse
 import asyncio
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import pytest
 
 from adapters.storage import StorageError
 from core.config import Settings
 from models.search_and_crawl_models import CrawlMetadata, CrawlResult
-from models.storage_models import CrawlBatch, StorageWriteSummary
+from models.storage_models import (
+    CrawlBatch, FeedSeed, StorageWriteSummary, TaxonomyImportSummary,
+)
 from pipelines import news as pipeline_cli
 from services import news as service_cli
 from workers import cli as worker_cli
@@ -63,6 +69,142 @@ def _parse(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     worker_cli.validate(args, parser)
     return args
+
+
+def test_seed_feeds_uses_tech_opml_independent_of_cwd_and_import_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    calls = []
+
+    class FakeStorage:
+        def __init__(self, database_url):
+            pass
+
+        async def check_ready(self):
+            calls.append("ready")
+
+        async def seed_feeds(self, seeds):
+            calls.append(seeds)
+            return len(seeds)
+
+        async def close(self):
+            calls.append("closed")
+
+    settings = replace(
+        _settings("postgresql+asyncpg://db"),
+        rss_feed_path=tmp_path / "ignored.tsv",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(worker_cli, "PostgresRawStorage", FakeStorage)
+    args = worker_cli.build_parser(settings).parse_args(["seed-feeds"])
+    worker_cli.validate(args, worker_cli.build_parser(settings))
+
+    assert asyncio.run(worker_cli._dispatch(args, settings, None)) == 0
+    assert worker_cli.FEED_SEED_PATH == root / "data" / "Tech.opml"
+    expected = {
+        feed.rss_url: FeedSeed(feed.rss_url, feed.query_label)
+        for feed in worker_cli.RssFeedSearcher._load_queries_from_opml(
+            root / "data" / "Tech.opml"
+        )
+    }
+    assert expected
+    assert calls == ["ready", list(expected.values()), "closed"]
+
+
+def test_seed_feeds_deduplicates_urls_and_reports_existing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog
+) -> None:
+    path = tmp_path / "Tech.opml"
+    path.write_text(
+        '<opml><body><outline text="Folder">'
+        '<outline title="Example" xmlUrl="https://example.com/rss" />'
+        '<outline title="Example" xmlUrl="https://example.com/rss" />'
+        '<outline text="Atom" xmlUrl="https://example.org/atom" />'
+        '</outline></body></opml>'
+    )
+    monkeypatch.setattr(worker_cli, "FEED_SEED_PATH", path)
+
+    class FakeStorage:
+        async def seed_feeds(self, seeds):
+            assert seeds == [
+                FeedSeed("https://example.com/rss", "Example"),
+                FeedSeed("https://example.org/atom", "Atom"),
+            ]
+            return 0
+
+    with caplog.at_level("INFO"):
+        assert asyncio.run(worker_cli._dispatch_admin(
+            FakeStorage(), argparse.Namespace(command="seed-feeds")
+        )) == 0
+    assert "Seeded 0 new feed(s), skipped 2 existing feed(s)" in caplog.text
+
+
+@pytest.mark.parametrize("content", ["<opml>", "<opml><body /></opml>"])
+def test_seed_feeds_rejects_invalid_or_empty_file_before_writing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str
+) -> None:
+    path = tmp_path / "Tech.opml"
+    path.write_text(content)
+    monkeypatch.setattr(worker_cli, "FEED_SEED_PATH", path)
+    # No storage methods should be called for an unusable seed file.
+    assert asyncio.run(worker_cli._dispatch_admin(
+        object(), argparse.Namespace(command="seed-feeds")
+    )) == 1
+
+
+def test_seed_feeds_rejects_missing_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(worker_cli, "FEED_SEED_PATH", tmp_path / "missing.opml")
+    with pytest.raises(SystemExit) as exc:
+        _parse(["seed-feeds"])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("existing", [([object()], []), ([], [object()]), ([object()], [object()])])
+def test_taxonomy_import_if_empty_preserves_existing_registry(existing, caplog) -> None:
+    path = Path(__file__).resolve().parents[2] / "data" / "taxonomy.seed.yaml"
+    args = _parse(["taxonomy-import", "--file", str(path), "--if-empty"])
+    storage = SimpleNamespace(
+        export_taxonomy=AsyncMock(return_value=existing),
+        import_taxonomy=AsyncMock(),
+    )
+
+    with caplog.at_level("INFO"):
+        assert asyncio.run(worker_cli._dispatch_admin(storage, args)) == 0
+
+    storage.export_taxonomy.assert_awaited_once_with()
+    storage.import_taxonomy.assert_not_awaited()
+    assert "Skipping taxonomy import" in caplog.text
+
+
+@pytest.mark.parametrize("if_empty", [False, True])
+def test_taxonomy_import_bootstraps_empty_registry(if_empty: bool) -> None:
+    path = Path(__file__).resolve().parents[2] / "data" / "taxonomy.seed.yaml"
+    argv = ["taxonomy-import", "--file", str(path)]
+    if if_empty:
+        argv.append("--if-empty")
+    storage = SimpleNamespace(
+        export_taxonomy=AsyncMock(return_value=([], [])),
+        import_taxonomy=AsyncMock(return_value=TaxonomyImportSummary(
+            topics=[], taxonomies_created=[], taxonomies_updated=[],
+            nodes_created=0, nodes_updated=0, pruned_topics=[], pruned_nodes=[],
+        )),
+    )
+
+    assert asyncio.run(worker_cli._dispatch_admin(storage, _parse(argv))) == 0
+
+    storage.import_taxonomy.assert_awaited_once()
+    seed = storage.import_taxonomy.call_args.args[0]
+    assert seed.topics and seed.taxonomies
+    assert storage.import_taxonomy.call_args.kwargs == {"prune": False}
+    assert storage.export_taxonomy.await_count == int(if_empty)
+
+
+def test_taxonomy_import_if_empty_rejects_pruning() -> None:
+    with pytest.raises(SystemExit):
+        _parse(["taxonomy-import", "--file", "seed.yaml", "--if-empty", "--prune"])
 
 
 def test_scheduler_flags_are_available_to_every_worker_command() -> None:

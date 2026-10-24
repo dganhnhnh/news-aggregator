@@ -155,7 +155,7 @@ class CrawlWorker(Worker):
                 if not probe:
                     logger.warning(
                         "feed_state is empty; seed it once with "
-                        "`news-worker crawl --feed-path <file.opml/.tsv>`"
+                        "`news-worker seed-feeds` (data/Tech.opml)"
                     )
 
             async for poll in discovery.poll(targets):
