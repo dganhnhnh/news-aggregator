@@ -14,6 +14,25 @@ questions with streaming answers and article citations.
 run history; poll high-priority feeds more frequently.
 - Monitor pipeline health with queue reports, Prometheus metrics, and Grafana.
 
+Demo snippets
+- **Articles & Stories:** Search and filter articles, read full Markdown content, and explore related coverage from multiple sources.
+
+https://github.com/user-attachments/assets/918fc1e4-fd25-4686-ac16-7f5612bc8154
+
+- **Trends:** Track news coverage over time and compare article counts with percentage views.
+
+https://github.com/user-attachments/assets/a7fa1152-a132-4cb3-a998-bd29bf0f4201
+
+
+- **Ask AI:** Get streaming answers and summaries grounded in your article collection, with source citations.
+
+https://github.com/user-attachments/assets/9a1e661b-3a9d-4cc9-b33b-c88811394684
+
+- **Feeds:** Browse and manage RSS feeds, check polling activity, and add custom sources by keyword/topic.
+
+https://github.com/user-attachments/assets/83f72197-a4ce-44d7-822c-8e3334098cae
+
+
 
 ## Quick start
 
